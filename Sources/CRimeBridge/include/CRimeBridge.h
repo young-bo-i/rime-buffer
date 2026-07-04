@@ -1,0 +1,93 @@
+#ifndef CRIMEBRIDGE_H
+#define CRIMEBRIDGE_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Max candidates we surface per page. Rime pages are small (this user: 5);
+// 32 is a safe ceiling. Candidates beyond this on a page are ignored.
+#define BB_MAX_CANDIDATES 32
+
+// A single candidate on the CURRENT page. The string pointers are owned by the
+// bridge and remain valid only until the next BBRimeGetContext call — the Swift
+// side must copy them (String(cString:)) immediately.
+typedef struct {
+    const char* text;
+    const char* comment;
+    const char* label;   // selection label, e.g. "1".."5"
+} BBRimeCandidate;
+
+// Snapshot of the CURRENT-PAGE Rime context. Pointers are bridge-owned and live
+// until the next BBRimeGetContext call; copy immediately.
+typedef struct {
+    bool active;                // raw input non-empty OR preedit OR candidates>0
+    const char* preedit;        // composition preedit (may be empty)
+    const char* input;          // raw input buffer
+    int cursorPos;
+    int selStart;
+    int selEnd;
+    int pageSize;
+    int pageNo;
+    bool isLastPage;
+    int highlightedIndex;       // index within the current page
+    int numCandidates;          // count on the current page (<= BB_MAX_CANDIDATES)
+    BBRimeCandidate candidates[BB_MAX_CANDIDATES];
+} BBRimeContext;
+
+// Engine status. String pointers are bridge-owned, valid until the next
+// BBRimeGetStatus call.
+typedef struct {
+    const char* schemaId;       // load-bearing: drives chord gating (my_combo)
+    const char* schemaName;
+    bool disabled;
+    bool composing;
+    bool asciiMode;
+    bool fullShape;
+    bool simplified;
+    bool traditional;
+    bool asciiPunct;
+} BBRimeStatus;
+
+// Lifecycle. BBRimeStart dlopens Squirrel's librime, setup()+initialize(), and
+// only reports success if a smoke create_session() also succeeds.
+bool BBRimeStart(const char* sharedDataDir,
+                 const char* userDataDir,
+                 const char* logDir);
+bool BBRimeIsHealthy(void);
+
+uint64_t BBRimeCreateSession(void);
+void BBRimeDestroySession(uint64_t session);
+
+bool BBRimeProcessKey(uint64_t session, int32_t keycode, int32_t mask);
+bool BBRimeCommitComposition(uint64_t session);
+void BBRimeClearComposition(uint64_t session);
+bool BBRimeSelectCandidateOnCurrentPage(uint64_t session, uint64_t index);
+
+bool BBRimeGetOption(uint64_t session, const char* option);
+void BBRimeSetOption(uint64_t session, const char* option, bool value);
+bool BBRimeSelectSchema(uint64_t session, const char* schemaId);
+bool BBRimeDeploy(void);
+
+// Read a double from a DEPLOYED config (e.g. configId="squirrel",
+// key="chord_duration"). Returns false when missing/engine down.
+bool BBRimeConfigGetDouble(const char* configId, const char* key, double* out);
+
+// Fill caller-provided structs. Return false when unavailable (engine down /
+// no context). See ownership note on the struct typedefs.
+bool BBRimeGetContext(uint64_t session, BBRimeContext* out);
+bool BBRimeGetStatus(uint64_t session, BBRimeStatus* out);
+
+char* BBRimeCopyCommit(uint64_t session);
+char* BBRimeCopySchema(uint64_t session);
+char* BBRimeCopyLastError(void);
+void BBRimeFreeString(char* value);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

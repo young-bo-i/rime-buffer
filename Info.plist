@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>RimeBuffer</string>
+    <key>CFBundleDisplayName</key>
+    <string>RimeBuffer 输入法</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.isaac.inputmethod.RimeBuffer</string>
+    <key>CFBundleExecutable</key>
+    <string>RimeBuffer</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleSignature</key>
+    <string>????</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>LSBackgroundOnly</key>
+    <true/>
+
+    <!-- IMK wiring -->
+    <key>InputMethodConnectionName</key>
+    <string>RimeBuffer_1_Connection</string>
+    <key>InputMethodServerControllerClass</key>
+    <string>RimeBufferController</string>
+    <key>InputMethodServerDelegateClass</key>
+    <string>RimeBufferController</string>
+
+    <!-- The input source this app vends -->
+    <key>ComponentInputModeDict</key>
+    <dict>
+        <key>tsInputModeListKey</key>
+        <dict>
+            <key>com.isaac.inputmethod.RimeBuffer</key>
+            <dict>
+                <key>TISInputSourceID</key>
+                <string>com.isaac.inputmethod.RimeBuffer</string>
+                <key>TISIntendedLanguage</key>
+                <string>zh-Hans</string>
+                <key>tsInputModeAlternateMenuTitleKey</key>
+                <string>RimeBuffer</string>
+                <key>tsInputModeCharacterRepertoireKey</key>
+                <array>
+                    <string>Latn</string>
+                    <string>Hans</string>
+                </array>
+                <key>tsInputModeIsVisibleKey</key>
+                <true/>
+                <key>tsInputModePrimaryInScriptKey</key>
+                <true/>
+                <key>tsInputModeScriptKey</key>
+                <string>smUnicodeScript</string>
+                <key>tsInputModeKeyEquivalentKey</key>
+                <string></string>
+                <key>tsInputModeKeyEquivalentModifiersKey</key>
+                <integer>0</integer>
+            </dict>
+        </dict>
+        <key>tsVisibleInputModeOrderedArrayKey</key>
+        <array>
+            <string>com.isaac.inputmethod.RimeBuffer</string>
+        </array>
+    </dict>
+</dict>
+</plist>
