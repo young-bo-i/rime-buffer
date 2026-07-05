@@ -1,18 +1,40 @@
 import Cocoa
 import CRimeBridge
+import UniformTypeIdentifiers
 
-/// Visual settings (v1) — the "modern IME" configuration surface:
-///   · 方案管理: list deployed schemas, import a .schema.yaml (auto-added to
-///     schema_list), export one, redeploy-and-restart in place.
-///   · 缓冲区: enable staged commits.
-/// Lives in the IME process; shown from the status menu.
+/// Visual settings surface for schema management, appearance/buffer toggles,
+/// and local key-frequency statistics.
 final class SettingsWindowController: NSObject {
     static let shared = SettingsWindowController()
 
+    private enum Page: Int, CaseIterable {
+        case schemas
+        case appearance
+        case keyStats
+
+        var title: String {
+            switch self {
+            case .schemas: return "方案"
+            case .appearance: return "外观与缓冲"
+            case .keyStats: return "按键统计"
+            }
+        }
+    }
+
     private var window: NSWindow?
+    private let sidebar = NSStackView()
+    private let contentHost = NSView()
+    private var navButtons: [Page: NSButton] = [:]
+    private var selectedPage: Page = .schemas
+    private var statsObserver: NSObjectProtocol?
+
     private let schemaPopUp = NSPopUpButton()
     private let appearancePopUp = NSPopUpButton()
     private let bufferCheck = NSButton(checkboxWithTitle: "启用缓冲模式（提交先暂存，手动确认上屏）", target: nil, action: nil)
+    private let statsDatePicker = NSDatePicker()
+    private let statsSummary = NSTextField(labelWithString: "")
+    private let statsTopKey = NSTextField(labelWithString: "")
+    private let heatmapView = KeyboardHeatmapView()
 
     private var userDir: URL {
         URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/RimeBuffer")
@@ -21,6 +43,7 @@ final class SettingsWindowController: NSObject {
     func show() {
         if window == nil { build() }
         reload()
+        showPage(selectedPage)
         NSApp.activate(ignoringOtherApps: true)
         window?.center()
         window?.makeKeyAndOrderFront(nil)
@@ -29,29 +52,74 @@ final class SettingsWindowController: NSObject {
     // MARK: UI construction
 
     private func build() {
-        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 360),
-                           styleMask: [.titled, .closable],
+        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 980, height: 680),
+                           styleMask: [.titled, .closable, .resizable],
                            backing: .buffered, defer: false)
         win.title = "RimeBuffer 设置"
         win.isReleasedWhenClosed = false
+        win.minSize = NSSize(width: 860, height: 600)
 
-        func sectionLabel(_ s: String) -> NSTextField {
-            let l = NSTextField(labelWithString: s)
-            l.font = .systemFont(ofSize: 12, weight: .semibold)
-            l.textColor = .secondaryLabelColor
-            return l
+        configureControls()
+
+        sidebar.orientation = .vertical
+        sidebar.alignment = .leading
+        sidebar.spacing = 6
+        sidebar.edgeInsets = NSEdgeInsets(top: 16, left: 12, bottom: 16, right: 12)
+        sidebar.translatesAutoresizingMaskIntoConstraints = false
+
+        for page in Page.allCases {
+            let button = NSButton(title: page.title, target: self, action: #selector(pageChosen(_:)))
+            button.tag = page.rawValue
+            button.bezelStyle = .regularSquare
+            button.isBordered = false
+            button.alignment = .left
+            button.font = .systemFont(ofSize: 13, weight: .medium)
+            button.translatesAutoresizingMaskIntoConstraints = false
+            button.widthAnchor.constraint(equalToConstant: 136).isActive = true
+            button.heightAnchor.constraint(equalToConstant: 30).isActive = true
+            sidebar.addArrangedSubview(button)
+            navButtons[page] = button
+        }
+        sidebar.addArrangedSubview(flexSpacer())
+
+        let divider = NSBox()
+        divider.boxType = .separator
+        divider.translatesAutoresizingMaskIntoConstraints = false
+
+        contentHost.translatesAutoresizingMaskIntoConstraints = false
+
+        let root = NSStackView(views: [sidebar, divider, contentHost])
+        root.orientation = .horizontal
+        root.alignment = .top
+        root.spacing = 0
+        root.translatesAutoresizingMaskIntoConstraints = false
+
+        win.contentView = NSView()
+        win.contentView?.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.leadingAnchor.constraint(equalTo: win.contentView!.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: win.contentView!.trailingAnchor),
+            root.topAnchor.constraint(equalTo: win.contentView!.topAnchor),
+            root.bottomAnchor.constraint(equalTo: win.contentView!.bottomAnchor),
+            sidebar.widthAnchor.constraint(equalToConstant: 160),
+            divider.widthAnchor.constraint(equalToConstant: 1),
+        ])
+
+        statsObserver = NotificationCenter.default.addObserver(
+            forName: .keyFrequencyDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard self?.selectedPage == .keyStats else { return }
+            self?.refreshStats()
         }
 
+        window = win
+    }
+
+    private func configureControls() {
         schemaPopUp.target = self
         schemaPopUp.action = #selector(schemaChosen)
-
-        let importBtn = NSButton(title: "导入方案…", target: self, action: #selector(importSchema))
-        let exportBtn = NSButton(title: "导出选中方案…", target: self, action: #selector(exportSchema))
-        let deployBtn = NSButton(title: "重新部署并重启", target: self, action: #selector(deployAndRestart))
-        deployBtn.bezelColor = .controlAccentColor
-        let schemaButtons = NSStackView(views: [importBtn, exportBtn, deployBtn])
-        schemaButtons.orientation = .horizontal
-        schemaButtons.spacing = 8
 
         bufferCheck.target = self
         bufferCheck.action = #selector(bufferToggled)
@@ -64,44 +132,157 @@ final class SettingsWindowController: NSObject {
         appearancePopUp.target = self
         appearancePopUp.action = #selector(appearanceChosen)
 
+        statsDatePicker.datePickerElements = [.yearMonthDay]
+        statsDatePicker.datePickerStyle = .textFieldAndStepper
+        statsDatePicker.dateValue = Date()
+        statsDatePicker.target = self
+        statsDatePicker.action = #selector(statsDateChanged)
+
+        statsSummary.font = .systemFont(ofSize: 13, weight: .semibold)
+        statsTopKey.font = .systemFont(ofSize: 12)
+        statsTopKey.textColor = .secondaryLabelColor
+        heatmapView.translatesAutoresizingMaskIntoConstraints = false
+        heatmapView.heightAnchor.constraint(greaterThanOrEqualToConstant: 330).isActive = true
+    }
+
+    private func showPage(_ page: Page) {
+        selectedPage = page
+        for (p, button) in navButtons {
+            button.state = p == page ? .on : .off
+            button.contentTintColor = p == page ? .controlAccentColor : .labelColor
+        }
+
+        contentHost.subviews.forEach { $0.removeFromSuperview() }
+        let pageView: NSView
+        switch page {
+        case .schemas: pageView = schemaPage()
+        case .appearance: pageView = appearancePage()
+        case .keyStats: pageView = keyStatsPage()
+        }
+        pageView.translatesAutoresizingMaskIntoConstraints = false
+        contentHost.addSubview(pageView)
+        NSLayoutConstraint.activate([
+            pageView.leadingAnchor.constraint(equalTo: contentHost.leadingAnchor),
+            pageView.trailingAnchor.constraint(equalTo: contentHost.trailingAnchor),
+            pageView.topAnchor.constraint(equalTo: contentHost.topAnchor),
+            pageView.bottomAnchor.constraint(lessThanOrEqualTo: contentHost.bottomAnchor),
+        ])
+        if page == .keyStats { refreshStats() }
+    }
+
+    private func schemaPage() -> NSView {
+        let importBtn = NSButton(title: "导入方案…", target: self, action: #selector(importSchema))
+        let exportBtn = NSButton(title: "导出选中方案…", target: self, action: #selector(exportSchema))
+        let deployBtn = NSButton(title: "重新部署并重启", target: self, action: #selector(deployAndRestart))
+        deployBtn.bezelColor = .controlAccentColor
+        let schemaButtons = NSStackView(views: [importBtn, exportBtn, deployBtn])
+        schemaButtons.orientation = .horizontal
+        schemaButtons.spacing = 8
+
         let openDirBtn = NSButton(title: "打开配置目录", target: self, action: #selector(openDir))
         let note = NSTextField(wrappingLabelWithString:
-            "配置目录是 ~/Library/RimeBuffer（独立于 Squirrel 的 ~/Library/Rime，避免词库锁冲突）。导入的方案会自动加入 schema_list；改动配置后点「重新部署并重启」生效。")
+            "配置目录是 ~/Library/RimeBuffer。导入的方案会自动加入 schema_list；改动配置后点「重新部署并重启」生效。")
         note.font = .systemFont(ofSize: 11)
         note.textColor = .tertiaryLabelColor
 
-        let column = NSStackView(views: [
-            sectionLabel("方案管理（并击 / 串击 / 自定义）"),
-            schemaPopUp, schemaButtons,
-            spacer(12),
+        return contentColumn([
+            title("方案"),
+            caption("管理并击、串击和自定义 Rime schema。"),
+            spacer(8),
+            sectionLabel("当前方案"),
+            schemaPopUp,
+            schemaButtons,
+            spacer(16),
+            sectionLabel("配置目录"),
+            openDirBtn,
+            note,
+        ])
+    }
+
+    private func appearancePage() -> NSView {
+        return contentColumn([
+            title("外观与缓冲"),
+            caption("调整输入法界面外观，以及提交内容是否先进入缓冲区。"),
+            spacer(8),
             sectionLabel("缓冲区"),
             bufferCheck,
-            spacer(12),
+            spacer(16),
             sectionLabel("外观"),
             appearancePopUp,
-            spacer(12),
-            openDirBtn, note,
         ])
+    }
+
+    private func keyStatsPage() -> NSView {
+        let refreshBtn = NSButton(title: "刷新", target: self, action: #selector(refreshStatsTapped))
+        let clearDayBtn = NSButton(title: "清空当天", target: self, action: #selector(clearStatsDay))
+        let clearAllBtn = NSButton(title: "清空全部", target: self, action: #selector(clearStatsAll))
+        let controls = NSStackView(views: [statsDatePicker, refreshBtn, flexSpacer(), clearDayBtn, clearAllBtn])
+        controls.orientation = .horizontal
+        controls.alignment = .centerY
+        controls.spacing = 8
+
+        return contentColumn([
+            title("按键统计"),
+            caption("按天统计本输入法收到的物理按键次数；只保存按键计数，不保存输入内容。"),
+            spacer(8),
+            controls,
+            spacer(8),
+            statsSummary,
+            statsTopKey,
+            heatmapView,
+        ])
+    }
+
+    private func contentColumn(_ views: [NSView]) -> NSView {
+        let column = NSStackView(views: views)
         column.orientation = .vertical
         column.alignment = .leading
         column.spacing = 8
-        column.edgeInsets = NSEdgeInsets(top: 16, left: 20, bottom: 16, right: 20)
+        column.edgeInsets = NSEdgeInsets(top: 22, left: 24, bottom: 22, right: 24)
         column.translatesAutoresizingMaskIntoConstraints = false
 
-        win.contentView = NSView()
-        win.contentView!.addSubview(column)
+        let container = NSView()
+        container.addSubview(column)
         NSLayoutConstraint.activate([
-            column.leadingAnchor.constraint(equalTo: win.contentView!.leadingAnchor),
-            column.trailingAnchor.constraint(equalTo: win.contentView!.trailingAnchor),
-            column.topAnchor.constraint(equalTo: win.contentView!.topAnchor),
+            column.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            column.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            column.topAnchor.constraint(equalTo: container.topAnchor),
+            column.bottomAnchor.constraint(lessThanOrEqualTo: container.bottomAnchor),
         ])
-        window = win
+        return container
+    }
+
+    private func title(_ s: String) -> NSTextField {
+        let l = NSTextField(labelWithString: s)
+        l.font = .systemFont(ofSize: 20, weight: .semibold)
+        return l
+    }
+
+    private func caption(_ s: String) -> NSTextField {
+        let l = NSTextField(wrappingLabelWithString: s)
+        l.font = .systemFont(ofSize: 12)
+        l.textColor = .secondaryLabelColor
+        return l
+    }
+
+    private func sectionLabel(_ s: String) -> NSTextField {
+        let l = NSTextField(labelWithString: s)
+        l.font = .systemFont(ofSize: 12, weight: .semibold)
+        l.textColor = .secondaryLabelColor
+        return l
     }
 
     private func spacer(_ h: CGFloat) -> NSView {
         let v = NSView()
         v.translatesAutoresizingMaskIntoConstraints = false
         v.heightAnchor.constraint(equalToConstant: h).isActive = true
+        return v
+    }
+
+    private func flexSpacer() -> NSView {
+        let v = NSView()
+        v.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        v.setContentHuggingPriority(.defaultLow, for: .vertical)
         return v
     }
 
@@ -125,6 +306,20 @@ final class SettingsWindowController: NSObject {
             appearancePopUp.item(at: $0)?.representedObject as? String == RimeUI.appearance.rawValue
         }) {
             appearancePopUp.selectItem(at: idx)
+        }
+        refreshStats()
+    }
+
+    private func refreshStats() {
+        let snapshot = KeyFrequencyStore.shared.snapshot(for: statsDatePicker.dateValue)
+        heatmapView.snapshot = snapshot
+        statsSummary.stringValue = "\(snapshot.dayKey) · 总按键 \(snapshot.total) 次 · 覆盖 \(snapshot.counts.count) 个键"
+        if let top = snapshot.topKeyId {
+            let count = snapshot.counts[top] ?? 0
+            let ratio = snapshot.total > 0 ? Double(count) / Double(snapshot.total) * 100 : 0
+            statsTopKey.stringValue = "最高频：\(KeyboardLayout.displayName(for: top)) · \(count) 次 · \(String(format: "%.1f", ratio))%"
+        } else {
+            statsTopKey.stringValue = "最高频：暂无"
         }
     }
 
@@ -153,6 +348,12 @@ final class SettingsWindowController: NSObject {
 
     // MARK: Actions
 
+    @objc private func pageChosen(_ sender: NSButton) {
+        guard let page = Page(rawValue: sender.tag) else { return }
+        reload()
+        showPage(page)
+    }
+
     @objc private func schemaChosen() {
         guard let id = schemaPopUp.selectedItem?.representedObject as? String else { return }
         RimeBufferController.applyPreferredSchema(id)
@@ -160,7 +361,9 @@ final class SettingsWindowController: NSObject {
 
     @objc private func importSchema() {
         let panel = NSOpenPanel()
-        panel.allowedFileTypes = ["yaml"]
+        if let yaml = UTType(filenameExtension: "yaml") {
+            panel.allowedContentTypes = [yaml]
+        }
         panel.message = "选择一个 .schema.yaml 方案文件（并击方案同样适用）"
         guard panel.runModal() == .OK, let src = panel.url else { return }
         do {
@@ -226,7 +429,10 @@ final class SettingsWindowController: NSObject {
             _ = rimeEngine.start()
             let ok = BBRimeDeploy()
             IMELog.write("settings: deploy=\(ok), restarting")
-            DispatchQueue.main.async { exit(0) }   // text-input system relaunches us
+            DispatchQueue.main.async {
+                KeyFrequencyStore.shared.saveNow()
+                exit(0)   // text-input system relaunches us
+            }
         }
     }
 
@@ -239,6 +445,24 @@ final class SettingsWindowController: NSObject {
               let mode = RimeAppearanceMode(rawValue: raw) else { return }
         RimeUI.appearance = mode
         IMELog.write("appearance -> \(mode.rawValue)")
+    }
+
+    @objc private func statsDateChanged() {
+        refreshStats()
+    }
+
+    @objc private func refreshStatsTapped() {
+        refreshStats()
+    }
+
+    @objc private func clearStatsDay() {
+        KeyFrequencyStore.shared.clear(day: statsDatePicker.dateValue)
+        refreshStats()
+    }
+
+    @objc private func clearStatsAll() {
+        KeyFrequencyStore.shared.clear(day: nil)
+        refreshStats()
     }
 
     @objc private func openDir() {

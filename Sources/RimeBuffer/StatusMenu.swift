@@ -105,6 +105,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     @objc private func restart() {
         IMELog.write("user requested restart from status menu")
         RimeBufferController.active?.forceCommit()   // don't strand a composition
+        KeyFrequencyStore.shared.saveNow()
         exit(0)   // the system relaunches the IME on demand
     }
 }

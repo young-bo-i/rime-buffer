@@ -133,6 +133,8 @@ final class RimeBufferController: IMKInputController {
     }
 
     private func handleKeyDown(_ event: NSEvent, client: IMKTextInput) -> Bool {
+        KeyFrequencyStore.shared.record(keyCode: event.keyCode)
+
         // Cmd belongs to the app, always (macOS Rime configs never bind Super).
         // In my_combo every letter is a chording key, so without this early-out
         // chord_composer would eat Cmd+C/Cmd+V outright. Resolve any live
@@ -220,12 +222,16 @@ final class RimeBufferController: IMKInputController {
     }
 
     private func handleFlags(_ event: NSEvent, client: IMKTextInput) -> Bool {
+        let modifiers = event.modifierFlags
+        let changes = lastModifiers.symmetricDifference(modifiers)
+        if !changes.isEmpty {
+            KeyFrequencyStore.shared.recordModifierPress(keyCode: event.keyCode, flags: modifiers)
+        }
+
         guard rimeEngine.start(), ensureSessionReady() else {
             lastModifiers = event.modifierFlags
             return false
         }
-        let modifiers = event.modifierFlags
-        let changes = lastModifiers.symmetricDifference(modifiers)
         guard !changes.isEmpty else {
             lastModifiers = modifiers
             return false

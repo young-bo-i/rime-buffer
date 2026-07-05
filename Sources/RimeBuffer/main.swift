@@ -2,6 +2,9 @@ import Cocoa
 import InputMethodKit
 
 // `swift run RimeBuffer smoke` validates the engine end-to-end without IMK.
+if CommandLine.arguments.contains("stats-smoke") {
+    exit(runStatsSmokeTest() ? 0 : 1)
+}
 if CommandLine.arguments.contains("smoke") {
     runEngineSmokeTest()
     exit(0)
@@ -58,6 +61,13 @@ NSWorkspace.shared.notificationCenter.addObserver(
     RimeBufferController.active?.forceCommit()
     candidateWindow.hide()
 }
+NotificationCenter.default.addObserver(
+    forName: NSApplication.willTerminateNotification,
+    object: NSApp,
+    queue: .main
+) { _ in
+    KeyFrequencyStore.shared.saveNow()
+}
 
 IMELog.write("bootstrap done: server=\(imkServer != nil) engineHealthy=\(rimeEngine.isHealthy)")
 
@@ -98,4 +108,58 @@ func runEngineSmokeTest() {
     print("committed:", engine.takeCommit(session: session) ?? "(none)")
     engine.destroySession(session)
     print("== done ==")
+}
+
+func runStatsSmokeTest() -> Bool {
+    print("== RimeBuffer key-frequency smoke test ==")
+    let root = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("rimebuffer-key-frequency-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let calendar = Calendar(identifier: .gregorian)
+    let day1 = calendar.date(from: DateComponents(year: 2026, month: 7, day: 5))!
+    let day2 = calendar.date(from: DateComponents(year: 2026, month: 7, day: 6))!
+
+    let store1 = KeyFrequencyStore(storageRoot: root, autosaveDelay: 999) { day1 }
+    store1.record(keyCode: 0)       // A
+    store1.record(keyCode: 0)       // A
+    store1.record(keyCode: 8)       // C
+    store1.recordModifierPress(keyCode: 55, flags: [.command])
+    store1.recordModifierPress(keyCode: 55, flags: [])   // release, ignored
+    store1.saveNow()
+
+    let reloaded = KeyFrequencyStore(storageRoot: root, autosaveDelay: 999) { day1 }
+    let day1Snapshot = reloaded.snapshot(for: day1)
+    guard day1Snapshot.counts["KeyA"] == 2,
+          day1Snapshot.counts["KeyC"] == 1,
+          day1Snapshot.counts["LeftCommand"] == 1,
+          day1Snapshot.total == 4 else {
+        print("FAILED: day1 snapshot", day1Snapshot)
+        return false
+    }
+
+    let store2 = KeyFrequencyStore(storageRoot: root, autosaveDelay: 999) { day2 }
+    store2.record(keyCode: 11)      // B
+    store2.saveNow()
+    guard store2.snapshot(for: day1).total == 4,
+          store2.snapshot(for: day2).counts["KeyB"] == 1 else {
+        print("FAILED: day bucket isolation")
+        return false
+    }
+
+    store2.clear(day: day1)
+    guard store2.snapshot(for: day1).total == 0,
+          store2.snapshot(for: day2).total == 1 else {
+        print("FAILED: clear day")
+        return false
+    }
+
+    store2.clear(day: nil)
+    guard store2.snapshot(for: day2).total == 0 else {
+        print("FAILED: clear all")
+        return false
+    }
+
+    print("stats smoke: OK")
+    return true
 }
