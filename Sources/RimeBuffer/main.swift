@@ -31,6 +31,9 @@ _ = rimeEngine.start()
 candidateWindow.onSelect = { index in
     RimeBufferController.active?.selectCandidate(onPage: index)
 }
+candidateWindow.onSettings = {
+    SettingsWindowController.shared.show()
+}
 
 // Buffer wiring: flushes deliver to the focused field; every model change
 // re-renders the staging strip.

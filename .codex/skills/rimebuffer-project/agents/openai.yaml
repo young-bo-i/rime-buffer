@@ -1,0 +1,4 @@
+interface:
+  display_name: "RimeBuffer Project"
+  short_description: "RimeBuffer IME architecture guide"
+  default_prompt: "Use $rimebuffer-project to modify the RimeBuffer input method without breaking its IMK, librime, marked-text, candidate-window, or buffer contracts."

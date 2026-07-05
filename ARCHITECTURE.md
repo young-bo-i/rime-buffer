@@ -198,8 +198,8 @@ v1 里它是"无 marked 模式"的救生员；v2 有 marked 会话后 IMK 的 `c
 
 ### 5.10 BufferSurface + BufferModel（P2）— 状态：❌ 未开始
 
-- BufferModel **从零写**：append-only 块列表，每次 Rime 提交/选候选 = 一块（自带 createdAt）。只继承旧 buffer-bar 的时序常量（块存活 3s、淡出 0.45s）。旧项目的 diff/切片/合并机器**不移植**（它存在只因当年系统输入法往 buffer 自己的 TextView 里组字，边界不可知；现在边界在插入时天然已知）。
-- 提交拓扑=显式开关：buffer-OFF → P1 行为（直达焦点框）；buffer-ON → 提交**只进 buffer**（框内空着直到冲刷，文档明示这是预期），到期/手动冲刷经 Delivery 上屏。组字预览永远在候选窗，**组字不进 buffer**。`compositionActive` 标志在 processKey 前后由控制器设置，冲刷遇组字中则等待。
+- BufferModel **从零写**：append-only 块列表，每次 Rime 提交/选候选 = 一块（自带 createdAt）。旧项目的 diff/切片/合并机器**不移植**（它存在只因当年系统输入法往 buffer 自己的 TextView 里组字，边界不可知；现在边界在插入时天然已知）。自动到期上屏已关闭：IMK `insertText` 没有可靠成功回执，不能把"存在 client"当成"目标框收到内容"。
+- 提交拓扑=显式开关：buffer-OFF → P1 行为（直达焦点框）；buffer-ON → 提交**只进 buffer**（框内空着直到用户点"发送到输入框"）。手动发送经 Delivery 上屏，但 buffer 内容默认保留，确认收到后由用户点"清空"显式删除。组字预览永远在候选窗，**组字不进 buffer**。`compositionActive` 标志在 processKey 前后由控制器设置，未来任何自动/延迟冲刷都必须等待组字结束。
 - BufferSurface：NSPanel（磨砂 chrome 可从旧 buffer-bar 移植），**被动显示**（canBecomeKey=false，绝不抢焦点；编辑是显式切换的模式）。
 
 ### 5.11 AIOps（P3）— 状态：❌ 未开始
@@ -247,8 +247,8 @@ rime-buffer/
     ├── ChordController.swift     ✅ duration 读配置(用户 0.05s)
     ├── StatusMenu.swift          ✅ NSStatusItem + IMK menu() 双入口
     ├── (FocusObserver)           ✅ 以 main.swift 的 NSWorkspace 观察器实现(forceCommit+藏窗)
-    ├── BufferModel.swift          ✅ P2 缓冲模型(append-only 块/3s 生命周期/组字暂停/顺序冲刷)
-    ├── BufferSurface.swift        ✅ P2 底部暂存条(被动显示/块 chips/立即上屏/清空)
+    ├── BufferModel.swift          ✅ P2 缓冲模型(append-only 块/手动冲刷/不自动丢内容)
+    ├── BufferSurface.swift        ✅ P2 底部暂存条(被动显示/块 chips/发送到输入框/清空)
     ├── SettingsWindow.swift       ✅ 可视化设置 v1(方案列表/导入+自动进 schema_list/导出/部署重启/缓冲配置)
     └── [P3+] AIOps/CaretLocator/精细 Deploy
 
@@ -302,7 +302,7 @@ pkill -x RimeBuffer                # 系统会按需重新拉起
 
 ### P2 buffer / P3 语音+AI / P4 转正
 
-闸口见 §5.10–§5.12。P2 核心验收：buffer-ON 时提交进面板可编辑、冲刷经 insertText 落原框、组字期间冲刷会等待；buffer-OFF 完全回到 P1 行为。P4 核心验收：连用一周零"打不出字"事件；改 schema 后进程内重部署生效；password 框优雅直通。
+闸口见 §5.10–§5.12。P2 核心验收：buffer-ON 时提交进面板可见、手动冲刷经 insertText 落原框、组字期间冲刷会等待；buffer-OFF 完全回到 P1 行为且不会静默丢掉已有 buffer 内容。P4 核心验收：连用一周零"打不出字"事件；改 schema 后进程内重部署生效；password 框优雅直通。
 
 ---
 

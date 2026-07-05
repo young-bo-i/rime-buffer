@@ -150,6 +150,9 @@ final class RimeBufferController: IMKInputController {
             return false
         }
         let mask = RimeKey.modifierMask(from: event.modifierFlags)
+        if mask == 0, handleCandidateKey(keycode, client: client) {
+            return true
+        }
         return processRimeKey(keycode, mask: mask, client: client)
     }
 
@@ -292,6 +295,28 @@ final class RimeBufferController: IMKInputController {
     }
 
     // MARK: Candidate selection (mouse; routed here via `active` from main.swift)
+
+    private func handleCandidateKey(_ keycode: Int32, client: IMKTextInput) -> Bool {
+        guard candidateWindow.hasCandidates else { return false }
+        switch keycode {
+        case RimeKey.left:
+            return candidateWindow.moveSelection(delta: -1)
+        case RimeKey.right:
+            return candidateWindow.moveSelection(delta: 1)
+        case RimeKey.down:
+            return candidateWindow.expandGrid()
+        case RimeKey.up:
+            return candidateWindow.collapseGrid()
+        case RimeKey.return, 0x20:
+            guard let index = candidateWindow.selectedCandidateIndex else { return false }
+            selectCandidate(onPage: index)
+            return true
+        case RimeKey.escape:
+            return candidateWindow.collapseGrid()
+        default:
+            return false
+        }
+    }
 
     func selectCandidate(onPage index: Int) {
         guard session != 0, let client = self.client() else { return }

@@ -4,16 +4,15 @@ import CRimeBridge
 /// Visual settings (v1) — the "modern IME" configuration surface:
 ///   · 方案管理: list deployed schemas, import a .schema.yaml (auto-added to
 ///     schema_list), export one, redeploy-and-restart in place.
-///   · 缓冲区: enable + block lifetime.
+///   · 缓冲区: enable staged commits.
 /// Lives in the IME process; shown from the status menu.
 final class SettingsWindowController: NSObject {
     static let shared = SettingsWindowController()
 
     private var window: NSWindow?
     private let schemaPopUp = NSPopUpButton()
-    private let bufferCheck = NSButton(checkboxWithTitle: "启用缓冲模式（提交先暂存，到期自动上屏）", target: nil, action: nil)
-    private let lifetimeSlider = NSSlider(value: 3, minValue: 1, maxValue: 10, target: nil, action: nil)
-    private let lifetimeLabel = NSTextField(labelWithString: "3 秒")
+    private let appearancePopUp = NSPopUpButton()
+    private let bufferCheck = NSButton(checkboxWithTitle: "启用缓冲模式（提交先暂存，手动确认上屏）", target: nil, action: nil)
 
     private var userDir: URL {
         URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/RimeBuffer")
@@ -30,7 +29,7 @@ final class SettingsWindowController: NSObject {
     // MARK: UI construction
 
     private func build() {
-        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 320),
+        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 360),
                            styleMask: [.titled, .closable],
                            backing: .buffered, defer: false)
         win.title = "RimeBuffer 设置"
@@ -56,13 +55,14 @@ final class SettingsWindowController: NSObject {
 
         bufferCheck.target = self
         bufferCheck.action = #selector(bufferToggled)
-        lifetimeSlider.target = self
-        lifetimeSlider.action = #selector(lifetimeChanged)
-        let lifetimeRow = NSStackView(views: [NSTextField(labelWithString: "块存活时间"), lifetimeSlider, lifetimeLabel])
-        lifetimeRow.orientation = .horizontal
-        lifetimeRow.spacing = 8
-        lifetimeSlider.translatesAutoresizingMaskIntoConstraints = false
-        lifetimeSlider.widthAnchor.constraint(equalToConstant: 200).isActive = true
+
+        appearancePopUp.removeAllItems()
+        for mode in RimeAppearanceMode.allCases {
+            appearancePopUp.addItem(withTitle: mode.title)
+            appearancePopUp.lastItem?.representedObject = mode.rawValue
+        }
+        appearancePopUp.target = self
+        appearancePopUp.action = #selector(appearanceChosen)
 
         let openDirBtn = NSButton(title: "打开配置目录", target: self, action: #selector(openDir))
         let note = NSTextField(wrappingLabelWithString:
@@ -75,7 +75,10 @@ final class SettingsWindowController: NSObject {
             schemaPopUp, schemaButtons,
             spacer(12),
             sectionLabel("缓冲区"),
-            bufferCheck, lifetimeRow,
+            bufferCheck,
+            spacer(12),
+            sectionLabel("外观"),
+            appearancePopUp,
             spacer(12),
             openDirBtn, note,
         ])
@@ -118,8 +121,11 @@ final class SettingsWindowController: NSObject {
             schemaPopUp.selectItem(at: idx)
         }
         bufferCheck.state = BufferModel.shared.enabled ? .on : .off
-        lifetimeSlider.doubleValue = BufferModel.shared.lifetime
-        lifetimeLabel.stringValue = "\(Int(BufferModel.shared.lifetime)) 秒"
+        if let idx = (0..<appearancePopUp.numberOfItems).first(where: {
+            appearancePopUp.item(at: $0)?.representedObject as? String == RimeUI.appearance.rawValue
+        }) {
+            appearancePopUp.selectItem(at: idx)
+        }
     }
 
     /// (id, display name) for every *.schema.yaml in the user dir.
@@ -228,9 +234,11 @@ final class SettingsWindowController: NSObject {
         BufferModel.shared.enabled = bufferCheck.state == .on
     }
 
-    @objc private func lifetimeChanged() {
-        BufferModel.shared.lifetime = lifetimeSlider.doubleValue.rounded()
-        lifetimeLabel.stringValue = "\(Int(lifetimeSlider.doubleValue.rounded())) 秒"
+    @objc private func appearanceChosen() {
+        guard let raw = appearancePopUp.selectedItem?.representedObject as? String,
+              let mode = RimeAppearanceMode(rawValue: raw) else { return }
+        RimeUI.appearance = mode
+        IMELog.write("appearance -> \(mode.rawValue)")
     }
 
     @objc private func openDir() {

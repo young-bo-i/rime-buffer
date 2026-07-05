@@ -1,28 +1,49 @@
 import Cocoa
 
-/// In-process candidate window (borderless NSPanel). Renders the current Rime
-/// page from a native RimeContextModel — no cross-process anything.
-///
-/// Positioning chain (§5.5): (1) the caret rect the controller read from the
-/// client — reliable now that a marked-text session is always active; (2) the
-/// last known-good rect for this bundleId; (3) bottom-center of the main
-/// screen. Never defaults to a screen corner.
+/// In-process candidate window. The default view is a compact horizontal strip;
+/// Down opens a 3-row picker so every current-page candidate remains selectable.
 final class CandidateWindow {
     private let panel: NSPanel
-    private let stack = NSStackView()
+    private let root = NSStackView()
+    private let preeditLabel = NSTextField(labelWithString: "")
+    private let strip = NSView()
+    private let candidateScroll = NSScrollView()
+    private let candidateStack = NSStackView()
+    private let pageButton = CandidateActionButton(symbolName: "chevron.down", title: "")
+    private let settingsButton = CandidateActionButton(symbolName: "gearshape", title: "设置")
+    private var stripHeightConstraint: NSLayoutConstraint!
+    private var candidateHeightConstraint: NSLayoutConstraint!
     private var lastGoodRect: [String: NSRect] = [:]
 
-    /// Mouse selection: row index on the current page. Wired by the controller
-    /// to select_candidate_on_current_page + the normal commit drain.
-    var onSelect: ((Int) -> Void)?
+    private var currentContext = RimeContextModel()
+    private var currentSignature = ""
+    private var selectedIndex = 0
+    private var gridExpanded = false
+    private var lastCaretRect = NSRect.zero
+    private var lastBundleId = ""
+    private var lastShowPreedit = false
 
-    // Visual parity with the user's squirrel config (font_point 20,
-    // label_font_point 14, stacked vertical layout).
-    private let candidateFontSize: CGFloat = 20
-    private let labelFontSize: CGFloat = 14
+    var onSelect: ((Int) -> Void)?
+    var onSettings: (() -> Void)?
+
+    var hasCandidates: Bool { panel.isVisible && !currentContext.candidates.isEmpty }
+    var isGridExpanded: Bool { gridExpanded }
+    var selectedCandidateIndex: Int? {
+        guard hasCandidates else { return nil }
+        return clamp(selectedIndex, count: currentContext.candidates.count)
+    }
+
+    private let baseWidth: CGFloat = 500
+    private let compactStripHeight: CGFloat = 44
+    private let expandedStripHeight: CGFloat = 126
+    private let compactCandidateHeight: CGFloat = 34
+    private let expandedCandidateHeight: CGFloat = 114
+    private let preeditHeight: CGFloat = 24
+    private let candidateFontSize: CGFloat = 18
+    private let labelFontSize: CGFloat = 13
 
     init() {
-        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 240, height: 40),
+        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: baseWidth, height: compactStripHeight),
                         styleMask: [.borderless, .nonactivatingPanel],
                         backing: .buffered, defer: false)
         panel.level = .popUpMenu
@@ -33,50 +54,171 @@ final class CandidateWindow {
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
 
-        let visual = NSVisualEffectView()
-        visual.material = .menu
-        visual.state = .active
-        visual.blendingMode = .behindWindow
-        visual.wantsLayer = true
-        visual.layer?.cornerRadius = 7          // user's corner_radius: 7
-        visual.layer?.masksToBounds = true
+        preeditLabel.font = .monospacedSystemFont(ofSize: 17, weight: .regular)
+        preeditLabel.lineBreakMode = .byTruncatingTail
+        preeditLabel.isHidden = true
+        preeditLabel.heightAnchor.constraint(equalToConstant: preeditHeight).isActive = true
 
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 5                        // user's line_spacing: 5
-        stack.edgeInsets = NSEdgeInsets(top: 8, left: 10, bottom: 8, right: 10)
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        visual.addSubview(stack)
+        strip.wantsLayer = true
+        strip.layer?.cornerRadius = 12
+        strip.layer?.borderWidth = 1
+        strip.layer?.masksToBounds = true
+        stripHeightConstraint = strip.heightAnchor.constraint(equalToConstant: compactStripHeight)
+        stripHeightConstraint.isActive = true
+
+        candidateStack.orientation = .horizontal
+        candidateStack.alignment = .centerY
+        candidateStack.spacing = 6
+        candidateStack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+
+        candidateScroll.drawsBackground = false
+        candidateScroll.hasHorizontalScroller = false
+        candidateScroll.hasVerticalScroller = false
+        candidateScroll.horizontalScrollElasticity = .none
+        candidateScroll.verticalScrollElasticity = .none
+        candidateScroll.documentView = candidateStack
+        candidateScroll.translatesAutoresizingMaskIntoConstraints = false
+        candidateScroll.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        candidateHeightConstraint = candidateScroll.heightAnchor.constraint(equalToConstant: compactCandidateHeight)
+        candidateHeightConstraint.isActive = true
+
+        let divider = NSView()
+        divider.wantsLayer = true
+        divider.layer?.backgroundColor = RimeUI.borderStrong.cgColor
+        divider.translatesAutoresizingMaskIntoConstraints = false
+        divider.widthAnchor.constraint(equalToConstant: 1).isActive = true
+        divider.heightAnchor.constraint(equalToConstant: 30).isActive = true
+
+        pageButton.target = self
+        pageButton.action = #selector(toggleGridTapped)
+        pageButton.toolTip = "展开候选"
+        pageButton.widthAnchor.constraint(equalToConstant: 32).isActive = true
+        pageButton.heightAnchor.constraint(equalToConstant: 32).isActive = true
+
+        settingsButton.target = self
+        settingsButton.action = #selector(settingsTapped)
+        settingsButton.toolTip = "打开设置"
+        settingsButton.widthAnchor.constraint(equalToConstant: 64).isActive = true
+        settingsButton.heightAnchor.constraint(equalToConstant: 32).isActive = true
+
+        let barRow = NSStackView(views: [candidateScroll, divider, pageButton, settingsButton])
+        barRow.orientation = .horizontal
+        barRow.alignment = .centerY
+        barRow.spacing = 7
+        barRow.translatesAutoresizingMaskIntoConstraints = false
+        strip.addSubview(barRow)
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: visual.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: visual.trailingAnchor),
-            stack.topAnchor.constraint(equalTo: visual.topAnchor),
-            stack.bottomAnchor.constraint(equalTo: visual.bottomAnchor),
+            barRow.leadingAnchor.constraint(equalTo: strip.leadingAnchor, constant: 7),
+            barRow.trailingAnchor.constraint(equalTo: strip.trailingAnchor, constant: -7),
+            barRow.topAnchor.constraint(equalTo: strip.topAnchor, constant: 5),
+            barRow.bottomAnchor.constraint(equalTo: strip.bottomAnchor, constant: -5),
         ])
-        panel.contentView = visual
+
+        root.orientation = .vertical
+        root.alignment = .leading
+        root.spacing = 5
+        root.translatesAutoresizingMaskIntoConstraints = false
+        root.addArrangedSubview(preeditLabel)
+        root.addArrangedSubview(strip)
+
+        let content = NSView()
+        content.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            root.topAnchor.constraint(equalTo: content.topAnchor),
+            root.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            strip.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            strip.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            preeditLabel.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 2),
+            preeditLabel.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -2),
+        ])
+        panel.contentView = content
+
+        applyAppearance()
+        NotificationCenter.default.addObserver(
+            forName: .rimeAppearanceDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.applyAppearance()
+            self?.renderCandidates()
+        }
     }
 
-    /// `caretRect` is what the controller got from the client (screen coords,
-    /// zero when unavailable). `showPreedit` is true only in placeholder mode —
-    /// in inline mode the preedit is already visible in the field.
     func update(_ ctx: RimeContextModel, caretRect: NSRect, bundleId: String, showPreedit: Bool) {
         guard !ctx.candidates.isEmpty || (showPreedit && !ctx.preedit.isEmpty) else {
             hide()
             return
         }
 
-        rebuildRows(ctx, showPreedit: showPreedit)
+        let sameComposition = ctx.input == currentContext.input && ctx.preedit == currentContext.preedit
+        let signature = contextSignature(ctx)
+        if signature != currentSignature {
+            selectedIndex = clamp(ctx.highlightedIndex, count: ctx.candidates.count)
+            currentSignature = signature
+        }
+        if !sameComposition { gridExpanded = false }
 
-        panel.layoutIfNeeded()
-        let fit = stack.fittingSize
-        panel.setContentSize(NSSize(width: max(fit.width, 80), height: fit.height))
-        panel.setFrameOrigin(origin(for: caretRect, bundleId: bundleId))
+        currentContext = ctx
+        lastCaretRect = caretRect
+        lastBundleId = bundleId
+        lastShowPreedit = showPreedit
+
+        preeditLabel.stringValue = showPreedit ? (ctx.preedit.isEmpty ? ctx.input : ctx.preedit) : ""
+        preeditLabel.isHidden = preeditLabel.stringValue.isEmpty
+        applyAppearance()
+        renderCandidates()
+        layoutPanel(caretRect: caretRect, bundleId: bundleId)
         panel.orderFrontRegardless()
     }
 
-    func hide() { panel.orderOut(nil) }
+    func hide() {
+        gridExpanded = false
+        panel.orderOut(nil)
+    }
+
+    @discardableResult
+    func expandGrid() -> Bool {
+        guard !currentContext.candidates.isEmpty else { return false }
+        gridExpanded = true
+        renderCandidates()
+        layoutPanel(caretRect: lastCaretRect, bundleId: lastBundleId)
+        panel.orderFrontRegardless()
+        return true
+    }
+
+    @discardableResult
+    func collapseGrid() -> Bool {
+        guard gridExpanded else { return false }
+        gridExpanded = false
+        renderCandidates()
+        layoutPanel(caretRect: lastCaretRect, bundleId: lastBundleId)
+        panel.orderFrontRegardless()
+        return true
+    }
+
+    @discardableResult
+    func moveSelection(delta: Int) -> Bool {
+        guard !currentContext.candidates.isEmpty else { return false }
+        selectedIndex = clamp(selectedIndex + delta, count: currentContext.candidates.count)
+        renderCandidates()
+        scrollSelectedIntoView()
+        return true
+    }
 
     // MARK: Positioning
+
+    private func layoutPanel(caretRect: NSRect, bundleId: String) {
+        let width = panelWidth(for: currentContext, caretRect: caretRect)
+        let height = (gridExpanded ? expandedStripHeight : compactStripHeight)
+            + (preeditLabel.isHidden ? 0 : preeditHeight + root.spacing)
+        panel.setContentSize(NSSize(width: width, height: height))
+        panel.layoutIfNeeded()
+        updateCandidateDocumentSize()
+        scrollSelectedIntoView()
+        panel.setFrameOrigin(origin(for: caretRect, bundleId: bundleId))
+    }
 
     private func origin(for caretRect: NSRect, bundleId: String) -> NSPoint {
         var anchor = caretRect
@@ -89,17 +231,13 @@ final class CandidateWindow {
             return NSPoint(x: vf.midX - panel.frame.width / 2, y: vf.minY + 120)
         }
 
-        // Point containment, NOT intersects — caret rects are often zero-width
-        // and NSRect.intersects returns false for empty rects.
-        let screen = NSScreen.screens.first {
-            $0.frame.insetBy(dx: -8, dy: -8).contains(anchor.origin)
-        } ?? NSScreen.main
+        let screen = screen(containing: anchor)
         let vf = screen?.visibleFrame ?? .zero
         var x = anchor.minX
-        var y = anchor.minY - panel.frame.height - 4       // below the line
-        if y < vf.minY { y = anchor.maxY + 4 }             // flip above
-        x = min(max(x, vf.minX + 4), vf.maxX - panel.frame.width - 4)
-        y = min(max(y, vf.minY + 4), vf.maxY - panel.frame.height - 4)
+        var y = anchor.minY - panel.frame.height - 6
+        if y < vf.minY { y = anchor.maxY + 6 }
+        x = min(max(x, vf.minX + 6), vf.maxX - panel.frame.width - 6)
+        y = min(max(y, vf.minY + 6), vf.maxY - panel.frame.height - 6)
         return NSPoint(x: x, y: y)
     }
 
@@ -108,92 +246,249 @@ final class CandidateWindow {
         return NSScreen.screens.contains { $0.frame.insetBy(dx: -8, dy: -8).contains(r.origin) }
     }
 
+    private func screen(containing rect: NSRect) -> NSScreen? {
+        NSScreen.screens.first { $0.frame.insetBy(dx: -8, dy: -8).contains(rect.origin) }
+            ?? NSScreen.main
+    }
+
+    private func panelWidth(for ctx: RimeContextModel, caretRect: NSRect) -> CGFloat {
+        let visibleWidth = (screen(containing: caretRect)?.visibleFrame.width ?? baseWidth) - 12
+        let firstWidth = ctx.candidates.first.map {
+            measuredCandidateWidth($0, highlighted: selectedIndex == 0, compact: true)
+        } ?? 0
+        let minimumForFirstCandidate = firstWidth + 124
+        return min(max(baseWidth, minimumForFirstCandidate), max(420, visibleWidth))
+    }
+
     // MARK: Rendering
 
-    private func rebuildRows(_ ctx: RimeContextModel, showPreedit: Bool) {
-        stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
-
-        if showPreedit, !ctx.preedit.isEmpty {
-            let p = NSTextField(labelWithString: ctx.preedit)
-            p.font = .monospacedSystemFont(ofSize: labelFontSize, weight: .regular)
-            p.textColor = .secondaryLabelColor
-            stack.addArrangedSubview(p)
+    private func renderCandidates() {
+        candidateStack.arrangedSubviews.forEach {
+            candidateStack.removeArrangedSubview($0)
+            $0.removeFromSuperview()
         }
 
-        for (i, c) in ctx.candidates.enumerated() {
-            stack.addArrangedSubview(row(index: i, candidate: c,
-                                         highlighted: i == ctx.highlightedIndex))
-        }
+        stripHeightConstraint.constant = gridExpanded ? expandedStripHeight : compactStripHeight
+        candidateHeightConstraint.constant = gridExpanded ? expandedCandidateHeight : compactCandidateHeight
+        pageButton.image = RimeUI.symbol(gridExpanded ? "chevron.up" : "chevron.down",
+                                         pointSize: 17,
+                                         weight: .semibold)
+        pageButton.toolTip = gridExpanded ? "收起候选" : "展开候选"
 
-        if ctx.pageNo > 0 || !ctx.isLastPage {
-            let pager = NSTextField(labelWithString:
-                "\(ctx.pageNo > 0 ? "◂ " : "")\(ctx.pageNo + 1)\(ctx.isLastPage ? "" : " ▸")")
-            pager.font = .systemFont(ofSize: 10)
-            pager.textColor = .tertiaryLabelColor
-            stack.addArrangedSubview(pager)
+        if gridExpanded {
+            renderGrid()
+        } else {
+            renderCompactRow()
+        }
+        applyAppearance()
+        updateCandidateDocumentSize()
+    }
+
+    private func renderCompactRow() {
+        candidateStack.orientation = .horizontal
+        candidateStack.alignment = .centerY
+        candidateStack.spacing = 6
+
+        for (i, c) in currentContext.candidates.enumerated() {
+            candidateStack.addArrangedSubview(candidateButton(
+                index: i,
+                candidate: c,
+                highlighted: i == selectedIndex,
+                compact: true,
+                width: nil
+            ))
         }
     }
 
-    private func row(index: Int, candidate c: RimeCandidateModel, highlighted: Bool) -> NSView {
+    private func renderGrid() {
+        candidateStack.orientation = .vertical
+        candidateStack.alignment = .leading
+        candidateStack.spacing = 5
+
+        let count = currentContext.candidates.count
+        guard count > 0 else { return }
+        let rows = min(3, count)
+        let columns = Int(ceil(Double(count) / Double(rows)))
+        let cellWidth = gridCellWidth(columns: columns)
+
+        for rowIndex in 0..<rows {
+            let row = NSStackView()
+            row.orientation = .horizontal
+            row.alignment = .centerY
+            row.spacing = 6
+            row.translatesAutoresizingMaskIntoConstraints = false
+
+            let start = rowIndex * columns
+            let end = min(start + columns, count)
+            guard start < end else { continue }
+            for i in start..<end {
+                row.addArrangedSubview(candidateButton(
+                    index: i,
+                    candidate: currentContext.candidates[i],
+                    highlighted: i == selectedIndex,
+                    compact: false,
+                    width: cellWidth
+                ))
+            }
+            candidateStack.addArrangedSubview(row)
+        }
+    }
+
+    private func candidateButton(
+        index: Int,
+        candidate: RimeCandidateModel,
+        highlighted: Bool,
+        compact: Bool,
+        width: CGFloat?
+    ) -> NSButton {
+        let button = CandidatePillButton()
+        button.tag = index
+        button.target = self
+        button.action = #selector(candidateTapped(_:))
+        button.attributedTitle = candidateTitle(candidate, highlighted: highlighted)
+        button.layer?.backgroundColor = highlighted
+            ? RimeUI.selectedCandidateColor.cgColor
+            : NSColor.clear.cgColor
+        button.layer?.borderColor = highlighted
+            ? NSColor.clear.cgColor
+            : RimeUI.border.withAlphaComponent(0.35).cgColor
+        button.layer?.borderWidth = highlighted ? 0 : 1
+        button.toolTip = candidate.comment.isEmpty
+            ? candidate.text
+            : "\(candidate.text)  \(candidate.comment)"
+
+        let naturalWidth = ceil(measuredCandidateWidth(candidate, highlighted: highlighted, compact: compact))
+        NSLayoutConstraint.activate([
+            button.widthAnchor.constraint(equalToConstant: width ?? naturalWidth),
+            button.heightAnchor.constraint(equalToConstant: compact ? 34 : 32),
+        ])
+        return button
+    }
+
+    private func candidateTitle(_ c: RimeCandidateModel, highlighted: Bool) -> NSAttributedString {
         let line = NSMutableAttributedString()
+        let labelColor = highlighted ? NSColor.white.withAlphaComponent(0.86) : RimeUI.textMuted
+        let textColor = highlighted ? NSColor.white : RimeUI.textSecondary
+        let baseline = (candidateFontSize - labelFontSize) / 2
+
         line.append(NSAttributedString(
-            string: "\(c.label) ",
-            attributes: [.font: NSFont.systemFont(ofSize: labelFontSize),
-                         .foregroundColor: highlighted ? NSColor.white.withAlphaComponent(0.85)
-                                                       : NSColor.secondaryLabelColor,
-                         .baselineOffset: (candidateFontSize - labelFontSize) / 2]))
+            string: "\(c.label.isEmpty ? "" : c.label) ",
+            attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: labelFontSize, weight: .semibold),
+                         .foregroundColor: labelColor,
+                         .baselineOffset: baseline]))
         line.append(NSAttributedString(
             string: c.text,
-            attributes: [.font: NSFont.systemFont(ofSize: candidateFontSize),
-                         .foregroundColor: highlighted ? NSColor.white : NSColor.labelColor]))
-        if !c.comment.isEmpty {
-            line.append(NSAttributedString(
-                string: "  \(c.comment)",
-                attributes: [.font: NSFont.systemFont(ofSize: labelFontSize),
-                             .foregroundColor: highlighted ? NSColor.white.withAlphaComponent(0.7)
-                                                           : NSColor.tertiaryLabelColor,
-                             .baselineOffset: (candidateFontSize - labelFontSize) / 2]))
-        }
+            attributes: [.font: NSFont.systemFont(ofSize: candidateFontSize, weight: highlighted ? .semibold : .regular),
+                         .foregroundColor: textColor]))
+        return line
+    }
 
-        let label = ClickableRow(index: index) { [weak self] i in self?.onSelect?(i) }
-        label.attributedStringValue = line
-        guard highlighted else { return label }
+    private func measuredCandidateWidth(_ c: RimeCandidateModel, highlighted: Bool, compact: Bool) -> CGFloat {
+        candidateTitle(c, highlighted: highlighted).size().width + (compact ? 20 : 14)
+    }
 
-        let box = NSView()
-        box.wantsLayer = true
-        box.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
-        box.layer?.cornerRadius = 4
-        label.translatesAutoresizingMaskIntoConstraints = false
-        box.addSubview(label)
-        NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 6),
-            label.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -6),
-            label.topAnchor.constraint(equalTo: box.topAnchor, constant: 1),
-            label.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -1),
-        ])
-        return box
+    private func gridCellWidth(columns: Int) -> CGFloat {
+        let sideControlsWidth: CGFloat = 1 + 32 + 64 + 7 * 3
+        let available = baseWidth - 14 - sideControlsWidth - CGFloat(max(columns - 1, 0)) * 6
+        return max(70, floor(available / CGFloat(max(columns, 1))))
+    }
+
+    private func updateCandidateDocumentSize() {
+        let fit = candidateStack.fittingSize
+        let height = gridExpanded ? expandedCandidateHeight : compactCandidateHeight
+        candidateStack.setFrameSize(NSSize(width: max(fit.width, candidateScroll.contentSize.width),
+                                           height: height))
+    }
+
+    private func scrollSelectedIntoView() {
+        guard !gridExpanded,
+              let selected = candidateStack.arrangedSubviews.first(where: { $0 is NSButton && $0.tag == selectedIndex })
+        else { return }
+        candidateScroll.layoutSubtreeIfNeeded()
+        candidateStack.layoutSubtreeIfNeeded()
+        let contentWidth = candidateScroll.contentSize.width
+        let maxX = max(0, candidateStack.frame.width - contentWidth)
+        let targetX = min(max(0, selected.frame.midX - contentWidth / 2), maxX)
+        candidateScroll.contentView.scroll(to: NSPoint(x: targetX, y: 0))
+        candidateScroll.reflectScrolledClipView(candidateScroll.contentView)
+    }
+
+    private func applyAppearance() {
+        preeditLabel.textColor = RimeUI.textPrimary
+        strip.layer?.backgroundColor = RimeUI.candidateBackgroundColor.cgColor
+        strip.layer?.borderColor = RimeUI.borderStrong.cgColor
+        pageButton.contentTintColor = RimeUI.textSecondary
+        settingsButton.contentTintColor = RimeUI.textSecondary
+    }
+
+    private func contextSignature(_ ctx: RimeContextModel) -> String {
+        let candidates = ctx.candidates.map { "\($0.label):\($0.text):\($0.comment)" }.joined(separator: "|")
+        return "\(ctx.input)#\(ctx.preedit)#\(ctx.pageNo)#\(candidates)"
+    }
+
+    private func clamp(_ index: Int, count: Int) -> Int {
+        guard count > 0 else { return 0 }
+        return min(max(index, 0), count - 1)
+    }
+
+    @objc private func candidateTapped(_ sender: NSButton) {
+        selectedIndex = clamp(sender.tag, count: currentContext.candidates.count)
+        onSelect?(selectedIndex)
+    }
+
+    @objc private func toggleGridTapped() {
+        _ = gridExpanded ? collapseGrid() : expandGrid()
+    }
+
+    @objc private func settingsTapped() {
+        onSettings?()
     }
 }
 
-/// A label row that reports clicks with its page-local candidate index.
-private final class ClickableRow: NSTextField {
-    private let index: Int
-    private let onClick: (Int) -> Void
-
-    init(index: Int, onClick: @escaping (Int) -> Void) {
-        self.index = index
-        self.onClick = onClick
+private final class CandidatePillButton: NSButton {
+    init() {
         super.init(frame: .zero)
-        isEditable = false
         isBordered = false
-        drawsBackground = false
-        isSelectable = false
+        setButtonType(.momentaryChange)
+        focusRingType = .none
+        alignment = .center
+        wantsLayer = true
+        layer?.cornerRadius = 9
+        layer?.masksToBounds = true
+        cell?.lineBreakMode = .byTruncatingTail
+        cell?.usesSingleLineMode = true
+        translatesAutoresizingMaskIntoConstraints = false
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
     }
+
     required init?(coder: NSCoder) { fatalError() }
 
-    // The panel is nonactivating and never key, so every click is an "initial"
-    // mouse-down — without this it would be swallowed by the window server.
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
 
-    override func mouseDown(with event: NSEvent) { onClick(index) }
+private final class CandidateActionButton: NSButton {
+    init(symbolName: String, title: String) {
+        super.init(frame: .zero)
+        self.title = title
+        image = RimeUI.symbol(symbolName, pointSize: title.isEmpty ? 17 : 14, weight: .semibold)
+        image?.isTemplate = true
+        imagePosition = title.isEmpty ? .imageOnly : .imageLeading
+        imageScaling = .scaleProportionallyDown
+        isBordered = false
+        setButtonType(.momentaryChange)
+        focusRingType = .none
+        font = .systemFont(ofSize: 14, weight: .semibold)
+        contentTintColor = RimeUI.textSecondary
+        wantsLayer = true
+        layer?.cornerRadius = 9
+        layer?.backgroundColor = NSColor.clear.cgColor
+        translatesAutoresizingMaskIntoConstraints = false
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
