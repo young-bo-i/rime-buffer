@@ -26,6 +26,10 @@ final class BufferModel {
         stagedText.count
     }
 
+    var shouldDisplay: Bool {
+        enabled || !blocks.isEmpty
+    }
+
     /// Wired in main.swift → active controller's client. Returns false when no
     /// client is available (block stays queued and retries).
     var deliver: ((String) -> Bool)?

@@ -43,9 +43,17 @@ candidateWindow.onSettings = {
 BufferModel.shared.deliver = { text in
     RimeBufferController.active?.deliverText(text) ?? false
 }
-BufferModel.shared.onChange = {
+BufferSurface.shared.shouldSuppress = {
+    candidateWindow.isShowingInlineBuffer
+}
+candidateWindow.onInlineBufferVisibilityChanged = {
     BufferSurface.shared.refresh()
 }
+BufferModel.shared.onChange = {
+    candidateWindow.refreshBuffer()
+    BufferSurface.shared.refresh()
+}
+candidateWindow.refreshBuffer()
 BufferSurface.shared.refresh()   // restore visibility if buffer mode was left ON
 
 // Menu-bar entry (schema switching / health / log) + a safety net that hides a

@@ -16,6 +16,7 @@ final class BufferSurface {
     private let hint = NSTextField(labelWithString: "")
     private let flushButton = FirstMouseButton(title: "发送到输入框", target: nil, action: nil)
     private let clearButton = FirstMouseButton(title: "清空", target: nil, action: nil)
+    var shouldSuppress: (() -> Bool)?
 
     private init() {
         panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 560, height: 110),
@@ -116,10 +117,15 @@ final class BufferSurface {
     @objc private func flushTapped() { BufferModel.shared.flushAll() }
     @objc private func clearTapped() { BufferModel.shared.clear() }
 
-    /// Re-render from the model. Visible whenever buffer mode is ON.
+    /// Re-render from the model. Used as a fallback when the candidate panel
+    /// cannot host the inline buffer.
     func refresh() {
+        if shouldSuppress?() == true {
+            panel.orderOut(nil)
+            return
+        }
         let model = BufferModel.shared
-        guard model.enabled || !model.blocks.isEmpty else {
+        guard model.shouldDisplay else {
             panel.orderOut(nil)
             return
         }

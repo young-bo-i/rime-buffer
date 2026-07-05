@@ -11,22 +11,27 @@ final class CandidateWindow {
     private let candidateStack = NSStackView()
     private let pageButton = CandidateActionButton(symbolName: "chevron.down", title: "")
     private let settingsButton = CandidateActionButton(symbolName: "gearshape", title: "设置")
+    private let inlineBuffer = BufferInlineView()
     private var stripHeightConstraint: NSLayoutConstraint!
     private var candidateHeightConstraint: NSLayoutConstraint!
+    private var inlineBufferHeightConstraint: NSLayoutConstraint!
     private var lastGoodRect: [String: NSRect] = [:]
 
     private var currentContext = RimeContextModel()
     private var currentSignature = ""
     private var selectedIndex = 0
     private var gridExpanded = false
+    private var bufferOnly = false
     private var lastCaretRect = NSRect.zero
     private var lastBundleId = ""
     private var lastShowPreedit = false
 
     var onSelect: ((Int) -> Void)?
     var onSettings: (() -> Void)?
+    var onInlineBufferVisibilityChanged: (() -> Void)?
 
     var hasCandidates: Bool { panel.isVisible && !currentContext.candidates.isEmpty }
+    var isShowingInlineBuffer: Bool { panel.isVisible && !inlineBuffer.isHidden }
     var isGridExpanded: Bool { gridExpanded }
     var selectedCandidateIndex: Int? {
         guard hasCandidates else { return nil }
@@ -120,6 +125,10 @@ final class CandidateWindow {
         root.translatesAutoresizingMaskIntoConstraints = false
         root.addArrangedSubview(preeditLabel)
         root.addArrangedSubview(strip)
+        root.addArrangedSubview(inlineBuffer)
+        inlineBuffer.isHidden = true
+        inlineBufferHeightConstraint = inlineBuffer.heightAnchor.constraint(equalToConstant: 0)
+        inlineBufferHeightConstraint.isActive = true
 
         let content = NSView()
         content.addSubview(root)
@@ -132,6 +141,8 @@ final class CandidateWindow {
             strip.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             preeditLabel.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 2),
             preeditLabel.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -2),
+            inlineBuffer.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            inlineBuffer.trailingAnchor.constraint(equalTo: root.trailingAnchor),
         ])
         panel.contentView = content
 
@@ -143,6 +154,7 @@ final class CandidateWindow {
         ) { [weak self] _ in
             self?.applyAppearance()
             self?.renderCandidates()
+            self?.refreshBuffer()
         }
     }
 
@@ -161,6 +173,7 @@ final class CandidateWindow {
         if !sameComposition { gridExpanded = false }
 
         currentContext = ctx
+        bufferOnly = false
         lastCaretRect = caretRect
         lastBundleId = bundleId
         lastShowPreedit = showPreedit
@@ -169,13 +182,58 @@ final class CandidateWindow {
         preeditLabel.isHidden = preeditLabel.stringValue.isEmpty
         applyAppearance()
         renderCandidates()
+        refreshInlineBuffer()
         layoutPanel(caretRect: caretRect, bundleId: bundleId)
         panel.orderFrontRegardless()
+        onInlineBufferVisibilityChanged?()
+    }
+
+    func showBufferOnly(caretRect: NSRect, bundleId: String) {
+        guard BufferModel.shared.shouldDisplay else {
+            hide()
+            return
+        }
+        bufferOnly = true
+        gridExpanded = false
+        currentContext = RimeContextModel()
+        currentSignature = ""
+        selectedIndex = 0
+        lastCaretRect = caretRect
+        lastBundleId = bundleId
+        lastShowPreedit = false
+        preeditLabel.stringValue = ""
+        preeditLabel.isHidden = true
+        applyAppearance()
+        renderCandidates()
+        refreshInlineBuffer()
+        layoutPanel(caretRect: caretRect, bundleId: bundleId)
+        panel.orderFrontRegardless()
+        onInlineBufferVisibilityChanged?()
     }
 
     func hide() {
+        let wasShowingInlineBuffer = isShowingInlineBuffer
         gridExpanded = false
+        bufferOnly = false
         panel.orderOut(nil)
+        if wasShowingInlineBuffer {
+            onInlineBufferVisibilityChanged?()
+        }
+    }
+
+    func refreshBuffer() {
+        refreshInlineBuffer()
+        guard panel.isVisible else {
+            onInlineBufferVisibilityChanged?()
+            return
+        }
+        if inlineBuffer.isHidden, currentContext.candidates.isEmpty, preeditLabel.isHidden {
+            hide()
+            return
+        }
+        layoutPanel(caretRect: lastCaretRect, bundleId: lastBundleId)
+        panel.orderFrontRegardless()
+        onInlineBufferVisibilityChanged?()
     }
 
     @discardableResult
@@ -211,8 +269,10 @@ final class CandidateWindow {
 
     private func layoutPanel(caretRect: NSRect, bundleId: String) {
         let width = panelWidth(for: currentContext, caretRect: caretRect)
+        let bufferHeight = inlineBuffer.isHidden ? 0 : inlineBuffer.preferredHeight + root.spacing
         let height = (gridExpanded ? expandedStripHeight : compactStripHeight)
             + (preeditLabel.isHidden ? 0 : preeditHeight + root.spacing)
+            + bufferHeight
         panel.setContentSize(NSSize(width: width, height: height))
         panel.layoutIfNeeded()
         updateCandidateDocumentSize()
@@ -270,18 +330,29 @@ final class CandidateWindow {
 
         stripHeightConstraint.constant = gridExpanded ? expandedStripHeight : compactStripHeight
         candidateHeightConstraint.constant = gridExpanded ? expandedCandidateHeight : compactCandidateHeight
+        pageButton.isEnabled = !bufferOnly && !currentContext.candidates.isEmpty
+        candidateScroll.isHidden = false
         pageButton.image = RimeUI.symbol(gridExpanded ? "chevron.up" : "chevron.down",
                                          pointSize: 17,
                                          weight: .semibold)
         pageButton.toolTip = gridExpanded ? "收起候选" : "展开候选"
 
-        if gridExpanded {
+        if bufferOnly {
+            applyAppearance()
+            updateCandidateDocumentSize()
+            return
+        } else if gridExpanded {
             renderGrid()
         } else {
             renderCompactRow()
         }
         applyAppearance()
         updateCandidateDocumentSize()
+    }
+
+    private func refreshInlineBuffer() {
+        let visible = inlineBuffer.refresh()
+        inlineBufferHeightConstraint.constant = visible ? inlineBuffer.preferredHeight : 0
     }
 
     private func renderCompactRow() {

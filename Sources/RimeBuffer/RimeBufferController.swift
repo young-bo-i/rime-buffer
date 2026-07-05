@@ -55,6 +55,10 @@ final class RimeBufferController: IMKInputController {
         }
         StatusMenu.shared.setHealthy(true)
         ensureSessionReady(applyPreference: true)
+        let activeClient: IMKTextInput? = (sender as? IMKTextInput) ?? self.client()
+        if let client = activeClient, BufferModel.shared.shouldDisplay {
+            showBufferOnly(client: client)
+        }
     }
 
     /// Post-start initialization, shared by activateServer AND the key paths —
@@ -387,9 +391,16 @@ final class RimeBufferController: IMKInputController {
                                    caretRect: caretRect(for: client),
                                    bundleId: bid,
                                    showPreedit: mode == .placeholder)
+        } else if BufferModel.shared.shouldDisplay {
+            candidateWindow.showBufferOnly(caretRect: caretRect(for: client), bundleId: bid)
         } else {
             candidateWindow.hide()
         }
+    }
+
+    private func showBufferOnly(client: IMKTextInput) {
+        candidateWindow.showBufferOnly(caretRect: caretRect(for: client),
+                                       bundleId: bundleId(of: client))
     }
 
     private func refreshSchema() {
