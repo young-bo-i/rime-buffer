@@ -4,7 +4,7 @@ import UniformTypeIdentifiers
 
 /// Visual settings surface for schema management, appearance/buffer toggles,
 /// and local key-frequency statistics.
-final class SettingsWindowController: NSObject {
+final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     static let shared = SettingsWindowController()
 
     private enum Page: Int, CaseIterable {
@@ -31,13 +31,20 @@ final class SettingsWindowController: NSObject {
     private let schemaPopUp = NSPopUpButton()
     private let appearancePopUp = NSPopUpButton()
     private let bufferCheck = NSButton(checkboxWithTitle: "启用缓冲模式（提交先暂存，手动确认上屏）", target: nil, action: nil)
+    private var candidateMetricFields: [CandidateWindowMetric: NSTextField] = [:]
+    private var candidateMetricSteppers: [CandidateWindowMetric: NSStepper] = [:]
     private let statsDatePicker = NSDatePicker()
     private let statsSummary = NSTextField(labelWithString: "")
     private let statsTopKey = NSTextField(labelWithString: "")
+    private let installStatus = NSTextField(labelWithString: "")
     private let heatmapView = KeyboardHeatmapView()
 
     private var userDir: URL {
         URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/RimeBuffer")
+    }
+
+    private var installLogURL: URL {
+        URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("rimebuffer-install.log")
     }
 
     func show() {
@@ -131,6 +138,7 @@ final class SettingsWindowController: NSObject {
         }
         appearancePopUp.target = self
         appearancePopUp.action = #selector(appearanceChosen)
+        configureCandidateMetricControls()
 
         statsDatePicker.datePickerElements = [.yearMonthDay]
         statsDatePicker.datePickerStyle = .textFieldAndStepper
@@ -141,8 +149,43 @@ final class SettingsWindowController: NSObject {
         statsSummary.font = .systemFont(ofSize: 13, weight: .semibold)
         statsTopKey.font = .systemFont(ofSize: 12)
         statsTopKey.textColor = .secondaryLabelColor
+        installStatus.font = .systemFont(ofSize: 11)
+        installStatus.textColor = .tertiaryLabelColor
         heatmapView.translatesAutoresizingMaskIntoConstraints = false
         heatmapView.heightAnchor.constraint(greaterThanOrEqualToConstant: 330).isActive = true
+    }
+
+    private func configureCandidateMetricControls() {
+        for metric in CandidateWindowMetric.allCases {
+            let formatter = NumberFormatter()
+            formatter.minimumFractionDigits = 0
+            formatter.maximumFractionDigits = 0
+            formatter.allowsFloats = false
+            formatter.minimum = NSNumber(value: metric.range.lowerBound)
+            formatter.maximum = NSNumber(value: metric.range.upperBound)
+
+            let field = NSTextField(string: "")
+            field.formatter = formatter
+            field.alignment = .right
+            field.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+            field.target = self
+            field.action = #selector(candidateMetricFieldChanged(_:))
+            field.delegate = self
+            field.tag = metric.tag
+            field.translatesAutoresizingMaskIntoConstraints = false
+            field.widthAnchor.constraint(equalToConstant: 64).isActive = true
+
+            let stepper = NSStepper()
+            stepper.minValue = metric.range.lowerBound
+            stepper.maxValue = metric.range.upperBound
+            stepper.increment = 1
+            stepper.target = self
+            stepper.action = #selector(candidateMetricStepperChanged(_:))
+            stepper.tag = metric.tag
+
+            candidateMetricFields[metric] = field
+            candidateMetricSteppers[metric] = stepper
+        }
     }
 
     private func showPage(_ page: Page) {
@@ -184,6 +227,15 @@ final class SettingsWindowController: NSObject {
             "配置目录是 ~/Library/RimeBuffer。导入的方案会自动加入 schema_list；改动配置后点「重新部署并重启」生效。")
         note.font = .systemFont(ofSize: 11)
         note.textColor = .tertiaryLabelColor
+        let reinstallBtn = NSButton(title: "重新安装输入法", target: self, action: #selector(reinstallInputMethod))
+        let openInstallLogBtn = NSButton(title: "打开安装日志", target: self, action: #selector(openInstallLog))
+        let installButtons = NSStackView(views: [reinstallBtn, openInstallLogBtn])
+        installButtons.orientation = .horizontal
+        installButtons.spacing = 8
+        let installNote = NSTextField(wrappingLabelWithString:
+            "从当前源码目录运行 build_install.sh；会重新构建、替换并重启 RimeBuffer。")
+        installNote.font = .systemFont(ofSize: 11)
+        installNote.textColor = .tertiaryLabelColor
 
         return contentColumn([
             title("方案"),
@@ -196,6 +248,11 @@ final class SettingsWindowController: NSObject {
             sectionLabel("配置目录"),
             openDirBtn,
             note,
+            spacer(16),
+            sectionLabel("安装"),
+            installButtons,
+            installStatus,
+            installNote,
         ])
     }
 
@@ -209,6 +266,9 @@ final class SettingsWindowController: NSObject {
             spacer(16),
             sectionLabel("外观"),
             appearancePopUp,
+            spacer(16),
+            sectionLabel("候选窗尺寸"),
+            candidateMetricsView(),
         ])
     }
 
@@ -286,6 +346,52 @@ final class SettingsWindowController: NSObject {
         return v
     }
 
+    private func candidateMetricsView() -> NSView {
+        let rows = CandidateWindowMetric.allCases.map(candidateMetricRow)
+        let applyBtn = NSButton(title: "应用修改", target: self, action: #selector(applyCandidateMetrics))
+        applyBtn.bezelStyle = .rounded
+        applyBtn.bezelColor = .controlAccentColor
+
+        let resetBtn = NSButton(title: "恢复默认", target: self, action: #selector(resetCandidateMetrics))
+        resetBtn.bezelStyle = .rounded
+        let actions = NSStackView(views: [applyBtn, resetBtn])
+        actions.orientation = .horizontal
+        actions.alignment = .centerY
+        actions.spacing = 8
+
+        let stack = NSStackView(views: rows + [actions])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 7
+        return stack
+    }
+
+    private func candidateMetricRow(_ metric: CandidateWindowMetric) -> NSView {
+        let label = NSTextField(labelWithString: metric.title)
+        label.alignment = .right
+        label.font = .systemFont(ofSize: 12)
+        label.textColor = .secondaryLabelColor
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.widthAnchor.constraint(equalToConstant: 96).isActive = true
+
+        let unit = NSTextField(labelWithString: metric.unit)
+        unit.font = .systemFont(ofSize: 11)
+        unit.textColor = .tertiaryLabelColor
+        unit.translatesAutoresizingMaskIntoConstraints = false
+        unit.widthAnchor.constraint(equalToConstant: 24).isActive = true
+
+        let field = candidateMetricFields[metric] ?? NSTextField(string: "")
+        let stepper = candidateMetricSteppers[metric] ?? NSStepper()
+        field.removeFromSuperview()
+        stepper.removeFromSuperview()
+
+        let row = NSStackView(views: [label, field, stepper, unit])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        return row
+    }
+
     // MARK: State
 
     private func reload() {
@@ -307,7 +413,20 @@ final class SettingsWindowController: NSObject {
         }) {
             appearancePopUp.selectItem(at: idx)
         }
+        refreshCandidateMetricControls()
         refreshStats()
+    }
+
+    private func refreshCandidateMetricControls() {
+        for metric in CandidateWindowMetric.allCases {
+            let value = CandidateWindowMetrics.value(for: metric)
+            candidateMetricFields[metric]?.stringValue = formatMetricValue(value)
+            candidateMetricSteppers[metric]?.doubleValue = Double(value)
+        }
+    }
+
+    private func formatMetricValue(_ value: CGFloat) -> String {
+        "\(Int(value.rounded()))"
     }
 
     private func refreshStats() {
@@ -436,6 +555,52 @@ final class SettingsWindowController: NSObject {
         }
     }
 
+    @objc private func reinstallInputMethod() {
+        guard let script = installScriptURL() else {
+            info("找不到 build_install.sh。默认查找：~/Documents/DEV/rime-buffer 或 ~/Documents/05-dev/apps/rime-buffer。")
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "重新安装 RimeBuffer？"
+        alert.informativeText = "将从 \(script.deletingLastPathComponent().path) 运行 build_install.sh。构建完成后当前输入法进程会被重启。"
+        alert.addButton(withTitle: "重新安装")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        RimeBufferController.active?.forceCommit()
+        KeyFrequencyStore.shared.saveNow()
+
+        let command = [
+            "cd \(shellQuote(script.deletingLastPathComponent().path))",
+            "nohup /bin/bash ./build_install.sh > \(shellQuote(installLogURL.path)) 2>&1 &",
+        ].joined(separator: " && ")
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-lc", command]
+        do {
+            try process.run()
+            installStatus.stringValue = "安装已启动，日志：~/rimebuffer-install.log"
+            IMELog.write("settings: launched install script \(script.path)")
+        } catch {
+            installStatus.stringValue = "安装启动失败"
+            info("安装启动失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func installScriptURL() -> URL? {
+        let home = URL(fileURLWithPath: NSHomeDirectory())
+        let candidates = [
+            home.appendingPathComponent("Documents/DEV/rime-buffer/build_install.sh"),
+            home.appendingPathComponent("Documents/05-dev/apps/rime-buffer/build_install.sh"),
+        ]
+        return candidates.first { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
+    private func shellQuote(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
+    }
+
     @objc private func bufferToggled() {
         BufferModel.shared.enabled = bufferCheck.state == .on
     }
@@ -445,6 +610,49 @@ final class SettingsWindowController: NSObject {
               let mode = RimeAppearanceMode(rawValue: raw) else { return }
         RimeUI.appearance = mode
         IMELog.write("appearance -> \(mode.rawValue)")
+    }
+
+    @objc private func candidateMetricFieldChanged(_ sender: NSTextField) {
+        syncCandidateMetricControl(tag: sender.tag, value: sender.doubleValue)
+    }
+
+    @objc private func candidateMetricStepperChanged(_ sender: NSStepper) {
+        syncCandidateMetricControl(tag: sender.tag, value: sender.doubleValue)
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        guard let field = obj.object as? NSTextField,
+              candidateMetricFields.values.contains(where: { $0 === field }) else { return }
+        syncCandidateMetricControl(tag: field.tag, value: field.doubleValue)
+    }
+
+    private func syncCandidateMetricControl(tag: Int, value: Double) {
+        guard let metric = CandidateWindowMetric.fromTag(tag) else { return }
+        let clamped = clamp(value, to: metric.range)
+        candidateMetricFields[metric]?.stringValue = formatMetricValue(CGFloat(clamped))
+        candidateMetricSteppers[metric]?.doubleValue = clamped
+    }
+
+    @objc private func applyCandidateMetrics() {
+        window?.makeFirstResponder(nil)
+        var values: [CandidateWindowMetric: Double] = [:]
+        for metric in CandidateWindowMetric.allCases {
+            let raw = candidateMetricFields[metric]?.doubleValue
+                ?? candidateMetricSteppers[metric]?.doubleValue
+                ?? metric.defaultValue
+            values[metric] = clamp(raw, to: metric.range)
+        }
+        CandidateWindowMetrics.apply(values)
+        refreshCandidateMetricControls()
+    }
+
+    @objc private func resetCandidateMetrics() {
+        CandidateWindowMetrics.resetToDefaults()
+        refreshCandidateMetricControls()
+    }
+
+    private func clamp(_ value: Double, to range: ClosedRange<Double>) -> Double {
+        min(max(value, range.lowerBound), range.upperBound)
     }
 
     @objc private func statsDateChanged() {
@@ -467,6 +675,10 @@ final class SettingsWindowController: NSObject {
 
     @objc private func openDir() {
         NSWorkspace.shared.open(userDir)
+    }
+
+    @objc private func openInstallLog() {
+        NSWorkspace.shared.open(installLogURL)
     }
 
     private func info(_ message: String) {

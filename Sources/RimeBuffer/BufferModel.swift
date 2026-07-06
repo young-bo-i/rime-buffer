@@ -33,7 +33,7 @@ final class BufferModel {
     /// Wired in main.swift → active controller's client. Returns false when no
     /// client is available (block stays queued and retries).
     var deliver: ((String) -> Bool)?
-    /// Wired to the surface panel.
+    /// Wired to the candidate-window buffer UI.
     var onChange: (() -> Void)?
     /// Set by the controller around composition state. Future automatic flush or
     /// edit-mode operations must still respect it.
@@ -56,9 +56,18 @@ final class BufferModel {
         onChange?()
     }
 
-    /// Send a copy of everything now, oldest first. Keep blocks queued because
-    /// IMK insertText provides no success acknowledgement from the target app.
-    func flushAll() {
+    @discardableResult
+    func removeLastBlock() -> Bool {
+        guard let removed = blocks.popLast() else { return false }
+        IMELog.write("buffer remove last block '\(removed.text)' remaining=\(blocks.count)")
+        onChange?()
+        return true
+    }
+
+    /// Send everything now, oldest first. If every delivery path accepts the
+    /// text, clear the queue and leave buffer mode; otherwise preserve state so
+    /// the user can retry.
+    func sendAllAndExit() {
         guard !blocks.isEmpty else { return }
         IMELog.write("buffer send start blocks=\(blocks.count) chars=\(stagedCharacterCount)")
         for block in blocks {
@@ -69,8 +78,10 @@ final class BufferModel {
             }
             IMELog.write("buffer send attempted '\(block.text)'")
         }
-        IMELog.write("buffer send end; preserved \(blocks.count) blocks")
-        onChange?()
+        let count = blocks.count
+        blocks.removeAll()
+        IMELog.write("buffer send end; cleared \(count) blocks and disabled buffer mode")
+        enabled = false
     }
 
     func clear() {

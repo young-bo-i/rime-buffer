@@ -3,19 +3,15 @@ import Cocoa
 /// Compact buffer renderer that can live inside the candidate panel. It reads
 /// from BufferModel only; delivery and clearing still go through the model.
 final class BufferInlineView: NSView {
-    private let titleLabel = NSTextField(labelWithString: "缓冲区")
-    private let hintLabel = NSTextField(labelWithString: "")
-    private let previewLabel = NSTextField(labelWithString: "")
     private let chipScroll = NSScrollView()
     private let chipRow = NSStackView()
-    private let flushButton = FirstMouseButton(title: "发送", target: nil, action: nil)
-    private let clearButton = FirstMouseButton(title: "清空", target: nil, action: nil)
-
-    private let previewBox = NSView()
-    private var hasBlocks = false
+    private let leadingSpacer = NSView()
+    private let emptyLabel = NSTextField(labelWithString: "等待暂存内容")
+    private let flushButton = FirstMouseButton(title: "", target: nil, action: nil)
+    private let clearButton = FirstMouseButton(title: "", target: nil, action: nil)
 
     var preferredHeight: CGFloat {
-        hasBlocks ? 86 : 30
+        34
     }
 
     override init(frame frameRect: NSRect) {
@@ -26,50 +22,27 @@ final class BufferInlineView: NSView {
         layer?.borderWidth = 1
         layer?.masksToBounds = true
 
-        titleLabel.font = .systemFont(ofSize: 11, weight: .semibold)
-        titleLabel.textColor = .secondaryLabelColor
+        emptyLabel.font = .systemFont(ofSize: 12)
+        emptyLabel.lineBreakMode = .byTruncatingTail
 
-        hintLabel.font = .systemFont(ofSize: 11)
-        hintLabel.textColor = .tertiaryLabelColor
-        hintLabel.lineBreakMode = .byTruncatingTail
-
-        flushButton.bezelStyle = .rounded
-        flushButton.controlSize = .mini
+        configureIconButton(flushButton,
+                            symbolName: "paperplane.fill",
+                            toolTip: "发送到输入框")
         flushButton.target = self
         flushButton.action = #selector(flushTapped)
 
-        clearButton.bezelStyle = .rounded
-        clearButton.controlSize = .mini
+        configureIconButton(clearButton,
+                            symbolName: "trash",
+                            toolTip: "清空缓冲区")
         clearButton.target = self
         clearButton.action = #selector(clearTapped)
-
-        let spacer = NSView()
-        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let header = NSStackView(views: [titleLabel, hintLabel, spacer, flushButton, clearButton])
-        header.orientation = .horizontal
-        header.alignment = .centerY
-        header.spacing = 6
-
-        previewBox.wantsLayer = true
-        previewBox.layer?.cornerRadius = 7
-        previewBox.layer?.borderWidth = 1
-
-        previewLabel.font = .systemFont(ofSize: 14)
-        previewLabel.lineBreakMode = .byTruncatingTail
-        previewLabel.maximumNumberOfLines = 1
-        previewLabel.translatesAutoresizingMaskIntoConstraints = false
-        previewBox.addSubview(previewLabel)
-        NSLayoutConstraint.activate([
-            previewLabel.leadingAnchor.constraint(equalTo: previewBox.leadingAnchor, constant: 8),
-            previewLabel.trailingAnchor.constraint(equalTo: previewBox.trailingAnchor, constant: -8),
-            previewLabel.topAnchor.constraint(equalTo: previewBox.topAnchor, constant: 4),
-            previewLabel.bottomAnchor.constraint(equalTo: previewBox.bottomAnchor, constant: -4),
-            previewBox.heightAnchor.constraint(equalToConstant: 28),
-        ])
 
         chipRow.orientation = .horizontal
         chipRow.spacing = 5
         chipRow.alignment = .centerY
+        chipRow.distribution = .fill
+        leadingSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        leadingSpacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         chipScroll.drawsBackground = false
         chipScroll.hasHorizontalScroller = false
@@ -78,19 +51,27 @@ final class BufferInlineView: NSView {
         chipScroll.verticalScrollElasticity = .none
         chipScroll.documentView = chipRow
         chipScroll.translatesAutoresizingMaskIntoConstraints = false
+        chipScroll.setContentHuggingPriority(.defaultLow, for: .horizontal)
         chipScroll.heightAnchor.constraint(equalToConstant: 24).isActive = true
 
-        let column = NSStackView(views: [header, previewBox, chipScroll])
-        column.orientation = .vertical
-        column.spacing = 4
-        column.edgeInsets = NSEdgeInsets(top: 4, left: 8, bottom: 5, right: 8)
-        column.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(column)
+        let controls = NSStackView(views: [flushButton, clearButton])
+        controls.orientation = .horizontal
+        controls.alignment = .centerY
+        controls.spacing = 4
+        controls.setContentHuggingPriority(.required, for: .horizontal)
+
+        let row = NSStackView(views: [chipScroll, controls])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 7
+        row.edgeInsets = NSEdgeInsets(top: 5, left: 8, bottom: 5, right: 7)
+        row.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(row)
         NSLayoutConstraint.activate([
-            column.leadingAnchor.constraint(equalTo: leadingAnchor),
-            column.trailingAnchor.constraint(equalTo: trailingAnchor),
-            column.topAnchor.constraint(equalTo: topAnchor),
-            column.bottomAnchor.constraint(equalTo: bottomAnchor),
+            row.leadingAnchor.constraint(equalTo: leadingAnchor),
+            row.trailingAnchor.constraint(equalTo: trailingAnchor),
+            row.topAnchor.constraint(equalTo: topAnchor),
+            row.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
 
         applyAppearance()
@@ -102,30 +83,22 @@ final class BufferInlineView: NSView {
     func refresh() -> Bool {
         let model = BufferModel.shared
         let shouldShow = model.shouldDisplay
-        hasBlocks = !model.blocks.isEmpty
 
         chipRow.arrangedSubviews.forEach {
             chipRow.removeArrangedSubview($0)
             $0.removeFromSuperview()
         }
-        for (index, block) in model.blocks.enumerated() {
-            chipRow.addArrangedSubview(chip(for: block, index: index))
+        chipRow.addArrangedSubview(leadingSpacer)
+        if model.blocks.isEmpty {
+            chipRow.addArrangedSubview(emptyLabel)
+        } else {
+            for block in model.blocks {
+                chipRow.addArrangedSubview(chip(for: block))
+            }
         }
 
-        let text = model.stagedText
-        previewLabel.stringValue = text
-        previewLabel.toolTip = text.isEmpty ? nil : text
-        previewLabel.textColor = text.isEmpty ? .tertiaryLabelColor : .labelColor
-
-        hintLabel.stringValue = model.blocks.isEmpty
-            ? "等待暂存内容"
-            : "\(model.blocks.count) 块 · \(model.stagedCharacterCount) 字"
-        flushButton.isHidden = model.blocks.isEmpty
-        clearButton.isHidden = model.blocks.isEmpty
         flushButton.isEnabled = !model.blocks.isEmpty
         clearButton.isEnabled = !model.blocks.isEmpty
-        previewBox.isHidden = model.blocks.isEmpty
-        chipScroll.isHidden = model.blocks.isEmpty
 
         applyAppearance()
         layoutSubtreeIfNeeded()
@@ -135,14 +108,7 @@ final class BufferInlineView: NSView {
         return shouldShow
     }
 
-    private func chip(for block: BufferModel.Block, index: Int) -> NSView {
-        let indexLabel = NSTextField(labelWithString: "\(index + 1)")
-        indexLabel.font = .monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
-        indexLabel.textColor = .secondaryLabelColor
-        indexLabel.alignment = .center
-        indexLabel.translatesAutoresizingMaskIntoConstraints = false
-        indexLabel.widthAnchor.constraint(equalToConstant: 16).isActive = true
-
+    private func chip(for block: BufferModel.Block) -> NSView {
         let label = NSTextField(labelWithString: block.text)
         label.font = .systemFont(ofSize: 12)
         label.textColor = .labelColor
@@ -150,10 +116,9 @@ final class BufferInlineView: NSView {
         label.maximumNumberOfLines = 1
         label.toolTip = block.text
 
-        let row = NSStackView(views: [indexLabel, label])
+        let row = NSStackView(views: [label])
         row.orientation = .horizontal
         row.alignment = .centerY
-        row.spacing = 3
 
         let box = NSView()
         box.wantsLayer = true
@@ -175,10 +140,32 @@ final class BufferInlineView: NSView {
         return box
     }
 
+    private func configureIconButton(_ button: FirstMouseButton,
+                                     symbolName: String,
+                                     toolTip: String) {
+        button.image = RimeUI.symbol(symbolName, pointSize: 13, weight: .semibold)
+        button.image?.isTemplate = true
+        button.imagePosition = .imageOnly
+        button.imageScaling = .scaleProportionallyDown
+        button.isBordered = false
+        button.setButtonType(.momentaryChange)
+        button.focusRingType = .none
+        button.toolTip = toolTip
+        button.contentTintColor = RimeUI.textSecondary
+        button.wantsLayer = true
+        button.layer?.cornerRadius = 6
+        button.layer?.backgroundColor = NSColor.clear.cgColor
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 24).isActive = true
+    }
+
     private func updateChipDocumentSize() {
         let fit = chipRow.fittingSize
         let documentWidth = max(fit.width, chipScroll.contentSize.width)
         chipRow.setFrameSize(NSSize(width: documentWidth, height: 24))
+        chipRow.needsLayout = true
+        chipRow.layoutSubtreeIfNeeded()
     }
 
     private func scrollChipsToNewest() {
@@ -190,19 +177,21 @@ final class BufferInlineView: NSView {
     private func applyAppearance() {
         layer?.backgroundColor = RimeUI.candidateBackgroundColor.cgColor
         layer?.borderColor = RimeUI.borderStrong.cgColor
-        titleLabel.textColor = RimeUI.textSecondary
-        hintLabel.textColor = RimeUI.textMuted
-        previewBox.layer?.backgroundColor = NSColor.textBackgroundColor.withAlphaComponent(
-            RimeUI.isNight ? 0.14 : 0.62
-        ).cgColor
-        previewBox.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.28).cgColor
+        emptyLabel.textColor = RimeUI.textMuted
+        flushButton.contentTintColor = flushButton.isEnabled ? RimeUI.textSecondary : RimeUI.textMuted
+        clearButton.contentTintColor = clearButton.isEnabled ? RimeUI.textSecondary : RimeUI.textMuted
     }
 
     @objc private func flushTapped() {
-        BufferModel.shared.flushAll()
+        BufferModel.shared.sendAllAndExit()
     }
 
     @objc private func clearTapped() {
         BufferModel.shared.clear()
     }
+}
+
+/// A button that works on the first click inside a never-key panel.
+final class FirstMouseButton: NSButton {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }

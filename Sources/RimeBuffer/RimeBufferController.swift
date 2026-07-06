@@ -13,11 +13,16 @@ final class RimeBufferController: IMKInputController {
     /// The controller currently owning focus — StatusMenu routes schema
     /// switches here so they apply to the live session immediately.
     private(set) static weak var active: RimeBufferController?
+    private static weak var recent: RimeBufferController?
     private static var chordDurationCache: TimeInterval?
+    private static let duplicateBackspaceCommandWindow: CFTimeInterval = 0.05
 
     private var session: UInt64 = 0
     private var currentSchemaId = ""
     private var lastModifiers: NSEvent.ModifierFlags = []
+    private var lastClient: IMKTextInput?
+    private var lastBufferBackspaceKeyHandledAt: CFAbsoluteTime = 0
+    private var lastBufferBackspaceCommandHandledAt: CFAbsoluteTime = 0
     private let composition = CompositionSession()
     private let chord = ChordController()
 
@@ -48,6 +53,11 @@ final class RimeBufferController: IMKInputController {
         // held or locked across a focus change.
         lastModifiers = NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
         Self.active = self
+        Self.recent = self
+        let activeClient: IMKTextInput? = (sender as? IMKTextInput) ?? self.client()
+        if let activeClient {
+            lastClient = activeClient
+        }
         guard rimeEngine.start() else {
             StatusMenu.shared.setHealthy(false)
             IMELog.write("activate: engine down — raw passthrough mode")
@@ -55,9 +65,9 @@ final class RimeBufferController: IMKInputController {
         }
         StatusMenu.shared.setHealthy(true)
         ensureSessionReady(applyPreference: true)
-        let activeClient: IMKTextInput? = (sender as? IMKTextInput) ?? self.client()
-        if let client = activeClient, BufferModel.shared.shouldDisplay {
-            showBufferOnly(client: client)
+        if let activeClient, BufferModel.shared.shouldDisplay {
+            candidateWindow.showBufferOnly(caretRect: caretRect(for: activeClient),
+                                           bundleId: bundleId(of: activeClient))
         }
     }
 
@@ -90,6 +100,7 @@ final class RimeBufferController: IMKInputController {
         // IMK sometimes passes a nil/non-client sender here — fall back to
         // client() (Squirrel-proven) so live marked text never strands.
         resolveComposition(client: (sender as? IMKTextInput) ?? (self.client() as IMKTextInput?))
+        Self.recent = self
         if Self.active === self { Self.active = nil }
     }
 
@@ -129,6 +140,9 @@ final class RimeBufferController: IMKInputController {
 
     override func handle(_ event: NSEvent!, client sender: Any!) -> Bool {
         guard let event, let client = sender as? IMKTextInput else { return false }
+        Self.active = self
+        Self.recent = self
+        lastClient = client
         switch event.type {
         case .flagsChanged: return handleFlags(event, client: client)
         case .keyDown:      return handleKeyDown(event, client: client)
@@ -156,10 +170,99 @@ final class RimeBufferController: IMKInputController {
             return false
         }
         let mask = RimeKey.modifierMask(from: event.modifierFlags)
-        if mask == 0, handleCandidateKey(keycode, client: client) {
+        if handleBufferBackspace(keycode, mask: mask, client: client) {
             return true
         }
+        if mask == 0 {
+            if handleCandidateKey(keycode, client: client) {
+                return true
+            }
+            if keycode == RimeKey.return, commitRawInput(client: client) {
+                return true
+            }
+        }
         return processRimeKey(keycode, mask: mask, client: client)
+    }
+
+    private func handleBufferBackspace(_ keycode: Int32, mask: Int32, client: IMKTextInput) -> Bool {
+        guard keycode == RimeKey.backspace,
+              BufferModel.shared.enabled,
+              mask & (RimeKey.controlMask | RimeKey.altMask | RimeKey.superMask) == 0 else {
+            return false
+        }
+
+        let now = CFAbsoluteTimeGetCurrent()
+        if now - lastBufferBackspaceCommandHandledAt < Self.duplicateBackspaceCommandWindow {
+            IMELog.write("buffer backspace key consumed after command")
+            lastBufferBackspaceKeyHandledAt = now
+            return true
+        }
+
+        lastBufferBackspaceKeyHandledAt = now
+        return performBufferBackspace(client: client, source: "key")
+    }
+
+    override func didCommand(by selector: Selector!, client sender: Any!) -> Bool {
+        guard let selector else { return false }
+        guard isDeleteBackwardSelector(selector),
+              BufferModel.shared.enabled else {
+            return false
+        }
+
+        let now = CFAbsoluteTimeGetCurrent()
+        if now - lastBufferBackspaceKeyHandledAt < Self.duplicateBackspaceCommandWindow {
+            IMELog.write("buffer backspace command consumed after key selector=\(NSStringFromSelector(selector))")
+            lastBufferBackspaceCommandHandledAt = now
+            return true
+        }
+
+        guard let client = (sender as? IMKTextInput) ?? (self.client() as IMKTextInput?) else {
+            if !BufferModel.shared.removeLastBlock() {
+                IMELog.write("buffer backspace command consumed; no client/no blocks")
+            }
+            lastBufferBackspaceCommandHandledAt = now
+            return true
+        }
+
+        Self.active = self
+        Self.recent = self
+        lastClient = client
+        lastBufferBackspaceCommandHandledAt = now
+        return performBufferBackspace(client: client, source: "command:\(NSStringFromSelector(selector))")
+    }
+
+    private func isDeleteBackwardSelector(_ selector: Selector) -> Bool {
+        selector == #selector(NSResponder.deleteBackward(_:))
+            || selector == #selector(NSResponder.deleteBackwardByDecomposingPreviousCharacter(_:))
+    }
+
+    private func performBufferBackspace(client: IMKTextInput, source: String) -> Bool {
+        guard rimeEngine.start(), ensureSessionReady(), session != 0 else {
+            if !BufferModel.shared.removeLastBlock() {
+                IMELog.write("buffer backspace \(source) consumed; engine unavailable/no blocks")
+            }
+            BufferModel.shared.compositionActive = false
+            candidateWindow.refreshBuffer()
+            return true
+        }
+
+        if chord.hasPending || composition.composing {
+            _ = processRimeKey(RimeKey.backspace, mask: 0, client: client)
+            return true
+        }
+
+        let ctx = rimeEngine.getContext(session: session)
+        if ctx.active || !ctx.input.isEmpty || !ctx.preedit.isEmpty {
+            _ = processRimeKey(RimeKey.backspace, mask: 0, client: client)
+            return true
+        }
+
+        if !BufferModel.shared.removeLastBlock() {
+            IMELog.write("buffer backspace \(source) consumed; no blocks")
+        }
+        BufferModel.shared.compositionActive = false
+        updateUI(client: client)
+        return true
     }
 
     /// keyDown → Rime keysym: letters/punct/F-keys via the virtual-key table,
@@ -307,25 +410,42 @@ final class RimeBufferController: IMKInputController {
     // MARK: Candidate selection (mouse; routed here via `active` from main.swift)
 
     private func handleCandidateKey(_ keycode: Int32, client: IMKTextInput) -> Bool {
-        guard candidateWindow.hasCandidates else { return false }
+        guard candidateWindow.isVisible else { return false }
         switch keycode {
         case RimeKey.left:
             return candidateWindow.moveSelection(delta: -1)
         case RimeKey.right:
             return candidateWindow.moveSelection(delta: 1)
         case RimeKey.down:
-            return candidateWindow.expandGrid()
+            return pageCandidates(delta: 1, client: client)
         case RimeKey.up:
-            return candidateWindow.collapseGrid()
-        case RimeKey.return, 0x20:
+            return pageCandidates(delta: -1, client: client)
+        case RimeKey.return:
+            return commitRawInput(client: client)
+        case 0x20:
             guard let index = candidateWindow.selectedCandidateIndex else { return false }
             selectCandidate(onPage: index)
             return true
-        case RimeKey.escape:
-            return candidateWindow.collapseGrid()
+        case 0x30:
+            candidateWindow.performBufferAction()
+            return true
         default:
             return false
         }
+    }
+
+    func pageCandidates(delta: Int) {
+        guard let client = self.client() else { return }
+        _ = pageCandidates(delta: delta, client: client)
+    }
+
+    @discardableResult
+    private func pageCandidates(delta: Int, client: IMKTextInput) -> Bool {
+        guard candidateWindow.hasCandidates else { return false }
+        if candidateWindow.movePage(delta: delta) { return true }
+        let keycode = delta < 0 ? RimeKey.pageUp : RimeKey.pageDown
+        _ = processRimeKey(keycode, mask: 0, client: client)
+        return true
     }
 
     func selectCandidate(onPage index: Int) {
@@ -333,6 +453,39 @@ final class RimeBufferController: IMKInputController {
         guard rimeEngine.selectCandidate(onPage: index, session: session) else { return }
         drainCommit(client)
         updateUI(client: client)
+    }
+
+    private func commitRawInput(client: IMKTextInput) -> Bool {
+        guard session != 0 else { return false }
+
+        var ctx = rimeEngine.getContext(session: session)
+        var raw = ctx.input
+        if raw.isEmpty, candidateWindow.isVisible {
+            raw = candidateWindow.rawInputForCommit
+        }
+        if chord.hasPending {
+            chord.flush()
+            ctx = rimeEngine.getContext(session: session)
+            raw = ctx.input
+            if raw.isEmpty, candidateWindow.isVisible {
+                raw = candidateWindow.rawInputForCommit
+            }
+        }
+        guard !raw.isEmpty else { return false }
+
+        rimeEngine.clearComposition(session: session)
+        if BufferModel.shared.enabled {
+            BufferModel.shared.append(raw)
+            composition.clear(client: client)
+            IMELog.write("raw input '\(raw)' -> buffer (\(BufferModel.shared.blocks.count) blocks)")
+        } else {
+            Delivery.insert(raw, into: client)
+            composition.commitDidInsert()
+            IMELog.write("raw input '\(raw)' -> \(bundleId(of: client))")
+        }
+        BufferModel.shared.compositionActive = false
+        updateUI(client: client)
+        return true
     }
 
     // MARK: Commit drain + UI
@@ -356,9 +509,46 @@ final class RimeBufferController: IMKInputController {
     /// Buffer-flush destination: insert into whatever field currently has
     /// focus. Called via the sink wired in main.swift.
     func deliverText(_ text: String) -> Bool {
-        guard let client: IMKTextInput = self.client() else { return false }
+        let liveClient: IMKTextInput? = self.client()
+        guard let client = liveClient ?? lastClient else {
+            IMELog.write("buffer send blocked; no active IMK client")
+            return false
+        }
         Delivery.insert(text, into: client)
+        lastClient = client
         return true
+    }
+
+    static func deliverBufferedText(_ text: String) -> Bool {
+        guard let controller = active ?? recent else {
+            IMELog.write("buffer send blocked; no active/recent controller")
+            return false
+        }
+        return controller.deliverText(text)
+    }
+
+    static func refreshBufferDisplayForCurrentOrRecent() {
+        if let controller = active ?? recent {
+            controller.refreshBufferDisplay()
+        } else {
+            candidateWindow.refreshBuffer()
+        }
+    }
+
+    func refreshBufferDisplay() {
+        if candidateWindow.isVisible {
+            candidateWindow.refreshBuffer()
+            return
+        }
+
+        let liveClient: IMKTextInput? = self.client()
+        guard let client = liveClient ?? lastClient,
+              BufferModel.shared.shouldDisplay else {
+            candidateWindow.refreshBuffer()
+            return
+        }
+        candidateWindow.showBufferOnly(caretRect: caretRect(for: client),
+                                       bundleId: bundleId(of: client))
     }
 
     private func updateUI(client: IMKTextInput) {
@@ -396,11 +586,6 @@ final class RimeBufferController: IMKInputController {
         } else {
             candidateWindow.hide()
         }
-    }
-
-    private func showBufferOnly(client: IMKTextInput) {
-        candidateWindow.showBufferOnly(caretRect: caretRect(for: client),
-                                       bundleId: bundleId(of: client))
     }
 
     private func refreshSchema() {

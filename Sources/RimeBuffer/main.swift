@@ -5,6 +5,9 @@ import InputMethodKit
 if CommandLine.arguments.contains("stats-smoke") {
     exit(runStatsSmokeTest() ? 0 : 1)
 }
+if CommandLine.arguments.contains("buffer-smoke") {
+    exit(runBufferSmokeTest() ? 0 : 1)
+}
 if CommandLine.arguments.contains("smoke") {
     runEngineSmokeTest()
     exit(0)
@@ -34,27 +37,22 @@ _ = rimeEngine.start()
 candidateWindow.onSelect = { index in
     RimeBufferController.active?.selectCandidate(onPage: index)
 }
+candidateWindow.onPage = { delta in
+    RimeBufferController.active?.pageCandidates(delta: delta)
+}
 candidateWindow.onSettings = {
     SettingsWindowController.shared.show()
 }
 
 // Buffer wiring: flushes deliver to the focused field; every model change
-// re-renders the staging strip.
+// re-renders the inline buffer that lives inside the candidate window.
 BufferModel.shared.deliver = { text in
-    RimeBufferController.active?.deliverText(text) ?? false
-}
-BufferSurface.shared.shouldSuppress = {
-    candidateWindow.isShowingInlineBuffer
-}
-candidateWindow.onInlineBufferVisibilityChanged = {
-    BufferSurface.shared.refresh()
+    RimeBufferController.deliverBufferedText(text)
 }
 BufferModel.shared.onChange = {
-    candidateWindow.refreshBuffer()
-    BufferSurface.shared.refresh()
+    RimeBufferController.refreshBufferDisplayForCurrentOrRecent()
 }
 candidateWindow.refreshBuffer()
-BufferSurface.shared.refresh()   // restore visibility if buffer mode was left ON
 
 // Menu-bar entry (schema switching / health / log) + a safety net that hides a
 // stray candidate panel when the user switches apps mid-composition.
@@ -169,5 +167,78 @@ func runStatsSmokeTest() -> Bool {
     }
 
     print("stats smoke: OK")
+    return true
+}
+
+func runBufferSmokeTest() -> Bool {
+    print("== RimeBuffer buffer smoke test ==")
+    let model = BufferModel.shared
+    let oldEnabled = model.enabled
+    let oldDeliver = model.deliver
+    let oldOnChange = model.onChange
+    defer {
+        model.clear()
+        model.enabled = oldEnabled
+        model.deliver = oldDeliver
+        model.onChange = oldOnChange
+    }
+
+    model.onChange = nil
+    model.deliver = nil
+    model.enabled = true
+    model.clear()
+
+    var delivered: [String] = []
+    model.deliver = { text in
+        delivered.append(text)
+        return true
+    }
+    model.append("你")
+    model.append("好")
+    model.sendAllAndExit()
+    guard delivered == ["你", "好"], model.blocks.isEmpty, model.enabled == false else {
+        print("FAILED: sendAllAndExit success semantics",
+              "delivered=\(delivered)",
+              "blocks=\(model.blocks.count)",
+              "enabled=\(model.enabled)")
+        return false
+    }
+
+    model.enabled = true
+    model.append("保留")
+    model.deliver = { _ in false }
+    model.sendAllAndExit()
+    guard model.blocks.count == 1, model.enabled == true else {
+        print("FAILED: send failure should preserve state",
+              "blocks=\(model.blocks.count)",
+              "enabled=\(model.enabled)")
+        return false
+    }
+
+    model.clear()
+    guard model.blocks.isEmpty, model.enabled == true else {
+        print("FAILED: clear should not exit buffer mode",
+              "blocks=\(model.blocks.count)",
+              "enabled=\(model.enabled)")
+        return false
+    }
+
+    model.append("前")
+    model.append("后")
+    guard model.removeLastBlock(),
+          model.blocks.map(\.text) == ["前"] else {
+        print("FAILED: removeLastBlock should drop newest block",
+              "blocks=\(model.blocks.map(\.text))")
+        return false
+    }
+    guard model.removeLastBlock(),
+          model.blocks.isEmpty,
+          model.removeLastBlock() == false else {
+        print("FAILED: removeLastBlock empty semantics",
+              "blocks=\(model.blocks.map(\.text))")
+        return false
+    }
+
+    print("buffer smoke: OK")
     return true
 }
