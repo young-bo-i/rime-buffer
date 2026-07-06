@@ -1,19 +1,28 @@
 #!/bin/bash
-# Builds RimeBuffer.app (an IMK input method), installs it into the per-user
-# Input Methods folder, and (re)registers it so it shows in System Settings.
+# Builds ETInput.app (恩特输入法, an IMK input method) as a SELF-CONTAINED bundle:
+# librime + the Rime shared data are packaged inside, so no separate Squirrel
+# install is needed. Installs into the per-user Input Methods folder and
+# (re)registers it so it shows in System Settings.
+#
+# (The SPM target / source dir stay named "RimeBuffer" — that's the internal
+# codename / repo; the shipped product is ETInput / 恩特输入法.)
 set -euo pipefail
 cd "$(dirname "$0")"
 
 CONFIG="${1:-release}"
-APP="RimeBuffer.app"
+APP="ETInput.app"
+EXE="ETInput"
 DEST="$HOME/Library/Input Methods/$APP"
 
-# RimeBuffer uses its OWN user dir so it never fights Squirrel over the userdb
-# LevelDB lock. Seed it from the live ~/Library/Rime (includes the compiled
-# build/ so no deploy is needed). Re-run `rm -rf ~/Library/RimeBuffer` to reseed
-# after editing your Rime config.
+# Fetch the bundled librime runtime (cached in Vendor/, not committed to git).
+./scripts/fetch-rime.sh
+
+# Its OWN Rime user dir so it never fights Squirrel over the userdb LevelDB lock.
+# If a live ~/Library/Rime exists (Squirrel installed), seed from it so custom
+# schemas carry over; otherwise the app deploys from the bundled SharedSupport on
+# first run. Re-run `rm -rf ~/Library/RimeBuffer` to reseed.
 RB_USER="$HOME/Library/RimeBuffer"
-if [ ! -d "$RB_USER/build" ]; then
+if [ ! -d "$RB_USER/build" ] && [ -d "$HOME/Library/Rime" ]; then
     echo "==> seeding $RB_USER from ~/Library/Rime"
     rm -rf "$RB_USER"; mkdir -p "$RB_USER"
     rsync -a --exclude 'sync' "$HOME/Library/Rime/" "$RB_USER/"
@@ -25,18 +34,27 @@ swift build -c "$CONFIG"
 BIN=".build/$CONFIG/RimeBuffer"
 echo "==> assembling $APP"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$BIN" "$APP/Contents/MacOS/RimeBuffer"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" \
+         "$APP/Contents/Frameworks" "$APP/Contents/SharedSupport"
+cp "$BIN" "$APP/Contents/MacOS/$EXE"
 cp Info.plist "$APP/Contents/Info.plist"
 
-# Ad-hoc sign for local testing (a trusted identity needs interactive keychain
-# access we don't have in a background shell — errSecInternalComponent — and is
-# only needed for the make-default/notarized phase). No nested code, so no --deep.
-echo "==> ad-hoc signing"
-codesign --force --sign - "$APP"
+# Bundle the self-contained runtime: librime + plugins + Rime shared data.
+cp -R Vendor/rime/Frameworks/* "$APP/Contents/Frameworks/"
+cp -R Vendor/rime/SharedSupport/* "$APP/Contents/SharedSupport/"
+
+# App icon, if it's been generated.
+if [ -f "Logo/AppIcon.icns" ]; then
+    cp "Logo/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+fi
+
+# Ad-hoc sign. --deep now that we have nested dylibs (librime + plugins).
+echo "==> ad-hoc signing (deep)"
+codesign --force --deep --sign - "$APP"
 
 echo "==> stopping any running instance"
-pkill -x RimeBuffer 2>/dev/null || true
+pkill -x "$EXE" 2>/dev/null || true
+pkill -x RimeBuffer 2>/dev/null || true   # kill a pre-rename instance too
 sleep 0.5
 
 echo "==> installing to $DEST"
@@ -54,9 +72,9 @@ cat <<EOF
 
 One-time GUI step to enable it:
   System Settings → Keyboard → (Text Input) Input Sources → Edit… → +
-  → Chinese, Simplified (or Other) → "RimeBuffer" → Add
+  → Chinese, Simplified (or Other) → "恩特输入法" → Add
 Then switch to it with the input menu (or Ctrl-Space) and type.
 
 Watch behaviour:  tail -f ~/rimebuffer.log
-Your Squirrel stays installed as the fallback — switch back anytime.
+Self-contained: librime + Rime data are bundled, no Squirrel needed.
 EOF

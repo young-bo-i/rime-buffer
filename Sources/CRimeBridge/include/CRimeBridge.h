@@ -52,11 +52,15 @@ typedef struct {
     bool asciiPunct;
 } BBRimeStatus;
 
-// Lifecycle. BBRimeStart dlopens Squirrel's librime, setup()+initialize(), and
-// only reports success if a smoke create_session() also succeeds.
+// Lifecycle. BBRimeStart dlopens librime (preferring the app's own bundled copy
+// under `frameworksDir`, falling back to a system Squirrel install), runs
+// setup()+initialize(), deploys on first run, and only reports success if a
+// smoke create_session() also succeeds. Pass frameworksDir="" to force the
+// legacy Squirrel-only behaviour.
 bool BBRimeStart(const char* sharedDataDir,
                  const char* userDataDir,
-                 const char* logDir);
+                 const char* logDir,
+                 const char* frameworksDir);
 bool BBRimeIsHealthy(void);
 
 uint64_t BBRimeCreateSession(void);

@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include <mutex>
 #include <sstream>
@@ -216,14 +217,25 @@ static std::string gSharedDataDir;
 static std::string gUserDataDir;
 static std::string gLogDir;
 
-static const char* kLibrimePath =
-    "/Library/Input Methods/Squirrel.app/Contents/Frameworks/librime.1.dylib";
-static const char* kLuaPluginPath =
-    "/Library/Input Methods/Squirrel.app/Contents/Frameworks/rime-plugins/librime-lua.dylib";
-static const char* kOctagramPluginPath =
-    "/Library/Input Methods/Squirrel.app/Contents/Frameworks/rime-plugins/librime-octagram.dylib";
-static const char* kPredictPluginPath =
-    "/Library/Input Methods/Squirrel.app/Contents/Frameworks/rime-plugins/librime-predict.dylib";
+// Fallback location when the app isn't self-contained: a system Squirrel install.
+static const char* kSquirrelFrameworks =
+    "/Library/Input Methods/Squirrel.app/Contents/Frameworks";
+
+static bool fileExists(const std::string& path) {
+    struct stat st;
+    return stat(path.c_str(), &st) == 0;
+}
+
+// Prefer the app's own bundled Frameworks dir; fall back to Squirrel's. `leaf`
+// is relative to a Frameworks dir, e.g. "librime.1.dylib" or
+// "rime-plugins/librime-lua.dylib".
+static std::string resolveDylib(const std::string& frameworksDir, const char* leaf) {
+    if (!frameworksDir.empty()) {
+        std::string bundled = frameworksDir + "/" + leaf;
+        if (fileExists(bundled)) return bundled;
+    }
+    return std::string(kSquirrelFrameworks) + "/" + leaf;
+}
 
 #define RIME_STRUCT_INIT(Type, var) \
     ((var).data_size = (int)(sizeof(Type) - sizeof((var).data_size)))
@@ -261,18 +273,24 @@ static bool loadDylib(const char* path, bool required) {
 
 bool BBRimeStart(const char* sharedDataDir,
                  const char* userDataDir,
-                 const char* logDir) {
+                 const char* logDir,
+                 const char* frameworksDir) {
     std::lock_guard<std::mutex> lock(gMutex);
     if (gStarted) return true;
 
     gSharedDataDir = sharedDataDir ? sharedDataDir : "";
     gUserDataDir = userDataDir ? userDataDir : "";
     gLogDir = logDir ? logDir : "";
+    std::string fw = frameworksDir ? frameworksDir : "";
 
-    if (!loadDylib(kLibrimePath, true)) return false;
-    loadDylib(kLuaPluginPath, false);
-    loadDylib(kOctagramPluginPath, false);
-    loadDylib(kPredictPluginPath, false);
+    // librime is dlopen'd (not linked). Load it FIRST with RTLD_GLOBAL so that
+    // when the plugins below ask for their `@rpath/librime.1.dylib` dependency,
+    // dyld satisfies it from this already-loaded image by install-name match —
+    // no LC_RPATH needed on the plugins or on us.
+    if (!loadDylib(resolveDylib(fw, "librime.1.dylib").c_str(), true)) return false;
+    loadDylib(resolveDylib(fw, "rime-plugins/librime-lua.dylib").c_str(), false);
+    loadDylib(resolveDylib(fw, "rime-plugins/librime-octagram.dylib").c_str(), false);
+    loadDylib(resolveDylib(fw, "rime-plugins/librime-predict.dylib").c_str(), false);
 
     auto getApi = reinterpret_cast<RimeGetApiFunc>(dlsym(RTLD_DEFAULT, "rime_get_api"));
     if (!getApi) {
@@ -309,16 +327,26 @@ bool BBRimeStart(const char* sharedDataDir,
     gApi->setup(&traits);
     gApi->initialize(&traits);
 
+    // First-run / stale deploy: build the schemas from shared_data_dir into
+    // user_data_dir/build. This is what makes a self-contained app work with no
+    // prior Squirrel/~/Library/Rime — otherwise create_session below fails
+    // because there's no compiled data. full_check only on the first build (no
+    // build dir yet) so subsequent launches stay fast.
+    if (gApi->start_maintenance) {
+        bool needFullCheck = !fileExists(gUserDataDir + "/build");
+        if (gApi->start_maintenance(needFullCheck ? 1 : 0) && gApi->join_maintenance_thread) {
+            gApi->join_maintenance_thread();
+        }
+    }
+
     // Health gate: only report started if a smoke session actually spins up.
-    // (initialize() can "succeed" yet leave the deployer unusable if the built
-    // data under ~/Library/Rime/build is missing/stale — Squirrel must have run.)
     if (!gApi->create_session) {
         gLastError = "librime missing create_session";
         return false;
     }
     RimeSessionId smoke = gApi->create_session();
     if (!smoke) {
-        gLastError = "smoke create_session failed (is ~/Library/Rime built? run Squirrel once)";
+        gLastError = "smoke create_session failed (deploy did not produce usable data)";
         return false;
     }
     if (gApi->destroy_session) gApi->destroy_session(smoke);

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36" role="img" aria-labelledby="title desc">
+  <title id="title">ET menu bar template icon</title>
+  <desc id="desc">A monochrome black ET monogram for macOS menu bar template rendering.</desc>
+  <g fill="#000000">
+    <rect x="4" y="8" width="4.6" height="20" rx="1.2"/>
+    <rect x="6.4" y="8" width="10" height="4.1" rx="1.2"/>
+    <rect x="6.4" y="16" width="8.7" height="4" rx="1.2"/>
+    <rect x="6.4" y="23.9" width="10" height="4.1" rx="1.2"/>
+    <rect x="17.1" y="8" width="14.9" height="4.1" rx="1.2"/>
+    <rect x="22.4" y="8" width="4.2" height="20" rx="1.2"/>
+  </g>
+</svg>

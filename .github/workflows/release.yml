@@ -54,29 +54,39 @@ jobs:
           swift build -c release --arch arm64 --arch x86_64
           echo "BIN_DIR=$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)" >> "$GITHUB_ENV"
 
-      - name: Assemble RimeBuffer.app
+      # Download librime + Rime data (from Squirrel's official pkg) so the app is
+      # self-contained — end users don't need to install Squirrel separately.
+      - name: Fetch bundled librime runtime
+        run: ./scripts/fetch-rime.sh
+
+      - name: Assemble ETInput.app
         run: |
-          APP="RimeBuffer.app"
+          APP="ETInput.app"
           rm -rf "$APP"
-          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-          cp "$BIN_DIR/RimeBuffer" "$APP/Contents/MacOS/RimeBuffer"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" \
+                   "$APP/Contents/Frameworks" "$APP/Contents/SharedSupport"
+          # SPM target is still "RimeBuffer"; ship the binary as ETInput.
+          cp "$BIN_DIR/RimeBuffer" "$APP/Contents/MacOS/ETInput"
           cp Info.plist "$APP/Contents/Info.plist"
-          # Ad-hoc sign for local use (users clear quarantine on first run / the
-          # in-app updater removes it automatically). No nested code, so no --deep.
-          codesign --force --sign - "$APP"
+          cp -R Vendor/rime/Frameworks/* "$APP/Contents/Frameworks/"
+          cp -R Vendor/rime/SharedSupport/* "$APP/Contents/SharedSupport/"
+          [ -f Logo/AppIcon.icns ] && cp Logo/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns" || true
+          # --deep: sign the nested librime + plugin dylibs too.
+          codesign --force --deep --sign - "$APP"
           codesign --verify --verbose "$APP" || true
           xattr -cr "$APP"
           echo "----- assembled bundle -----"
-          file "$APP/Contents/MacOS/RimeBuffer"
+          file "$APP/Contents/MacOS/ETInput"
+          du -sh "$APP"
 
       - name: Package ZIP
         id: package
         run: |
           VERSION="${{ steps.version.outputs.VERSION }}"
-          ZIP="RimeBuffer-${VERSION}.zip"
+          ZIP="ETInput-${VERSION}.zip"
           # ditto preserves the bundle structure + ad-hoc signature; the in-app
           # updater unzips this with /usr/bin/unzip.
-          ditto -c -k --sequesterRsrc --keepParent "RimeBuffer.app" "$ZIP"
+          ditto -c -k --sequesterRsrc --keepParent "ETInput.app" "$ZIP"
           SHA256=$(shasum -a 256 "$ZIP" | awk '{print $1}')
           echo "ZIP=$ZIP" >> "$GITHUB_OUTPUT"
           echo "SHA256=$SHA256" >> "$GITHUB_OUTPUT"
@@ -88,29 +98,30 @@ jobs:
         with:
           files: ${{ steps.package.outputs.ZIP }}
           body: |
-            ## RimeBuffer v${{ steps.version.outputs.VERSION }}
+            ## 恩特输入法 (ETInput) v${{ steps.version.outputs.VERSION }}
 
-            macOS 输入法（IMK + librime）。**运行前提**：已安装 Squirrel（鼠须管），
-            RimeBuffer 复用其 `librime` 与 `~/Library/Rime` 配置。
+            现代 macOS 中文输入法（IMK + librime）。**自包含**：librime 引擎与 Rime
+            词库已打包在 app 内，**无需单独安装 Squirrel**，装一个就能用。通用二进制
+            （Apple Silicon + Intel）。
 
             ### 应用内自动更新
-            已安装并运行的 RimeBuffer 会自动检查此仓库的最新 Release，静默下载后在
+            已安装并运行的恩特输入法会自动检查此仓库的最新 Release，静默下载后在
             状态栏菜单提示；点「立即更新」即自动替换并重启。无需手动操作。
 
             ### 手动安装 / 首次安装
             ```bash
             # 1. 解压并放入输入法目录
-            unzip RimeBuffer-${{ steps.version.outputs.VERSION }}.zip
-            rm -rf "$HOME/Library/Input Methods/RimeBuffer.app"
-            mv RimeBuffer.app "$HOME/Library/Input Methods/"
-            xattr -cr "$HOME/Library/Input Methods/RimeBuffer.app"
+            unzip ETInput-${{ steps.version.outputs.VERSION }}.zip
+            rm -rf "$HOME/Library/Input Methods/ETInput.app"
+            mv ETInput.app "$HOME/Library/Input Methods/"
+            xattr -cr "$HOME/Library/Input Methods/ETInput.app"
 
             # 2. 注册并启动
             /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
-              -f "$HOME/Library/Input Methods/RimeBuffer.app"
-            open "$HOME/Library/Input Methods/RimeBuffer.app"
+              -f "$HOME/Library/Input Methods/ETInput.app"
+            open "$HOME/Library/Input Methods/ETInput.app"
             ```
-            然后在「系统设置 → 键盘 → 输入法」中添加 RimeBuffer。
+            然后在「系统设置 → 键盘 → 输入法」中添加「恩特输入法」。
 
             ### 校验和
             | 文件 | SHA256 |
@@ -125,5 +136,5 @@ jobs:
         if: "!startsWith(github.ref, 'refs/tags/')"
         uses: actions/upload-artifact@v4
         with:
-          name: RimeBuffer-${{ steps.version.outputs.VERSION }}
+          name: ETInput-${{ steps.version.outputs.VERSION }}
           path: ${{ steps.package.outputs.ZIP }}

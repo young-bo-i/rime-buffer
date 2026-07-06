@@ -8,10 +8,30 @@ import CRimeBridge
 final class RimeEngine {
     private var started = false
 
-    private let sharedDataDir = "/Library/Input Methods/Squirrel.app/Contents/SharedSupport"
-    // Its OWN user dir (~/Library/RimeBuffer, a copy of ~/Library/Rime made by
-    // build_install.sh). Separate from Squirrel's so the two never fight over the
-    // same userdb LevelDB lock — that lock conflict silently kills candidates.
+    private static let squirrelShared = "/Library/Input Methods/Squirrel.app/Contents/SharedSupport"
+    private static let squirrelFrameworks = "/Library/Input Methods/Squirrel.app/Contents/Frameworks"
+
+    // Prefer the app's OWN bundled data + librime (self-contained install, no
+    // Squirrel needed); fall back to a system Squirrel install for dev builds
+    // run outside the .app.
+    private let sharedDataDir: String = {
+        if let ss = Bundle.main.sharedSupportPath,
+           FileManager.default.fileExists(atPath: ss + "/default.yaml") {
+            return ss
+        }
+        return RimeEngine.squirrelShared
+    }()
+    private let frameworksDir: String = {
+        if let fw = Bundle.main.privateFrameworksPath,
+           FileManager.default.fileExists(atPath: fw + "/librime.1.dylib") {
+            return fw
+        }
+        return RimeEngine.squirrelFrameworks
+    }()
+
+    // Its OWN user dir (~/Library/RimeBuffer). Separate from Squirrel's so the
+    // two never fight over the same userdb LevelDB lock — that lock conflict
+    // silently kills candidates. First run deploys into it from sharedDataDir.
     // RIMEBUFFER_USER_DIR overrides it (used by the CLI smoke harness).
     private static let defaultUserDir = URL(fileURLWithPath: NSHomeDirectory())
         .appendingPathComponent("Library/RimeBuffer").path
@@ -25,9 +45,11 @@ final class RimeEngine {
     @discardableResult
     func start() -> Bool {
         if started { return true }
-        started = BBRimeStart(sharedDataDir, userDataDir, logDir)
+        // Ensure the user dir exists so the first-run deploy has a build target.
+        try? FileManager.default.createDirectory(atPath: userDataDir, withIntermediateDirectories: true)
+        started = BBRimeStart(sharedDataDir, userDataDir, logDir, frameworksDir)
         if started {
-            IMELog.write("rime start OK shared=\(sharedDataDir) user=\(userDataDir)")
+            IMELog.write("rime start OK shared=\(sharedDataDir) fw=\(frameworksDir) user=\(userDataDir)")
         } else {
             IMELog.write("rime start FAILED: \(lastError())")
         }

@@ -2,6 +2,9 @@
 .swiftpm/
 DerivedData/
 
+# Vendored librime runtime (fetched at build time by scripts/fetch-rime.sh)
+Vendor/
+
 *.app/
 *.dSYM/
 

@@ -15,9 +15,9 @@ if CommandLine.arguments.contains("smoke") {
 
 // IMK bootstrap. The connection name MUST match Info.plist; IMK finds our
 // controller via InputMethodServerControllerClass = RimeBufferController.
-IMELog.reset("=== RimeBuffer IME launch ===")
+IMELog.reset("=== 恩特输入法 (ETInput) IME launch ===")
 let connectionName = (Bundle.main.infoDictionary?["InputMethodConnectionName"] as? String)
-    ?? "RimeBuffer_1_Connection"
+    ?? "ETInput_1_Connection"
 
 NSApplication.shared.setActivationPolicy(.accessory)   // background app; panels can float above others
 
@@ -99,13 +99,12 @@ func runEngineSmokeTest() {
     let defaultStatus = engine.getStatus(session: session)
     print("default schema: \(defaultStatus.schemaId) (\(defaultStatus.schemaName))")
 
-    let picked = engine.selectSchema("my_serial", session: session)
-    let afterSelect = engine.getStatus(session: session)
-    print("select my_serial:", picked, "-> schema now:", afterSelect.schemaId, "ascii:", afterSelect.asciiMode)
+    // Candidate test on the DEFAULT deployed schema — this is the one a
+    // self-contained (default-only) build always ships, so it proves the
+    // bundled librime + SharedSupport actually produce input end-to-end.
     engine.setOption("ascii_mode", false, session: session)
     engine.clearComposition(session: session)
-
-    print("typing 'nihao' ...")
+    print("typing 'nihao' on \(defaultStatus.schemaId) ...")
     for scalar in "nihao".unicodeScalars {
         _ = engine.processKey(Int32(scalar.value), session: session)
     }
@@ -116,6 +115,11 @@ func runEngineSmokeTest() {
     }
     _ = engine.processKey(0x20, session: session)
     print("committed:", engine.takeCommit(session: session) ?? "(none)")
+
+    // Informational: schema switch only does something if that schema is
+    // installed (the custom 并击 schemas aren't part of a default-only build).
+    let picked = engine.selectSchema("my_serial", session: session)
+    print("select my_serial:", picked, "-> schema now:", engine.getStatus(session: session).schemaId)
     engine.destroySession(session)
     print("== done ==")
 }

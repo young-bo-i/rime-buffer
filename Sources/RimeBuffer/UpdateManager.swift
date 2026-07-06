@@ -49,7 +49,7 @@ enum UpdateStatus: Equatable {
     }
 }
 
-/// Pulls RimeBuffer releases from GitHub and installs them in place.
+/// Pulls 恩特输入法 (ETInput) releases from GitHub and installs them in place.
 ///
 /// Design mirrors Toolbit's UpdateManager (silent check → silent download →
 /// notify → user-confirmed install), but:
@@ -235,7 +235,7 @@ final class UpdateManager {
                 return
             }
             let dest = FileManager.default.temporaryDirectory
-                .appendingPathComponent("RimeBuffer-\(version).zip")
+                .appendingPathComponent("ETInput-\(version).zip")
             do {
                 if FileManager.default.fileExists(atPath: dest.path) {
                     try FileManager.default.removeItem(at: dest)
@@ -260,7 +260,7 @@ final class UpdateManager {
     func promptAndInstall() {
         guard case let .readyToInstall(version, zip) = status else { return }
         let alert = NSAlert()
-        alert.messageText = "更新到 RimeBuffer v\(version)？"
+        alert.messageText = "更新到 恩特输入法 v\(version)？"
         alert.informativeText = "输入法进程会关闭并以新版本重启。若正在输入，请先完成再更新。"
         alert.addButton(withTitle: "立即更新")
         alert.addButton(withTitle: "稍后")
@@ -273,7 +273,7 @@ final class UpdateManager {
         setStatus(.installing)
         let fm = FileManager.default
         let tempDir = fm.temporaryDirectory
-        let extractDir = tempDir.appendingPathComponent("RimeBuffer_Update")
+        let extractDir = tempDir.appendingPathComponent("ETInput_Update")
 
         do {
             if fm.fileExists(atPath: extractDir.path) { try fm.removeItem(at: extractDir) }
@@ -285,7 +285,7 @@ final class UpdateManager {
 
             let contents = try fm.contentsOfDirectory(at: extractDir, includingPropertiesForKeys: nil)
             guard let newApp = contents.first(where: { $0.pathExtension == "app" }) else {
-                setStatus(.error("解压后未找到 RimeBuffer.app")); return
+                setStatus(.error("解压后未找到 ETInput.app")); return
             }
             runTool("/usr/bin/xattr", ["-cr", newApp.path])
 
@@ -295,7 +295,7 @@ final class UpdateManager {
             let target = current.pathExtension == "app"
                 ? current
                 : URL(fileURLWithPath: NSHomeDirectory())
-                    .appendingPathComponent("Library/Input Methods/RimeBuffer.app")
+                    .appendingPathComponent("Library/Input Methods/ETInput.app")
 
             let pid = ProcessInfo.processInfo.processIdentifier
             let lsregister = "/System/Library/Frameworks/CoreServices.framework"
@@ -319,7 +319,7 @@ final class UpdateManager {
             SCRIPT=\(q(scriptURL.path))
             LSREGISTER=\(q(lsregister))
             VERSION=\(q(version))
-            echo "RimeBuffer update -> v$VERSION"
+            echo "ETInput update -> v$VERSION"
 
             # Wait for the old process to exit, then kill any instance the
             # text-input system may have relaunched so nothing holds the bundle.
@@ -327,7 +327,7 @@ final class UpdateManager {
               kill -0 \(pid) 2>/dev/null || { echo "old process exited"; break; }
               sleep 0.25
             done
-            pkill -x RimeBuffer 2>/dev/null || true
+            pkill -x ETInput 2>/dev/null || true
             sleep 0.5
 
             # Stage the new bundle BESIDE the target first. If this fails, the

@@ -3,13 +3,15 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>RimeBuffer</string>
+    <string>ETInput</string>
     <key>CFBundleDisplayName</key>
-    <string>RimeBuffer 输入法</string>
+    <string>恩特输入法</string>
     <key>CFBundleIdentifier</key>
-    <string>com.isaac.inputmethod.RimeBuffer</string>
+    <string>com.isaac.inputmethod.ETInput</string>
     <key>CFBundleExecutable</key>
-    <string>RimeBuffer</string>
+    <string>ETInput</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>CFBundleShortVersionString</key>
@@ -25,7 +27,7 @@
 
     <!-- IMK wiring -->
     <key>InputMethodConnectionName</key>
-    <string>RimeBuffer_1_Connection</string>
+    <string>ETInput_1_Connection</string>
     <key>InputMethodServerControllerClass</key>
     <string>RimeBufferController</string>
     <key>InputMethodServerDelegateClass</key>
@@ -36,14 +38,14 @@
     <dict>
         <key>tsInputModeListKey</key>
         <dict>
-            <key>com.isaac.inputmethod.RimeBuffer</key>
+            <key>com.isaac.inputmethod.ETInput</key>
             <dict>
                 <key>TISInputSourceID</key>
-                <string>com.isaac.inputmethod.RimeBuffer</string>
+                <string>com.isaac.inputmethod.ETInput</string>
                 <key>TISIntendedLanguage</key>
                 <string>zh-Hans</string>
                 <key>tsInputModeAlternateMenuTitleKey</key>
-                <string>RimeBuffer</string>
+                <string>恩特输入法</string>
                 <key>tsInputModeCharacterRepertoireKey</key>
                 <array>
                     <string>Latn</string>
@@ -63,7 +65,7 @@
         </dict>
         <key>tsVisibleInputModeOrderedArrayKey</key>
         <array>
-            <string>com.isaac.inputmethod.RimeBuffer</string>
+            <string>com.isaac.inputmethod.ETInput</string>
         </array>
     </dict>
 </dict>

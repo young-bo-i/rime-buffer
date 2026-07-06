@@ -44,7 +44,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         guard let button = item?.button else { return }
         button.image = NSImage(
             systemSymbolName: healthy ? "keyboard.badge.ellipsis" : "keyboard.badge.exclamationmark",
-            accessibilityDescription: "RimeBuffer")
+            accessibilityDescription: "恩特输入法")
         button.contentTintColor = UpdateManager.shared.pendingVersion != nil ? .controlAccentColor : nil
     }
 
@@ -54,7 +54,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
         let version = UpdateManager.shared.currentVersion
         let health = NSMenuItem(
-            title: healthy ? "RimeBuffer v\(version) · \(schemaName.isEmpty ? "就绪" : schemaName)"
+            title: healthy ? "恩特输入法 v\(version) · \(schemaName.isEmpty ? "就绪" : schemaName)"
                            : "⚠️ 引擎异常 — 已退化为英文直通",
             action: nil, keyEquivalent: "")
         health.isEnabled = false

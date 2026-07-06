@@ -62,7 +62,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 980, height: 680),
                            styleMask: [.titled, .closable, .resizable],
                            backing: .buffered, defer: false)
-        win.title = "RimeBuffer 设置"
+        win.title = "恩特输入法 设置"
         win.isReleasedWhenClosed = false
         win.minSize = NSSize(width: 860, height: 600)
 
@@ -233,7 +233,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         installButtons.orientation = .horizontal
         installButtons.spacing = 8
         let installNote = NSTextField(wrappingLabelWithString:
-            "从当前源码目录运行 build_install.sh；会重新构建、替换并重启 RimeBuffer。")
+            "从当前源码目录运行 build_install.sh；会重新构建、替换并重启 恩特输入法。")
         installNote.font = .systemFont(ofSize: 11)
         installNote.textColor = .tertiaryLabelColor
 
@@ -562,7 +562,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         }
 
         let alert = NSAlert()
-        alert.messageText = "重新安装 RimeBuffer？"
+        alert.messageText = "重新安装 恩特输入法？"
         alert.informativeText = "将从 \(script.deletingLastPathComponent().path) 运行 build_install.sh。构建完成后当前输入法进程会被重启。"
         alert.addButton(withTitle: "重新安装")
         alert.addButton(withTitle: "取消")
