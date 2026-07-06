@@ -13,6 +13,9 @@ import InputMethodKit
 final class CompositionSession {
     enum Mode: String { case inline, placeholder }
 
+    private let bufferGuardText = "\u{200B}"
+
+    private(set) var markedTextActive = false
     private(set) var composing = false
 
     /// Per-app override table (bundleId -> "placeholder"). Empty by default;
@@ -46,24 +49,44 @@ final class CompositionSession {
                                  selectionRange: NSRange(location: 0, length: 0),
                                  replacementRange: replacement)
         }
+        markedTextActive = true
         composing = true
+    }
+
+    /// Keep the host field connected to IMK while buffer mode owns visible
+    /// editing. The marked text is intentionally invisible; buffer UI renders
+    /// the real preedit/caret.
+    func updateBufferGuard(preedit: String, client: IMKTextInput) {
+        client.setMarkedText(bufferGuardText as NSString,
+                             selectionRange: NSRange(location: (bufferGuardText as NSString).length,
+                                                     length: 0),
+                             replacementRange: NSRange(location: NSNotFound, length: 0))
+        markedTextActive = true
+        composing = !preedit.isEmpty
     }
 
     /// End the session explicitly (escape / focus loss / commit without insert).
     func clear(client: IMKTextInput) {
-        guard composing else { return }
+        guard markedTextActive else { return }
         client.setMarkedText("" as NSString,
                              selectionRange: NSRange(location: 0, length: 0),
                              replacementRange: NSRange(location: NSNotFound, length: 0))
+        markedTextActive = false
         composing = false
     }
 
     /// insertText replaces the marked text atomically and closes the session —
     /// record that without sending another setMarkedText.
-    func commitDidInsert() { composing = false }
+    func commitDidInsert() {
+        markedTextActive = false
+        composing = false
+    }
 
     /// Session died with its client (focus already gone); just drop the flag.
-    func markCleared() { composing = false }
+    func markCleared() {
+        markedTextActive = false
+        composing = false
+    }
 
     private static func utf16Offset(ofUTF8 byteOffset: Int, in s: String) -> Int {
         if byteOffset <= 0 { return 0 }

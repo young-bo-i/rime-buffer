@@ -16,6 +16,10 @@ final class RimeBufferController: IMKInputController {
     private static weak var recent: RimeBufferController?
     private static var chordDurationCache: TimeInterval?
     private static let duplicateBackspaceCommandWindow: CFTimeInterval = 0.05
+    private static let duplicateEnterCommandWindow: CFTimeInterval = 0.05
+    private static let duplicateArrowCommandWindow: CFTimeInterval = 0.05
+    private static let bufferEnterHoldDelay: TimeInterval = 2.0
+    private static let bufferEnterPollInterval: TimeInterval = 0.02
 
     private var session: UInt64 = 0
     private var currentSchemaId = ""
@@ -23,6 +27,18 @@ final class RimeBufferController: IMKInputController {
     private var lastClient: IMKTextInput?
     private var lastBufferBackspaceKeyHandledAt: CFAbsoluteTime = 0
     private var lastBufferBackspaceCommandHandledAt: CFAbsoluteTime = 0
+    private var lastBufferEnterKeyHandledAt: CFAbsoluteTime = 0
+    private var lastBufferEnterCommandHandledAt: CFAbsoluteTime = 0
+    private var lastBufferArrowKeyHandledAt: CFAbsoluteTime = 0
+    private var lastBufferArrowCommandHandledAt: CFAbsoluteTime = 0
+    private var lastBufferArrowKeyDirection = 0
+    private var lastBufferArrowCommandDirection = 0
+    private var bufferEnterPending = false
+    private var bufferEnterSuppressUntilPhysicalUp = false
+    private var bufferEnterClient: IMKTextInput?
+    private var bufferEnterHardwareKeyCode: CGKeyCode = 36
+    private var bufferEnterStartedAt: CFAbsoluteTime = 0
+    private var bufferEnterPollTimer: Timer?
     private let composition = CompositionSession()
     private let chord = ChordController()
 
@@ -41,6 +57,7 @@ final class RimeBufferController: IMKInputController {
     }
 
     deinit {
+        resetBufferEnterGesture()
         chord.invalidate()
         if session != 0 { rimeEngine.destroySession(session) }
     }
@@ -99,6 +116,7 @@ final class RimeBufferController: IMKInputController {
     override func deactivateServer(_ sender: Any!) {
         // IMK sometimes passes a nil/non-client sender here — fall back to
         // client() (Squirrel-proven) so live marked text never strands.
+        resetBufferEnterGesture()
         resolveComposition(client: (sender as? IMKTextInput) ?? (self.client() as IMKTextInput?))
         Self.recent = self
         if Self.active === self { Self.active = nil }
@@ -135,7 +153,7 @@ final class RimeBufferController: IMKInputController {
     // MARK: Key routing
 
     override func recognizedEvents(_ sender: Any!) -> Int {
-        Int(NSEvent.EventTypeMask([.keyDown, .flagsChanged]).rawValue)
+        Int(NSEvent.EventTypeMask([.keyDown, .keyUp, .flagsChanged]).rawValue)
     }
 
     override func handle(_ event: NSEvent!, client sender: Any!) -> Bool {
@@ -146,8 +164,14 @@ final class RimeBufferController: IMKInputController {
         switch event.type {
         case .flagsChanged: return handleFlags(event, client: client)
         case .keyDown:      return handleKeyDown(event, client: client)
+        case .keyUp:        return handleKeyUp(event, client: client)
         default:            return false
         }
+    }
+
+    private func handleKeyUp(_ event: NSEvent, client: IMKTextInput) -> Bool {
+        guard let keycode = keysym(for: event) else { return false }
+        return handleBufferEnterKeyUp(keycode, client: client)
     }
 
     private func handleKeyDown(_ event: NSEvent, client: IMKTextInput) -> Bool {
@@ -173,6 +197,17 @@ final class RimeBufferController: IMKInputController {
         if handleBufferBackspace(keycode, mask: mask, client: client) {
             return true
         }
+        if handleBufferEscape(keycode, mask: mask, client: client) {
+            return true
+        }
+        if keycode == RimeKey.return,
+           mask & (RimeKey.controlMask | RimeKey.altMask | RimeKey.superMask) == 0,
+           commitRawInput(client: client) {
+            return true
+        }
+        if handleBufferEnter(keycode, mask: mask, client: client, hardwareKeyCode: event.keyCode) {
+            return true
+        }
         if mask == 0 {
             if handleCandidateKey(keycode, client: client) {
                 return true
@@ -181,7 +216,68 @@ final class RimeBufferController: IMKInputController {
                 return true
             }
         }
+        if handleBufferHorizontalArrow(keycode, mask: mask, client: client, source: "key") {
+            return true
+        }
         return processRimeKey(keycode, mask: mask, client: client)
+    }
+
+    private func handleBufferEscape(_ keycode: Int32, mask: Int32, client: IMKTextInput) -> Bool {
+        guard keycode == RimeKey.escape,
+              BufferModel.shared.enabled,
+              mask & (RimeKey.controlMask | RimeKey.altMask | RimeKey.superMask) == 0 else {
+            return false
+        }
+
+        return exitBufferMode(client: client, source: "escape key")
+    }
+
+    private func handleBufferEnter(_ keycode: Int32,
+                                   mask: Int32,
+                                   client: IMKTextInput,
+                                   hardwareKeyCode: UInt16) -> Bool {
+        guard keycode == RimeKey.return,
+              mask & (RimeKey.controlMask | RimeKey.altMask | RimeKey.superMask) == 0 else {
+            return false
+        }
+
+        let now = CFAbsoluteTimeGetCurrent()
+        if now - lastBufferEnterCommandHandledAt < Self.duplicateEnterCommandWindow {
+            IMELog.write("buffer enter key consumed after command")
+            lastBufferEnterKeyHandledAt = now
+            return true
+        }
+
+        if bufferEnterPending || bufferEnterSuppressUntilPhysicalUp {
+            IMELog.write("buffer enter keyDown consumed during active gesture")
+            lastBufferEnterKeyHandledAt = now
+            return true
+        }
+
+        guard BufferModel.shared.enabled else { return false }
+        lastBufferEnterKeyHandledAt = now
+        beginBufferEnterGesture(client: client, hardwareKeyCode: hardwareKeyCode)
+        return true
+    }
+
+    private func handleBufferEnterKeyUp(_ keycode: Int32, client: IMKTextInput) -> Bool {
+        guard keycode == RimeKey.return else { return false }
+        guard bufferEnterPending || bufferEnterSuppressUntilPhysicalUp else { return false }
+
+        lastBufferEnterKeyHandledAt = CFAbsoluteTimeGetCurrent()
+        if bufferEnterPending {
+            IMELog.write("buffer enter keyUp tap")
+            _ = performBufferEnter(client: bufferEnterClient ?? client, source: "key tap")
+            resetBufferEnterGesture()
+            return true
+        }
+
+        if bufferEnterSuppressUntilPhysicalUp {
+            IMELog.write("buffer enter keyUp after hold")
+            resetBufferEnterGesture()
+            return true
+        }
+        return true
     }
 
     private func handleBufferBackspace(_ keycode: Int32, mask: Int32, client: IMKTextInput) -> Bool {
@@ -202,12 +298,105 @@ final class RimeBufferController: IMKInputController {
         return performBufferBackspace(client: client, source: "key")
     }
 
-    override func didCommand(by selector: Selector!, client sender: Any!) -> Bool {
-        guard let selector else { return false }
-        guard isDeleteBackwardSelector(selector),
-              BufferModel.shared.enabled else {
+    private func handleBufferHorizontalArrow(_ keycode: Int32,
+                                             mask: Int32,
+                                             client: IMKTextInput,
+                                             source: String) -> Bool {
+        let direction: Int
+        switch keycode {
+        case RimeKey.left: direction = -1
+        case RimeKey.right: direction = 1
+        default: return false
+        }
+        guard BufferModel.shared.enabled,
+              mask & (RimeKey.shiftMask | RimeKey.controlMask | RimeKey.altMask | RimeKey.superMask) == 0,
+              canMoveBufferInsertionPoint() else {
             return false
         }
+
+        let now = CFAbsoluteTimeGetCurrent()
+        if now - lastBufferArrowCommandHandledAt < Self.duplicateArrowCommandWindow,
+           lastBufferArrowCommandDirection == direction {
+            IMELog.write("buffer arrow \(source) consumed after command direction=\(direction)")
+            lastBufferArrowKeyHandledAt = now
+            lastBufferArrowKeyDirection = direction
+            return true
+        }
+
+        lastBufferArrowKeyHandledAt = now
+        lastBufferArrowKeyDirection = direction
+        _ = BufferModel.shared.moveInsertionPoint(delta: direction)
+        updateUI(client: client)
+        return true
+    }
+
+    override func didCommand(by selector: Selector!, client sender: Any!) -> Bool {
+        guard let selector else { return false }
+        if isInsertNewlineSelector(selector) {
+            let now = CFAbsoluteTimeGetCurrent()
+            if bufferEnterPending
+                || bufferEnterSuppressUntilPhysicalUp
+                || now - lastBufferEnterKeyHandledAt < Self.duplicateEnterCommandWindow {
+                IMELog.write("buffer enter command consumed after key selector=\(NSStringFromSelector(selector))")
+                lastBufferEnterCommandHandledAt = now
+                return true
+            }
+
+            guard BufferModel.shared.enabled else { return false }
+            let client = (sender as? IMKTextInput) ?? (self.client() as IMKTextInput?) ?? lastClient
+            if let client {
+                Self.active = self
+                Self.recent = self
+                lastClient = client
+            }
+            lastBufferEnterCommandHandledAt = now
+            if let client, commitRawInput(client: client) {
+                IMELog.write("buffer enter command committed raw input before flush selector=\(NSStringFromSelector(selector))")
+                return true
+            }
+            return performBufferEnter(client: client, source: "command:\(NSStringFromSelector(selector))")
+        }
+        if let direction = horizontalMoveDirection(for: selector) {
+            guard BufferModel.shared.enabled else { return false }
+            let now = CFAbsoluteTimeGetCurrent()
+            if now - lastBufferArrowKeyHandledAt < Self.duplicateArrowCommandWindow,
+               lastBufferArrowKeyDirection == direction {
+                IMELog.write("buffer arrow command consumed after key selector=\(NSStringFromSelector(selector)) direction=\(direction)")
+                lastBufferArrowCommandHandledAt = now
+                lastBufferArrowCommandDirection = direction
+                return true
+            }
+
+            guard canMoveBufferInsertionPoint() else { return false }
+            let client = (sender as? IMKTextInput) ?? (self.client() as IMKTextInput?) ?? lastClient
+            if let client {
+                Self.active = self
+                Self.recent = self
+                lastClient = client
+            }
+            lastBufferArrowCommandHandledAt = now
+            lastBufferArrowCommandDirection = direction
+            _ = BufferModel.shared.moveInsertionPoint(delta: direction)
+            if let client {
+                updateUI(client: client)
+            } else {
+                candidateWindow.refreshBuffer()
+            }
+            return true
+        }
+        guard BufferModel.shared.enabled else {
+            return false
+        }
+        if isCancelOperationSelector(selector) {
+            let client = (sender as? IMKTextInput) ?? (self.client() as IMKTextInput?) ?? lastClient
+            if let client {
+                Self.active = self
+                Self.recent = self
+                lastClient = client
+            }
+            return exitBufferMode(client: client, source: "command:\(NSStringFromSelector(selector))")
+        }
+        guard isDeleteBackwardSelector(selector) else { return false }
 
         let now = CFAbsoluteTimeGetCurrent()
         if now - lastBufferBackspaceKeyHandledAt < Self.duplicateBackspaceCommandWindow {
@@ -234,6 +423,206 @@ final class RimeBufferController: IMKInputController {
     private func isDeleteBackwardSelector(_ selector: Selector) -> Bool {
         selector == #selector(NSResponder.deleteBackward(_:))
             || selector == #selector(NSResponder.deleteBackwardByDecomposingPreviousCharacter(_:))
+    }
+
+    private func isCancelOperationSelector(_ selector: Selector) -> Bool {
+        selector == #selector(NSResponder.cancelOperation(_:))
+    }
+
+    private func isInsertNewlineSelector(_ selector: Selector) -> Bool {
+        selector == #selector(NSResponder.insertNewline(_:))
+            || selector == #selector(NSResponder.insertLineBreak(_:))
+            || selector == #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:))
+            || selector == #selector(NSResponder.insertParagraphSeparator(_:))
+    }
+
+    private func horizontalMoveDirection(for selector: Selector) -> Int? {
+        if selector == #selector(NSResponder.moveLeft(_:)) {
+            return -1
+        }
+        if selector == #selector(NSResponder.moveRight(_:)) {
+            return 1
+        }
+        return nil
+    }
+
+    private func canMoveBufferInsertionPoint() -> Bool {
+        guard !chord.hasPending, !composition.composing else { return false }
+        guard session != 0 else { return true }
+        let ctx = rimeEngine.getContext(session: session)
+        return !ctx.active && ctx.input.isEmpty && ctx.preedit.isEmpty
+    }
+
+    private func exitBufferMode(client: IMKTextInput?, source: String) -> Bool {
+        if session != 0 {
+            rimeEngine.clearComposition(session: session)
+        }
+        if let client {
+            composition.clear(client: client)
+        } else {
+            composition.markCleared()
+        }
+        BufferModel.shared.compositionActive = false
+        BufferModel.shared.clear()
+        BufferModel.shared.enabled = false
+        IMELog.write("buffer mode cancelled by \(source)")
+        if let client {
+            updateUI(client: client)
+        } else {
+            candidateWindow.refreshBuffer()
+        }
+        return true
+    }
+
+    private func resetBufferEnterGesture() {
+        bufferEnterPending = false
+        bufferEnterSuppressUntilPhysicalUp = false
+        bufferEnterClient = nil
+        bufferEnterPollTimer?.invalidate()
+        bufferEnterPollTimer = nil
+        candidateWindow.setBufferFlushProgress(nil)
+    }
+
+    private func beginBufferEnterGesture(client: IMKTextInput, hardwareKeyCode: UInt16) {
+        bufferEnterPending = true
+        bufferEnterSuppressUntilPhysicalUp = false
+        bufferEnterClient = client
+        bufferEnterHardwareKeyCode = CGKeyCode(hardwareKeyCode)
+        bufferEnterStartedAt = CFAbsoluteTimeGetCurrent()
+        candidateWindow.setBufferFlushProgress(0)
+        IMELog.write("buffer enter pending; polling physical key state keyCode=\(hardwareKeyCode)")
+        scheduleBufferEnterPoll()
+    }
+
+    private func scheduleBufferEnterPoll() {
+        bufferEnterPollTimer?.invalidate()
+        let timer = Timer(timeInterval: Self.bufferEnterPollInterval, repeats: false) { [weak self] _ in
+            self?.pollBufferEnterGesture()
+        }
+        bufferEnterPollTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func pollBufferEnterGesture() {
+        if bufferEnterSuppressUntilPhysicalUp {
+            if isBufferEnterPhysicallyDown() {
+                scheduleBufferEnterPoll()
+            } else {
+                IMELog.write("buffer enter physical key released after hold")
+                resetBufferEnterGesture()
+            }
+            return
+        }
+
+        guard bufferEnterPending else { return }
+        guard BufferModel.shared.enabled else {
+            resetBufferEnterGesture()
+            return
+        }
+
+        if !isBufferEnterPhysicallyDown() {
+            IMELog.write("buffer enter physical release detected; tap")
+            lastBufferEnterKeyHandledAt = CFAbsoluteTimeGetCurrent()
+            _ = performBufferEnter(client: bufferEnterClient, source: "key tap")
+            resetBufferEnterGesture()
+            return
+        }
+
+        let elapsed = CFAbsoluteTimeGetCurrent() - bufferEnterStartedAt
+        let progress = min(max(elapsed / Self.bufferEnterHoldDelay, 0), 1)
+        candidateWindow.setBufferFlushProgress(progress)
+        if elapsed >= Self.bufferEnterHoldDelay {
+            IMELog.write("buffer enter hold reached \(Self.bufferEnterHoldDelay)s; send all")
+            lastBufferEnterKeyHandledAt = CFAbsoluteTimeGetCurrent()
+            bufferEnterPending = false
+            bufferEnterSuppressUntilPhysicalUp = true
+            candidateWindow.setBufferFlushProgress(1)
+            _ = performBufferEnterAll(client: bufferEnterClient, source: "key hold")
+            scheduleBufferEnterPoll()
+            return
+        }
+
+        scheduleBufferEnterPoll()
+    }
+
+    private func isBufferEnterPhysicallyDown() -> Bool {
+        CGEventSource.keyState(.combinedSessionState, key: bufferEnterHardwareKeyCode)
+    }
+
+    private func performBufferEnter(client: IMKTextInput?, source: String) -> Bool {
+        let resolvedClient = client ?? (self.client() as IMKTextInput?) ?? lastClient
+        if let resolvedClient {
+            Self.active = self
+            Self.recent = self
+            lastClient = resolvedClient
+        }
+
+        if let resolvedClient,
+           rimeEngine.start(),
+           ensureSessionReady(),
+           session != 0 {
+            let ctx = rimeEngine.getContext(session: session)
+            if chord.hasPending || composition.composing || ctx.active || !ctx.input.isEmpty || !ctx.preedit.isEmpty {
+                resolveComposition(client: resolvedClient)
+            }
+        } else if session != 0 {
+            rimeEngine.clearComposition(session: session)
+            composition.markCleared()
+        }
+
+        BufferModel.shared.compositionActive = false
+        let originalBlockCount = BufferModel.shared.blocks.count
+        let sent = BufferModel.shared.sendNextBlock()
+        IMELog.write("buffer enter \(source) consumed; send next=\(sent) blocks=\(originalBlockCount)->\(BufferModel.shared.blocks.count) enabled=\(BufferModel.shared.enabled)")
+
+        if let resolvedClient {
+            if BufferModel.shared.shouldDisplay {
+                updateUI(client: resolvedClient)
+            } else {
+                candidateWindow.hide()
+            }
+        } else {
+            candidateWindow.refreshBuffer()
+        }
+        return true
+    }
+
+    private func performBufferEnterAll(client: IMKTextInput?, source: String) -> Bool {
+        let resolvedClient = client ?? (self.client() as IMKTextInput?) ?? lastClient
+        if let resolvedClient {
+            Self.active = self
+            Self.recent = self
+            lastClient = resolvedClient
+        }
+
+        if let resolvedClient,
+           rimeEngine.start(),
+           ensureSessionReady(),
+           session != 0 {
+            let ctx = rimeEngine.getContext(session: session)
+            if chord.hasPending || composition.composing || ctx.active || !ctx.input.isEmpty || !ctx.preedit.isEmpty {
+                resolveComposition(client: resolvedClient)
+            }
+        } else if session != 0 {
+            rimeEngine.clearComposition(session: session)
+            composition.markCleared()
+        }
+
+        BufferModel.shared.compositionActive = false
+        let originalBlockCount = BufferModel.shared.blocks.count
+        BufferModel.shared.sendAll()
+        IMELog.write("buffer enter \(source) consumed; send all blocks=\(originalBlockCount)->\(BufferModel.shared.blocks.count) enabled=\(BufferModel.shared.enabled)")
+
+        if let resolvedClient {
+            if BufferModel.shared.shouldDisplay {
+                updateUI(client: resolvedClient)
+            } else {
+                candidateWindow.hide()
+            }
+        } else {
+            candidateWindow.refreshBuffer()
+        }
+        return true
     }
 
     private func performBufferBackspace(client: IMKTextInput, source: String) -> Bool {
@@ -427,6 +816,7 @@ final class RimeBufferController: IMKInputController {
             selectCandidate(onPage: index)
             return true
         case 0x30:
+            guard !BufferModel.shared.enabled else { return true }
             candidateWindow.performBufferAction()
             return true
         default:
@@ -515,6 +905,7 @@ final class RimeBufferController: IMKInputController {
             return false
         }
         Delivery.insert(text, into: client)
+        composition.commitDidInsert()
         lastClient = client
         return true
     }
@@ -570,17 +961,23 @@ final class RimeBufferController: IMKInputController {
 
         let bid = bundleId(of: client)
         let mode = CompositionSession.mode(for: bid)
-        composition.update(preedit: ctx.preedit, cursorPosUTF8: ctx.cursorPos,
-                           client: client, mode: mode)
-        BufferModel.shared.compositionActive = composition.composing   // expiry waits mid-composition
+        let bufferEnabled = BufferModel.shared.enabled
+        if bufferEnabled {
+            composition.updateBufferGuard(preedit: ctx.preedit, client: client)
+        } else {
+            composition.update(preedit: ctx.preedit, cursorPosUTF8: ctx.cursorPos,
+                               client: client, mode: mode)
+        }
+        BufferModel.shared.compositionActive = ctx.active || !ctx.input.isEmpty || !ctx.preedit.isEmpty
 
+        let showPreeditInPanel = bufferEnabled || mode == .placeholder
         let wantsPanel = !ctx.candidates.isEmpty
-            || (mode == .placeholder && !ctx.preedit.isEmpty)
+            || (showPreeditInPanel && !ctx.preedit.isEmpty)
         if wantsPanel {
             candidateWindow.update(ctx,
                                    caretRect: caretRect(for: client),
                                    bundleId: bid,
-                                   showPreedit: mode == .placeholder)
+                                   showPreedit: showPreeditInPanel)
         } else if BufferModel.shared.shouldDisplay {
             candidateWindow.showBufferOnly(caretRect: caretRect(for: client), bundleId: bid)
         } else {

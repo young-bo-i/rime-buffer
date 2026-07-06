@@ -17,6 +17,7 @@ final class BufferModel {
     }
 
     private(set) var blocks: [Block] = []
+    private(set) var insertionIndex = 0
 
     var stagedText: String {
         blocks.map(\.text).joined()
@@ -52,22 +53,40 @@ final class BufferModel {
 
     func append(_ text: String) {
         guard !text.isEmpty else { return }
-        blocks.append(Block(text: text))
+        let index = clampedInsertionIndex()
+        blocks.insert(Block(text: text), at: index)
+        insertionIndex = index + 1
+        IMELog.write("buffer insert block at \(index) count=\(blocks.count)")
         onChange?()
     }
 
     @discardableResult
     func removeLastBlock() -> Bool {
         guard let removed = blocks.popLast() else { return false }
+        clampInsertionIndexInPlace()
         IMELog.write("buffer remove last block '\(removed.text)' remaining=\(blocks.count)")
         onChange?()
         return true
     }
 
+    @discardableResult
+    func moveInsertionPoint(delta: Int) -> Bool {
+        let old = clampedInsertionIndex()
+        let next = min(max(old + delta, 0), blocks.count)
+        insertionIndex = next
+        guard next != old else {
+            IMELog.write("buffer insertion point edge index=\(next) count=\(blocks.count)")
+            return false
+        }
+        IMELog.write("buffer insertion point \(old)->\(next) count=\(blocks.count)")
+        onChange?()
+        return true
+    }
+
     /// Send everything now, oldest first. If every delivery path accepts the
-    /// text, clear the queue and leave buffer mode; otherwise preserve state so
-    /// the user can retry.
-    func sendAllAndExit() {
+    /// text, clear the queue but keep buffer mode active; otherwise preserve
+    /// the unsent blocks so the user can retry.
+    func sendAll() {
         guard !blocks.isEmpty else { return }
         IMELog.write("buffer send start blocks=\(blocks.count) chars=\(stagedCharacterCount)")
         for block in blocks {
@@ -80,8 +99,31 @@ final class BufferModel {
         }
         let count = blocks.count
         blocks.removeAll()
-        IMELog.write("buffer send end; cleared \(count) blocks and disabled buffer mode")
-        enabled = false
+        insertionIndex = 0
+        IMELog.write("buffer send end; cleared \(count) blocks; buffer mode preserved")
+        onChange?()
+    }
+
+    /// Send one block in FIFO order. A short Enter tap uses this, so releasing
+    /// staged text never exits buffer mode.
+    @discardableResult
+    func sendNextBlock() -> Bool {
+        guard let block = blocks.first else { return false }
+        IMELog.write("buffer send next start block='\(block.text)' remaining=\(blocks.count)")
+        guard deliver?(block.text) == true else {
+            IMELog.write("buffer send next blocked; keeping \(blocks.count) blocks")
+            onChange?()
+            return false
+        }
+
+        blocks.removeFirst()
+        if insertionIndex > 0 {
+            insertionIndex -= 1
+        }
+        clampInsertionIndexInPlace()
+        IMELog.write("buffer send next attempted '\(block.text)' remaining=\(blocks.count)")
+        onChange?()
+        return true
     }
 
     func clear() {
@@ -89,6 +131,15 @@ final class BufferModel {
             IMELog.write("buffer clear dropped \(blocks.count) blocks chars=\(stagedCharacterCount)")
         }
         blocks.removeAll()
+        insertionIndex = 0
         onChange?()
+    }
+
+    private func clampedInsertionIndex() -> Int {
+        min(max(insertionIndex, 0), blocks.count)
+    }
+
+    private func clampInsertionIndexInPlace() {
+        insertionIndex = clampedInsertionIndex()
     }
 }

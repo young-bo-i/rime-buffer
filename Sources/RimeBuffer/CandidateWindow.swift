@@ -149,6 +149,7 @@ final class CandidateWindow {
     private var bufferOnly = false
     private var lastCaretRect = NSRect.zero
     private var lastBundleId = ""
+    private var bufferFlushProgress: Double?
 
     var onSelect: ((Int) -> Void)?
     var onPage: ((Int) -> Void)?
@@ -317,7 +318,10 @@ final class CandidateWindow {
             visualPageIndex = clampVisualPage(visualPageIndex, panelWidth: activePanelWidth())
         }
 
-        preeditLabel.stringValue = showPreedit ? (ctx.preedit.isEmpty ? ctx.input : ctx.preedit) : ""
+        let bufferOwnsPreedit = BufferModel.shared.enabled
+        preeditLabel.stringValue = showPreedit && !bufferOwnsPreedit
+            ? (ctx.preedit.isEmpty ? ctx.input : ctx.preedit)
+            : ""
         preeditLabel.isHidden = preeditLabel.stringValue.isEmpty
         applyAppearance()
         renderCandidates()
@@ -376,6 +380,11 @@ final class CandidateWindow {
         panel.orderFrontRegardless()
     }
 
+    func setBufferFlushProgress(_ progress: Double?) {
+        bufferFlushProgress = progress
+        inlineBuffer.setFlushProgress(progress)
+    }
+
     @discardableResult
     func moveSelection(delta: Int) -> Bool {
         guard !currentContext.candidates.isEmpty else { return false }
@@ -405,7 +414,13 @@ final class CandidateWindow {
     }
 
     func performBufferAction() {
-        BufferModel.shared.enabled.toggle()
+        guard !BufferModel.shared.enabled else {
+            IMELog.write("candidate buffer action ignored; already enabled")
+            renderCandidates()
+            refreshBuffer()
+            return
+        }
+        BufferModel.shared.enabled = true
         IMELog.write("candidate buffer action -> \(BufferModel.shared.enabled)")
         renderCandidates()
         refreshBuffer()
@@ -488,7 +503,11 @@ final class CandidateWindow {
     }
 
     private func refreshInlineBuffer() {
-        let visible = inlineBuffer.refresh()
+        let bufferPreedit = BufferModel.shared.enabled
+            ? (currentContext.preedit.isEmpty ? currentContext.input : currentContext.preedit)
+            : ""
+        let visible = inlineBuffer.refresh(preedit: bufferPreedit)
+        inlineBuffer.setFlushProgress(bufferFlushProgress)
         inlineBufferHeightConstraint.constant = visible ? inlineBuffer.preferredHeight : 0
     }
 
@@ -499,7 +518,6 @@ final class CandidateWindow {
 
         let panelWidth = activePanelWidth()
         let available = candidateAvailableWidth(panelWidth: panelWidth)
-        let bufferWidth = min(bufferActionWidth(), available)
         for i in currentVisualCandidateIndices(panelWidth: panelWidth) {
             let c = currentContext.candidates[i]
             candidateStack.addArrangedSubview(candidateButton(
@@ -512,14 +530,9 @@ final class CandidateWindow {
             ))
         }
 
-        candidateStack.addArrangedSubview(candidateButton(
-            index: bufferActionTag,
-            candidate: bufferActionCandidate(),
-            highlighted: false,
-            compact: true,
-            width: bufferWidth,
-            maxWidth: bufferWidth
-        ))
+        if !BufferModel.shared.enabled {
+            candidateStack.addArrangedSubview(bufferActionButton(width: min(bufferActionWidth(), available)))
+        }
     }
 
     private func candidateButton(
@@ -577,6 +590,23 @@ final class CandidateWindow {
         return line
     }
 
+    private func bufferActionButton(width: CGFloat) -> NSButton {
+        let button = BufferActionPillButton()
+        button.tag = bufferActionTag
+        button.target = self
+        button.action = #selector(candidateTapped(_:))
+        button.attributedTitle = candidateTitle(bufferActionCandidate(), highlighted: false)
+        button.layer?.backgroundColor = NSColor.clear.cgColor
+        button.toolTip = "开启缓冲区"
+        NSLayoutConstraint.activate([
+            button.widthAnchor.constraint(equalToConstant: width),
+            button.heightAnchor.constraint(equalToConstant: compactCandidateButtonHeight(
+                for: CandidateWindowMetrics.current
+            )),
+        ])
+        return button
+    }
+
     private func measuredCandidateWidth(_ c: RimeCandidateModel, highlighted: Bool, compact: Bool) -> CGFloat {
         candidateTitle(c, highlighted: highlighted).size().width + (compact ? 20 : 14)
     }
@@ -591,18 +621,19 @@ final class CandidateWindow {
     }
 
     private func bufferActionCandidate() -> RimeCandidateModel {
-        RimeCandidateModel(text: "Buffer",
-                           comment: BufferModel.shared.enabled ? "缓冲区已开启" : "缓冲区已关闭",
-                           label: "0")
+        RimeCandidateModel(text: "B", comment: "开启缓冲区", label: "0")
     }
 
     private func bufferActionWidth() -> CGFloat {
-        ceil(measuredCandidateWidth(bufferActionCandidate(), highlighted: false, compact: true))
+        max(44, ceil(measuredCandidateWidth(bufferActionCandidate(), highlighted: false, compact: true)))
     }
 
     private func candidateMaxWidth(panelWidth: CGFloat) -> CGFloat {
         let available = candidateAvailableWidth(panelWidth: panelWidth)
-        let remaining = available - min(bufferActionWidth(), available) - candidateStack.spacing
+        let bufferSpace = BufferModel.shared.enabled
+            ? 0
+            : min(bufferActionWidth(), available) + candidateStack.spacing
+        let remaining = available - bufferSpace
         return max(64, remaining)
     }
 
@@ -610,7 +641,10 @@ final class CandidateWindow {
         guard !currentContext.candidates.isEmpty else { return [] }
 
         let available = candidateAvailableWidth(panelWidth: panelWidth)
-        let remaining = available - min(bufferActionWidth(), available) - candidateStack.spacing
+        let bufferSpace = BufferModel.shared.enabled
+            ? 0
+            : min(bufferActionWidth(), available) + candidateStack.spacing
+        let remaining = available - bufferSpace
         let pageWidth = max(64, remaining)
         let maxItemWidth = max(64, pageWidth)
 
@@ -758,6 +792,47 @@ private final class CandidatePillButton: NSButton {
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
+private final class BufferActionPillButton: NSButton {
+    private let dashedBorder = CAShapeLayer()
+
+    init() {
+        super.init(frame: .zero)
+        isBordered = false
+        setButtonType(.momentaryChange)
+        focusRingType = .none
+        alignment = .center
+        wantsLayer = true
+        layer?.cornerRadius = 9
+        layer?.masksToBounds = false
+        cell?.lineBreakMode = .byTruncatingTail
+        cell?.usesSingleLineMode = true
+        translatesAutoresizingMaskIntoConstraints = false
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        dashedBorder.fillColor = NSColor.clear.cgColor
+        dashedBorder.strokeColor = RimeUI.border.withAlphaComponent(0.55).cgColor
+        dashedBorder.lineWidth = 1
+        dashedBorder.lineDashPattern = [3, 2]
+        layer?.addSublayer(dashedBorder)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layout() {
+        super.layout()
+        dashedBorder.frame = bounds
+        dashedBorder.path = CGPath(
+            roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
+            cornerWidth: 9,
+            cornerHeight: 9,
+            transform: nil
+        )
+    }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }

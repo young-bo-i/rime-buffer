@@ -195,9 +195,9 @@ func runBufferSmokeTest() -> Bool {
     }
     model.append("你")
     model.append("好")
-    model.sendAllAndExit()
-    guard delivered == ["你", "好"], model.blocks.isEmpty, model.enabled == false else {
-        print("FAILED: sendAllAndExit success semantics",
+    model.sendAll()
+    guard delivered == ["你", "好"], model.blocks.isEmpty, model.enabled == true else {
+        print("FAILED: sendAll success should keep buffer mode",
               "delivered=\(delivered)",
               "blocks=\(model.blocks.count)",
               "enabled=\(model.enabled)")
@@ -207,7 +207,7 @@ func runBufferSmokeTest() -> Bool {
     model.enabled = true
     model.append("保留")
     model.deliver = { _ in false }
-    model.sendAllAndExit()
+    model.sendAll()
     guard model.blocks.count == 1, model.enabled == true else {
         print("FAILED: send failure should preserve state",
               "blocks=\(model.blocks.count)",
@@ -236,6 +236,49 @@ func runBufferSmokeTest() -> Bool {
           model.removeLastBlock() == false else {
         print("FAILED: removeLastBlock empty semantics",
               "blocks=\(model.blocks.map(\.text))")
+        return false
+    }
+
+    model.clear()
+    model.append("一")
+    model.append("三")
+    guard model.moveInsertionPoint(delta: -1),
+          model.insertionIndex == 1 else {
+        print("FAILED: moveInsertionPoint should move left",
+              "index=\(model.insertionIndex)",
+              "blocks=\(model.blocks.map(\.text))")
+        return false
+    }
+    model.append("二")
+    guard model.blocks.map(\.text) == ["一", "二", "三"],
+          model.insertionIndex == 2 else {
+        print("FAILED: append should insert at insertion point",
+              "index=\(model.insertionIndex)",
+              "blocks=\(model.blocks.map(\.text))")
+        return false
+    }
+    _ = model.moveInsertionPoint(delta: 99)
+    guard model.insertionIndex == model.blocks.count else {
+        print("FAILED: insertion point should clamp to end",
+              "index=\(model.insertionIndex)",
+              "blocks=\(model.blocks.map(\.text))")
+        return false
+    }
+
+    delivered.removeAll()
+    model.deliver = { text in
+        delivered.append(text)
+        return true
+    }
+    guard model.sendNextBlock(),
+          delivered == ["一"],
+          model.blocks.map(\.text) == ["二", "三"],
+          model.enabled == true else {
+        print("FAILED: sendNextBlock should send oldest and keep buffer mode",
+              "delivered=\(delivered)",
+              "index=\(model.insertionIndex)",
+              "blocks=\(model.blocks.map(\.text))",
+              "enabled=\(model.enabled)")
         return false
     }
 
