@@ -58,6 +58,10 @@ candidateWindow.refreshBuffer()
 // stray candidate panel when the user switches apps mid-composition.
 StatusMenu.shared.install()
 StatusMenu.shared.setHealthy(rimeEngine.isHealthy)
+
+// Auto-update: silently check GitHub Releases on launch + hourly, download in the
+// background, and surface a one-click install in the status menu when ready.
+UpdateManager.shared.startPeriodicUpdateCheck()
 NSWorkspace.shared.notificationCenter.addObserver(
     forName: NSWorkspace.didActivateApplicationNotification,
     object: nil, queue: .main) { _ in

@@ -1,0 +1,129 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'            # push a v-prefixed tag (e.g. v0.2.0) to cut a release
+  workflow_dispatch:    # manual builds (produces an artifact, no release)
+    inputs:
+      version:
+        description: 'Version number (e.g. 0.2.0)'
+        required: false
+        default: '0.0.0-dev'
+
+permissions:
+  contents: write       # needed to create the GitHub Release
+
+jobs:
+  build:
+    runs-on: macos-14   # ARM64 runner; the app is built universal below
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          elif [[ -n "${{ github.event.inputs.version }}" ]]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="0.0.0-dev"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building version: $VERSION"
+
+      - name: Stamp version into Info.plist
+        run: |
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ steps.version.outputs.VERSION }}" Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ github.run_number }}" Info.plist
+          echo "----- Info.plist versions -----"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Info.plist
+          /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" Info.plist
+
+      # Universal (arm64 + x86_64) so the same .app runs on Apple Silicon and
+      # Intel. librime is dlopen'd at runtime, so nothing extra is needed here.
+      - name: Build (release, universal)
+        run: |
+          swift build -c release --arch arm64 --arch x86_64
+          echo "BIN_DIR=$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)" >> "$GITHUB_ENV"
+
+      - name: Assemble RimeBuffer.app
+        run: |
+          APP="RimeBuffer.app"
+          rm -rf "$APP"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "$BIN_DIR/RimeBuffer" "$APP/Contents/MacOS/RimeBuffer"
+          cp Info.plist "$APP/Contents/Info.plist"
+          # Ad-hoc sign for local use (users clear quarantine on first run / the
+          # in-app updater removes it automatically). No nested code, so no --deep.
+          codesign --force --sign - "$APP"
+          codesign --verify --verbose "$APP" || true
+          xattr -cr "$APP"
+          echo "----- assembled bundle -----"
+          file "$APP/Contents/MacOS/RimeBuffer"
+
+      - name: Package ZIP
+        id: package
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          ZIP="RimeBuffer-${VERSION}.zip"
+          # ditto preserves the bundle structure + ad-hoc signature; the in-app
+          # updater unzips this with /usr/bin/unzip.
+          ditto -c -k --sequesterRsrc --keepParent "RimeBuffer.app" "$ZIP"
+          SHA256=$(shasum -a 256 "$ZIP" | awk '{print $1}')
+          echo "ZIP=$ZIP" >> "$GITHUB_OUTPUT"
+          echo "SHA256=$SHA256" >> "$GITHUB_OUTPUT"
+          echo "ZIP: $ZIP  SHA256: $SHA256"
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.package.outputs.ZIP }}
+          body: |
+            ## RimeBuffer v${{ steps.version.outputs.VERSION }}
+
+            macOS 输入法（IMK + librime）。**运行前提**：已安装 Squirrel（鼠须管），
+            RimeBuffer 复用其 `librime` 与 `~/Library/Rime` 配置。
+
+            ### 应用内自动更新
+            已安装并运行的 RimeBuffer 会自动检查此仓库的最新 Release，静默下载后在
+            状态栏菜单提示；点「立即更新」即自动替换并重启。无需手动操作。
+
+            ### 手动安装 / 首次安装
+            ```bash
+            # 1. 解压并放入输入法目录
+            unzip RimeBuffer-${{ steps.version.outputs.VERSION }}.zip
+            rm -rf "$HOME/Library/Input Methods/RimeBuffer.app"
+            mv RimeBuffer.app "$HOME/Library/Input Methods/"
+            xattr -cr "$HOME/Library/Input Methods/RimeBuffer.app"
+
+            # 2. 注册并启动
+            /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+              -f "$HOME/Library/Input Methods/RimeBuffer.app"
+            open "$HOME/Library/Input Methods/RimeBuffer.app"
+            ```
+            然后在「系统设置 → 键盘 → 输入法」中添加 RimeBuffer。
+
+            ### 校验和
+            | 文件 | SHA256 |
+            |------|--------|
+            | ZIP | `${{ steps.package.outputs.SHA256 }}` |
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifact (manual builds)
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        uses: actions/upload-artifact@v4
+        with:
+          name: RimeBuffer-${{ steps.version.outputs.VERSION }}
+          path: ${{ steps.package.outputs.ZIP }}

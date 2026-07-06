@@ -20,14 +20,14 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     func install() {
         guard item == nil else { return }
         let status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        if let button = status.button {
-            button.image = NSImage(systemSymbolName: "keyboard.badge.ellipsis",
-                                   accessibilityDescription: "RimeBuffer")
-        }
+        item = status
+        refreshButton()
+        // An available/staged update tints the menu-bar icon so it's noticeable
+        // without a nagging alert; the menu itself offers the one-click install.
+        UpdateManager.shared.onChange = { [weak self] in self?.refreshButton() }
         let menu = NSMenu()
         menu.delegate = self
         status.menu = menu
-        item = status
     }
 
     func update(schemaId: String, schemaName: String) {
@@ -37,22 +37,38 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
     func setHealthy(_ ok: Bool) {
         healthy = ok
-        item?.button?.image = NSImage(
-            systemSymbolName: ok ? "keyboard.badge.ellipsis" : "keyboard.badge.exclamationmark",
+        refreshButton()
+    }
+
+    private func refreshButton() {
+        guard let button = item?.button else { return }
+        button.image = NSImage(
+            systemSymbolName: healthy ? "keyboard.badge.ellipsis" : "keyboard.badge.exclamationmark",
             accessibilityDescription: "RimeBuffer")
+        button.contentTintColor = UpdateManager.shared.pendingVersion != nil ? .controlAccentColor : nil
     }
 
     // Rebuild on every open so state is always current.
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
 
+        let version = UpdateManager.shared.currentVersion
         let health = NSMenuItem(
-            title: healthy ? "RimeBuffer · \(schemaName.isEmpty ? "就绪" : schemaName)"
+            title: healthy ? "RimeBuffer v\(version) · \(schemaName.isEmpty ? "就绪" : schemaName)"
                            : "⚠️ 引擎异常 — 已退化为英文直通",
             action: nil, keyEquivalent: "")
         health.isEnabled = false
         menu.addItem(health)
         menu.addItem(.separator())
+
+        // Staged update, if any, gets top billing with a one-click install.
+        if UpdateManager.shared.isUpdateReady, let newVersion = UpdateManager.shared.pendingVersion {
+            let update = NSMenuItem(title: "🎉 有新版本 v\(newVersion) — 立即更新",
+                                    action: #selector(installUpdate), keyEquivalent: "")
+            update.target = self
+            menu.addItem(update)
+            menu.addItem(.separator())
+        }
 
         for schema in Self.schemas {
             let mi = NSMenuItem(title: schema.title, action: #selector(chooseSchema(_:)), keyEquivalent: "")
@@ -74,6 +90,10 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         menu.addItem(settings)
         menu.addItem(.separator())
 
+        let checkUpdate = NSMenuItem(title: "检查更新…", action: #selector(checkUpdate), keyEquivalent: "")
+        checkUpdate.target = self
+        menu.addItem(checkUpdate)
+
         let log = NSMenuItem(title: "打开日志 (~/rimebuffer.log)", action: #selector(openLog), keyEquivalent: "")
         log.target = self
         menu.addItem(log)
@@ -81,6 +101,14 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         let restart = NSMenuItem(title: "重启输入法进程", action: #selector(restart), keyEquivalent: "")
         restart.target = self
         menu.addItem(restart)
+    }
+
+    @objc private func installUpdate() {
+        UpdateManager.shared.promptAndInstall()
+    }
+
+    @objc private func checkUpdate() {
+        UpdateManager.shared.checkNowManually()
     }
 
     @objc private func chooseSchema(_ sender: NSMenuItem) {

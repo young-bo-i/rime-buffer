@@ -9,3 +9,13 @@
 .build/release/RimeBuffer smoke   # 免安装引擎自检
 tail -f ~/rimebuffer.log          # 行为日志
 ```
+
+## 发布 / 自动更新
+
+已装的 RimeBuffer 会自动检查 GitHub Release 并在状态栏菜单提示一键更新。发布新版本：
+
+```bash
+./scripts/release.sh minor        # 打 tag 触发 CI 构建并发布 Release
+```
+
+细节见 [RELEASE.md](RELEASE.md)（CI、通用二进制、应用内更新流程）。
