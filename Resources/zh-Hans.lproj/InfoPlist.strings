@@ -1,4 +1,5 @@
-/* 输入源在「输入法」列表 / 输入菜单里的显示名。键为 TISInputSourceID。 */
+/* 输入源在「输入法」列表 / 输入菜单里的显示名。键为 TISInputSourceID / bundle id。 */
 "CFBundleDisplayName" = "恩特输入法";
 "CFBundleName" = "恩特输入法";
 "com.isaac.inputmethod.ETInput" = "恩特输入法";
+"com.isaac.inputmethod.ETInput.Hans" = "恩特输入法";
