@@ -72,6 +72,7 @@ jobs:
           cp -R Vendor/rime/SharedSupport/* "$APP/Contents/SharedSupport/"
           [ -f Logo/AppIcon.icns ] && cp Logo/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns" || true
           cp -R Resources/*.lproj "$APP/Contents/Resources/" 2>/dev/null || true   # localized display name
+          cp Resources/etinput.png "$APP/Contents/Resources/" 2>/dev/null || true  # input-mode menu icon
           # --deep: sign the nested librime + plugin dylibs too.
           codesign --force --deep --sign - "$APP"
           codesign --verify --verbose "$APP" || true
