@@ -1,5 +1,7 @@
 import Cocoa
 import InputMethodKit
+import Network
+import CryptoKit
 
 // `swift run RimeBuffer smoke` validates the engine end-to-end without IMK.
 if CommandLine.arguments.contains("stats-smoke") {
@@ -7,6 +9,9 @@ if CommandLine.arguments.contains("stats-smoke") {
 }
 if CommandLine.arguments.contains("buffer-smoke") {
     exit(runBufferSmokeTest() ? 0 : 1)
+}
+if CommandLine.arguments.contains("remote-smoke") {
+    exit(runRemoteSmokeTest() ? 0 : 1)
 }
 if CommandLine.arguments.contains("smoke") {
     runEngineSmokeTest()
@@ -62,6 +67,45 @@ StatusMenu.shared.setHealthy(rimeEngine.isHealthy)
 // Auto-update: silently check GitHub Releases on launch + hourly, download in the
 // background, and surface a one-click install in the status menu when ready.
 UpdateManager.shared.startPeriodicUpdateCheck()
+
+// Remote typing ("隔空传字"): text committed here mirrors to a paired Mac; text
+// from the peer lands here — into the focused field if ETInput is active, else
+// on the clipboard as a fallback. Both callbacks run on the main thread.
+var remoteClipboardBuffer = ""   // accumulates received text while no field is focused
+RemoteTypingService.shared.onReceiveText = { text in
+    if RimeBufferController.insertRemoteText(text) {
+        remoteClipboardBuffer = ""
+        IMELog.write("remote: inserted received text into focused field")
+    } else {
+        // No focused field — accumulate onto the clipboard (don't clobber each
+        // prior message) so the user can paste the whole thing.
+        remoteClipboardBuffer += text
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(remoteClipboardBuffer, forType: .string)
+        IMELog.write("remote: no focused field; accumulated \(remoteClipboardBuffer.count) chars to clipboard")
+    }
+}
+// A peer asks to pair — show 同意/拒绝 with the 4-digit SAS. One tap, no code entry.
+RemoteTypingService.shared.onPairRequest = { peerName, sas, respond in
+    let alert = NSAlert()
+    alert.messageText = "「\(peerName)」请求隔空传字"
+    alert.informativeText = "同意后，对方打的字会即时出现在你这里，你打的字也会发给对方。\n验证码：\(sas)（两台显示一致即代表安全，无中间人）"
+    alert.addButton(withTitle: "同意")
+    alert.addButton(withTitle: "拒绝")
+    NSApp.activate(ignoringOtherApps: true)
+    respond(alert.runModal() == .alertFirstButtonReturn)
+}
+// We initiated pairing and reached the peer — confirm the SAS matches, then request.
+RemoteTypingService.shared.onPairConfirm = { peerName, sas, proceed in
+    let alert = NSAlert()
+    alert.messageText = "与「\(peerName)」配对"
+    alert.informativeText = "请核对两台 Mac 显示的验证码一致：\(sas)\n一致后点「配对」，再请对方点「同意」。"
+    alert.addButton(withTitle: "配对")
+    alert.addButton(withTitle: "取消")
+    NSApp.activate(ignoringOtherApps: true)
+    proceed(alert.runModal() == .alertFirstButtonReturn)
+}
+RemoteTypingService.shared.restart()   // starts only if enabled
 NSWorkspace.shared.notificationCenter.addObserver(
     forName: NSWorkspace.didActivateApplicationNotification,
     object: nil, queue: .main) { _ in
@@ -291,5 +335,118 @@ func runBufferSmokeTest() -> Bool {
     }
 
     print("buffer smoke: OK")
+    return true
+}
+
+// MARK: - Remote-typing transport smoke (crypto + framing + loopback socket)
+
+func runRemoteSmokeTest() -> Bool {
+    print("== ETInput remote-typing smoke test ==")
+    print("identity fp:", RemoteIdentity.fingerprint)   // must be stable across launches (Keychain)
+
+    // 1) ECDH session key: two identities derive the SAME key; and AES-GCM
+    //    round-trips only under that key.
+    let a = Curve25519.KeyAgreement.PrivateKey()
+    let b = Curve25519.KeyAgreement.PrivateKey()
+    let nA = RemoteCrypto.randomNonce(), nB = RemoteCrypto.randomNonce()
+    func derive(_ priv: Curve25519.KeyAgreement.PrivateKey, _ peer: Curve25519.KeyAgreement.PublicKey) -> SymmetricKey {
+        let shared = try! priv.sharedSecretFromKeyAgreement(with: peer)
+        let salt = nA.lexicographicallyPrecedes(nB) ? nA + nB : nB + nA
+        return shared.hkdfDerivedSymmetricKey(using: SHA256.self, salt: salt,
+                                              sharedInfo: Data("etinput-remote-session-v1".utf8), outputByteCount: 32)
+    }
+    let keyA = derive(a, b.publicKey)
+    let keyB = derive(b, a.publicKey)
+    let wrong = SymmetricKey(size: .bits256)
+    let plain = Data("你好 hello".utf8)
+    guard keyA.withUnsafeBytes({ Data($0) }) == keyB.withUnsafeBytes({ Data($0) }),
+          let sealed = RemoteCrypto.seal(plain, key: keyA),
+          RemoteCrypto.open(sealed, key: keyB) == plain,
+          RemoteCrypto.open(sealed, key: wrong) == nil else {
+        print("FAILED: ECDH key agreement / AES-GCM"); return false
+    }
+    print("ECDH + crypto: OK")
+
+    // 2) Framing: plaintext hello + sealed message, streaming reassembly.
+    let hello = HelloMessage(deviceID: "A", name: "阿 Mac", pubKey: "cHViaw==", nonce: "bm9uYw==")
+    guard let hf = RemoteFrame.encodeHello(hello),
+          let sf = RemoteFrame.encodeSealed(.init(kind: .text, seq: 7, text: "世界B"), key: keyA) else {
+        print("FAILED: frame encode"); return false
+    }
+    let dec = RemoteFrame.Decoder()
+    var helloOK = false, textOK = false
+    for byte in (hf + sf) {
+        guard let frames = dec.feed(Data([byte])) else { print("FAILED: decoder dropped"); return false }
+        for f in frames {
+            switch f.type {
+            case .hello:
+                if let h = try? JSONDecoder().decode(HelloMessage.self, from: f.payload),
+                   h.deviceID == "A", h.name == "阿 Mac" { helloOK = true }
+            case .sealed:
+                if let j = RemoteCrypto.open(f.payload, key: keyB),
+                   let m = try? JSONDecoder().decode(SealedMessage.self, from: j),
+                   m.kind == .text, m.seq == 7, m.text == "世界B" { textOK = true }
+            }
+        }
+    }
+    guard helloOK, textOK else { print("FAILED: framing hello=\(helloOK) text=\(textOK)"); return false }
+    print("framing (hello + sealed, streaming): OK")
+
+    // 3) Loopback transport: real NWListener <- NWConnection over 127.0.0.1.
+    let q = DispatchQueue(label: "remote-smoke")
+    let listener: NWListener
+    do { listener = try NWListener(using: .tcp) } catch { print("FAILED: listener \(error)"); return false }
+    let ldec = RemoteFrame.Decoder()
+    let recvSem = DispatchSemaphore(value: 0)
+    var received: String?
+    listener.newConnectionHandler = { conn in
+        conn.stateUpdateHandler = { st in
+            guard case .ready = st else { return }
+            func loop() {
+                conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, done, err in
+                    if let data, !data.isEmpty, let frames = ldec.feed(data) {
+                        for f in frames where f.type == .sealed {
+                            if let j = RemoteCrypto.open(f.payload, key: keyA),
+                               let m = try? JSONDecoder().decode(SealedMessage.self, from: j) {
+                                received = m.text; recvSem.signal()
+                            }
+                        }
+                    }
+                    if err == nil && !done { loop() }
+                }
+            }
+            loop()
+        }
+        conn.start(queue: q)
+    }
+    let portSem = DispatchSemaphore(value: 0)
+    var port: NWEndpoint.Port?
+    listener.stateUpdateHandler = { st in
+        switch st {
+        case .ready: port = listener.port; portSem.signal()
+        case .failed: portSem.signal()
+        default: break
+        }
+    }
+    listener.start(queue: q)
+    guard portSem.wait(timeout: .now() + 5) == .success, let port else {
+        print("FAILED: listener did not become ready"); listener.cancel(); return false
+    }
+    let conn = NWConnection(host: "127.0.0.1", port: port, using: .tcp)
+    conn.stateUpdateHandler = { st in
+        guard case .ready = st else { return }
+        if let frame = RemoteFrame.encodeSealed(.init(kind: .text, seq: 1, text: "远程你好"), key: keyA) {
+            conn.send(content: frame, completion: .idempotent)
+        }
+    }
+    conn.start(queue: q)
+    let ok = recvSem.wait(timeout: .now() + 5) == .success
+    conn.cancel(); listener.cancel()
+    guard ok, received == "远程你好" else {
+        print("FAILED: loopback transport received=\(received ?? "nil")"); return false
+    }
+    print("loopback transport: OK")
+
+    print("remote smoke: OK")
     return true
 }

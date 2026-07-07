@@ -871,6 +871,7 @@ final class RimeBufferController: IMKInputController {
         } else {
             Delivery.insert(raw, into: client)
             composition.commitDidInsert()
+            RemoteTypingService.shared.send(raw)   // mirror to paired Mac (no-op if off)
             IMELog.write("raw input '\(raw)' -> \(bundleId(of: client))")
         }
         BufferModel.shared.compositionActive = false
@@ -892,6 +893,7 @@ final class RimeBufferController: IMKInputController {
         } else {
             Delivery.insert(commit, into: client)
             composition.commitDidInsert()
+            RemoteTypingService.shared.send(commit)   // mirror to paired Mac (no-op if off)
             IMELog.write("commit '\(commit)' -> \(bundleId(of: client))")
         }
     }
@@ -906,7 +908,20 @@ final class RimeBufferController: IMKInputController {
         }
         Delivery.insert(text, into: client)
         composition.commitDidInsert()
+        RemoteTypingService.shared.send(text)   // mirror buffer flush to paired Mac (no-op if off)
         lastClient = client
+        return true
+    }
+
+    /// Insert text RECEIVED from a paired Mac into the currently focused field.
+    /// Returns false when there's no live client to insert into (caller falls
+    /// back to the clipboard). Goes straight through Delivery.insert so received
+    /// text is never re-broadcast back to the sender (no echo loop). Main thread.
+    static func insertRemoteText(_ text: String) -> Bool {
+        guard let controller = active, let client = controller.client() as? IMKTextInput else {
+            return false
+        }
+        Delivery.insert(text, into: client)
         return true
     }
 

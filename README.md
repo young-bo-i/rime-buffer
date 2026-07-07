@@ -21,3 +21,12 @@ tail -f ~/rimebuffer.log          # 行为日志
 ```
 
 细节见 [RELEASE.md](RELEASE.md)（CI、通用二进制、应用内更新流程）。
+
+## 隔空传字（Mac ↔ Mac）
+
+在状态栏菜单启用「隔空传字」，两台 Mac 即可把你打的字即时发到对方的输入框——加密的局域网
+点对点直连（Network.framework + Bonjour + AWDL，无需同一 Wi-Fi、无需 Apple ID）。
+
+配对是「请求 → 同意」，**没有配对码**：A 菜单点「配对新设备 → B」→ 两台各显示同一个 4 位验证码
+→ A 核对后点「配对」、B 点「同意」→ 之后自动静默连接。基于 X25519 身份 + TOFU 信任，只有已
+互相同意的设备能传字/收字（`RemoteTypingService`）。首次两台各弹一次「本地网络」授权。

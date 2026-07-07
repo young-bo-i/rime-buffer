@@ -25,6 +25,14 @@
     <key>LSBackgroundOnly</key>
     <true/>
 
+    <!-- 隔空传字 (remote typing): local peer-to-peer over Bonjour -->
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>恩特输入法用局域网直连，把你打的字即时发送到已配对的另一台 Mac。</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_etinput._tcp</string>
+    </array>
+
     <!-- IMK wiring -->
     <key>InputMethodConnectionName</key>
     <string>ETInput_1_Connection</string>

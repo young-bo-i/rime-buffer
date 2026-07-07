@@ -90,6 +90,57 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         menu.addItem(settings)
         menu.addItem(.separator())
 
+        // 隔空传字：把 commit 的文字发到已配对的另一台 Mac。配对靠"请求→同意"，无需配对码。
+        let remote = RemoteTypingService.shared
+        let remoteStatus = NSMenuItem(title: "隔空传字 · \(remote.statusSummary)", action: nil, keyEquivalent: "")
+        remoteStatus.isEnabled = false
+        menu.addItem(remoteStatus)
+
+        let remoteToggle = NSMenuItem(title: "启用隔空传字", action: #selector(toggleRemote), keyEquivalent: "")
+        remoteToggle.target = self
+        remoteToggle.state = RemoteConfig.enabled ? .on : .off
+        menu.addItem(remoteToggle)
+
+        if RemoteConfig.enabled {
+            // 配对新设备：列出发现的、尚未配对的设备，点一下发起请求。
+            let pairSub = NSMenu()
+            let untrusted = remote.status.discovered.filter { !$0.trusted }
+            if untrusted.isEmpty {
+                let none = NSMenuItem(title: "（未发现设备）", action: nil, keyEquivalent: "")
+                none.isEnabled = false
+                pairSub.addItem(none)
+            } else {
+                for p in untrusted {
+                    let mi = NSMenuItem(title: p.name, action: #selector(pairDevice(_:)), keyEquivalent: "")
+                    mi.target = self
+                    mi.representedObject = p.id
+                    pairSub.addItem(mi)
+                }
+            }
+            let pairItem = NSMenuItem(title: "配对新设备", action: nil, keyEquivalent: "")
+            pairItem.submenu = pairSub
+            menu.addItem(pairItem)
+
+            if !remote.status.trusted.isEmpty {
+                let trustedSub = NSMenu()
+                for t in remote.status.trusted {
+                    let mi = NSMenuItem(title: "取消配对：\(t.name)", action: #selector(unpairDevice(_:)), keyEquivalent: "")
+                    mi.target = self
+                    mi.representedObject = t.pubB64
+                    trustedSub.addItem(mi)
+                }
+                let trustedItem = NSMenuItem(title: "已配对设备", action: nil, keyEquivalent: "")
+                trustedItem.submenu = trustedSub
+                menu.addItem(trustedItem)
+            }
+        }
+
+        let remoteName = NSMenuItem(title: "本机名称：\(RemoteConfig.deviceName)",
+                                    action: #selector(setDeviceName), keyEquivalent: "")
+        remoteName.target = self
+        menu.addItem(remoteName)
+        menu.addItem(.separator())
+
         let checkUpdate = NSMenuItem(title: "检查更新…", action: #selector(checkUpdate), keyEquivalent: "")
         checkUpdate.target = self
         menu.addItem(checkUpdate)
@@ -109,6 +160,50 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
     @objc private func checkUpdate() {
         UpdateManager.shared.checkNowManually()
+    }
+
+    // MARK: 隔空传字
+
+    @objc private func toggleRemote() {
+        RemoteConfig.enabled.toggle()
+        if RemoteConfig.enabled { RemoteTypingService.shared.restart() }
+        else { RemoteTypingService.shared.stop() }
+        IMELog.write("remote typing enabled -> \(RemoteConfig.enabled)")
+    }
+
+    @objc private func pairDevice(_ sender: NSMenuItem) {
+        // Connects + handshakes; the SAS-confirm dialog (onPairConfirm) pops once
+        // we've reached the peer, then the other Mac shows 同意.
+        guard let id = sender.representedObject as? String else { return }
+        RemoteTypingService.shared.requestPair(peerID: id)
+    }
+
+    @objc private func unpairDevice(_ sender: NSMenuItem) {
+        guard let pubB64 = sender.representedObject as? String else { return }
+        RemoteTypingService.shared.unpair(pubB64: pubB64)
+    }
+
+    @objc private func setDeviceName() {
+        guard let name = promptText(
+            title: "本机名称",
+            message: "这个名字会显示在对方 Mac 上。", initial: RemoteConfig.deviceName) else { return }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { RemoteConfig.deviceName = trimmed; RemoteTypingService.shared.restart() }
+    }
+
+    private func promptText(title: String, message: String, initial: String) -> String? {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.stringValue = initial
+        alert.accessoryView = field
+        alert.addButton(withTitle: "确定")
+        alert.addButton(withTitle: "取消")
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+        alert.window.makeFirstResponder(field)
+        return response == .alertFirstButtonReturn ? field.stringValue : nil
     }
 
     @objc private func chooseSchema(_ sender: NSMenuItem) {
