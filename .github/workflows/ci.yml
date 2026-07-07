@@ -34,3 +34,4 @@ jobs:
           BIN="$(swift build --show-bin-path)/RimeBuffer"
           "$BIN" buffer-smoke
           "$BIN" stats-smoke
+          "$BIN" remote-smoke   # ECDH + framing + loopback socket (no Squirrel/network perms)
