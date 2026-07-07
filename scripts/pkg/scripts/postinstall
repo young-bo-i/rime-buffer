@@ -1,0 +1,11 @@
+#!/bin/bash
+# Runs as root after the payload lands in /Library/Input Methods. Clears any
+# quarantine and (re)registers the input source with Launch Services so it shows
+# up in System Settings → Keyboard → Input Sources.
+APP="/Library/Input Methods/ETInput.app"
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+
+/usr/bin/xattr -cr "$APP" 2>/dev/null || true
+"$LSREGISTER" -f "$APP" 2>/dev/null || true
+
+exit 0
