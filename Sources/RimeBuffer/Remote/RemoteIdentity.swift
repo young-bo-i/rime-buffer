@@ -1,29 +1,45 @@
 import Foundation
 import CryptoKit
-import Security
 
 /// This device's cryptographic identity for 隔空传字, plus the trusted-peer store.
 ///
-/// Each Mac has a long-term Curve25519 (X25519) key pair — the PRIVATE half lives
-/// in the Keychain, the PUBLIC half is the device's identity. Trust is
-/// "trust on first use": when you tap 同意 to a pair request, the peer's public
-/// key is remembered; from then on that Mac connects silently. No shared code is
-/// ever typed — the pairing ACCEPT is the whole ceremony.
+/// Each Mac has a long-term Curve25519 (X25519) key pair — the PRIVATE half is
+/// stored in a 0600 file under the app's user dir, the PUBLIC half is the
+/// device's identity. Trust is "trust on first use": when you tap 同意 to a pair
+/// request, the peer's public key is remembered; from then on that Mac connects
+/// silently. No shared code is ever typed — the pairing ACCEPT is the ceremony.
+///
+/// (We deliberately DON'T use the login Keychain: ETInput is ad-hoc signed, so
+/// every rebuild/auto-update changes the code signature and the Keychain ACL
+/// would re-prompt for the password on every launch. A 0600 file is the right
+/// store for a random 256-bit key here.)
 enum RemoteIdentity {
-    private static let keyTag = "com.isaac.inputmethod.ETInput.remote.idkey"
     private static let trustKey = "remoteTrustedPeers"   // [pubKeyB64: name]
 
-    // MARK: Long-term key pair (private key in Keychain)
+    private static var keyFileURL: URL {
+        URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent("Library/RimeBuffer/remote_identity.key")
+    }
+
+    // MARK: Long-term key pair (private key in a 0600 file)
 
     static let privateKey: Curve25519.KeyAgreement.PrivateKey = {
-        if let data = keychainLoad(keyTag),
+        if let data = try? Data(contentsOf: keyFileURL),
            let key = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: data) {
             return key
         }
         let key = Curve25519.KeyAgreement.PrivateKey()
-        keychainSave(keyTag, key.rawRepresentation)
+        saveKey(key.rawRepresentation)
         return key
     }()
+
+    private static func saveKey(_ data: Data) {
+        let url = keyFileURL
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? data.write(to: url, options: .atomic)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
 
     static var publicKeyData: Data { privateKey.publicKey.rawRepresentation }
     static var publicKeyB64: String { publicKeyData.base64EncodedString() }
@@ -77,27 +93,6 @@ enum RemoteIdentity {
         Set(trustedPeers.keys.compactMap { Data(base64Encoded: $0).map(fingerprint(of:)) })
     }
 
-    // MARK: Keychain
-
-    private static func keychainSave(_ tag: String, _ data: Data) {
-        let base: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
-                                    kSecAttrAccount as String: tag]
-        SecItemDelete(base as CFDictionary)
-        var add = base
-        add[kSecValueData as String] = data
-        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        SecItemAdd(add as CFDictionary, nil)
-    }
-
-    private static func keychainLoad(_ tag: String) -> Data? {
-        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
-                                kSecAttrAccount as String: tag,
-                                kSecReturnData as String: true,
-                                kSecMatchLimit as String: kSecMatchLimitOne]
-        var out: CFTypeRef?
-        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess else { return nil }
-        return out as? Data
-    }
 }
 
 private extension Data {
