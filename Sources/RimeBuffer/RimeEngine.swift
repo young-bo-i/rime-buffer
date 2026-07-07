@@ -96,6 +96,21 @@ final class RimeEngine {
         return ok ? value : nil
     }
 
+    /// Schemas Rime has actually deployed (id + display name). Empty if the
+    /// engine isn't up.
+    func schemaList() -> [(id: String, name: String)] {
+        var buf = [BBRimeSchema](repeating: BBRimeSchema(), count: 64)
+        let count = Int(BBRimeGetSchemaList(&buf, 64))
+        guard count > 0 else { return [] }
+        return (0..<count).compactMap { i in
+            guard let idPtr = buf[i].id else { return nil }
+            let id = String(cString: idPtr)
+            guard !id.isEmpty else { return nil }
+            let name = buf[i].name.map { String(cString: $0) } ?? id
+            return (id, name.isEmpty ? id : name)
+        }
+    }
+
     // MARK: Context / status
 
     func getContext(session: UInt64) -> RimeContextModel {

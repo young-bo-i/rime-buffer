@@ -80,6 +80,18 @@ bool BBRimeDeploy(void);
 // key="chord_duration"). Returns false when missing/engine down.
 bool BBRimeConfigGetDouble(const char* configId, const char* key, double* out);
 
+// A deployed schema. Pointers are bridge-owned, valid until the next
+// BBRimeGetSchemaList call; copy immediately.
+typedef struct {
+    const char* id;
+    const char* name;
+} BBRimeSchema;
+
+// Fill `out` (caller-provided, capacity maxCount) with the schemas Rime has
+// actually deployed, returning the count. Lets the UI offer real schemas
+// instead of hard-coded ones, and lets us reject a stale/unavailable preference.
+int BBRimeGetSchemaList(BBRimeSchema* out, int maxCount);
+
 // Fill caller-provided structs. Return false when unavailable (engine down /
 // no context). See ownership note on the struct typedefs.
 bool BBRimeGetContext(uint64_t session, BBRimeContext* out);

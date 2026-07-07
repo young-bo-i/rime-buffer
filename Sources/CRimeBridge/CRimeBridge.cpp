@@ -554,6 +554,31 @@ bool BBRimeConfigGetDouble(const char* configId, const char* key, double* out) {
     return ok != 0;
 }
 
+static std::vector<std::string> gSchemaIds(64);
+static std::vector<std::string> gSchemaNames(64);
+
+int BBRimeGetSchemaList(BBRimeSchema* out, int maxCount) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    if (!out || maxCount <= 0) return 0;
+    if (!gStarted || !gApi || !gApi->get_schema_list || !gApi->free_schema_list) return 0;
+
+    RimeSchemaList list;
+    memset(&list, 0, sizeof(list));
+    if (!gApi->get_schema_list(&list)) return 0;
+
+    int count = (int)list.size;
+    if (count > maxCount) count = maxCount;
+    if (count > 64) count = 64;
+    for (int i = 0; i < count; ++i) {
+        gSchemaIds[i] = list.list[i].schema_id ? list.list[i].schema_id : "";
+        gSchemaNames[i] = list.list[i].name ? list.list[i].name : "";
+        out[i].id = gSchemaIds[i].c_str();
+        out[i].name = gSchemaNames[i].c_str();
+    }
+    gApi->free_schema_list(&list);
+    return count;
+}
+
 char* BBRimeCopyLastError(void) {
     std::lock_guard<std::mutex> lock(gMutex);
     return copyString(gLastError);

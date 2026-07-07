@@ -52,7 +52,7 @@ fi
 # Without the .lproj the source shows its raw id; without the icon it renders as
 # a blank row and won't enable.
 cp -R Resources/*.lproj "$APP/Contents/Resources/" 2>/dev/null || true
-cp Resources/etinput.png "$APP/Contents/Resources/" 2>/dev/null || true
+cp Resources/etinput.pdf "$APP/Contents/Resources/" 2>/dev/null || true
 
 # Ad-hoc sign. --deep now that we have nested dylibs (librime + plugins).
 echo "==> ad-hoc signing (deep)"

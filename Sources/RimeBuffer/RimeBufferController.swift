@@ -1030,7 +1030,7 @@ final class RimeBufferController: IMKInputController {
 
     override func menu() -> NSMenu! {
         let m = NSMenu()
-        for schema in StatusMenu.schemas {
+        for schema in StatusMenu.availableSchemas() {
             let mi = NSMenuItem(title: schema.title, action: #selector(chooseSchema(_:)), keyEquivalent: "")
             mi.target = self
             mi.representedObject = schema.id
@@ -1077,6 +1077,14 @@ final class RimeBufferController: IMKInputController {
         guard session != 0,
               let pref = UserDefaults.standard.string(forKey: "preferredSchema"),
               !pref.isEmpty else { return }
+        // Only switch if the preferred schema is actually deployed. A stale or
+        // removed preference (e.g. a custom 并击 schema not bundled in this build)
+        // would otherwise put the session on an empty schema with no candidates.
+        let available = rimeEngine.schemaList().map(\.id)
+        guard available.isEmpty || available.contains(pref) else {
+            IMELog.write("preferredSchema '\(pref)' not deployed; keeping current schema")
+            return
+        }
         let current = rimeEngine.getStatus(session: session).schemaId
         if current != pref {
             _ = rimeEngine.selectSchema(pref, session: session)

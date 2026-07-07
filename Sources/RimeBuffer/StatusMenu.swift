@@ -12,10 +12,15 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     private(set) var schemaName = ""
     private(set) var healthy = true
 
-    static let schemas: [(id: String, title: String)] = [
-        ("my_combo", "并击 my_combo"),
-        ("my_serial", "串击 my_serial"),
-    ]
+    /// Schemas to offer — the ones Rime ACTUALLY deployed (not hard-coded), so
+    /// we never present a schema that isn't installed (which would switch the
+    /// session to an empty schema with no candidates). Falls back to a default
+    /// when the engine isn't up yet.
+    static func availableSchemas() -> [(id: String, title: String)] {
+        let list = rimeEngine.schemaList()
+        if list.isEmpty { return [("luna_pinyin", "朙月拼音")] }
+        return list.map { ($0.id, $0.name) }
+    }
 
     func install() {
         guard item == nil else { return }
@@ -70,7 +75,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             menu.addItem(.separator())
         }
 
-        for schema in Self.schemas {
+        for schema in Self.availableSchemas() {
             let mi = NSMenuItem(title: schema.title, action: #selector(chooseSchema(_:)), keyEquivalent: "")
             mi.target = self
             mi.representedObject = schema.id
