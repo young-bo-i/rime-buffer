@@ -1,0 +1,4 @@
+/* Input-source display name (unified to the Chinese brand name). Key = TISInputSourceID. */
+"CFBundleDisplayName" = "恩特输入法";
+"CFBundleName" = "恩特输入法";
+"com.isaac.inputmethod.ETInput" = "恩特输入法";

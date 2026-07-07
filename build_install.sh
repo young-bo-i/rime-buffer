@@ -48,6 +48,10 @@ if [ -f "Logo/AppIcon.icns" ]; then
     cp "Logo/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 fi
 
+# Localized input-source display name (恩特输入法) — without these .lproj files
+# the input source shows its raw id instead of the name.
+cp -R Resources/*.lproj "$APP/Contents/Resources/" 2>/dev/null || true
+
 # Ad-hoc sign. --deep now that we have nested dylibs (librime + plugins).
 echo "==> ad-hoc signing (deep)"
 codesign --force --deep --sign - "$APP"
