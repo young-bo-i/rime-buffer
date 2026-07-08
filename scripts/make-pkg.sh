@@ -22,7 +22,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 # 组件包：把 ETInput.app 装到 /Library/Input Methods，带 postinstall 注册脚本。
 mkdir -p "$TMP/root"
-cp -R "$APP" "$TMP/root/ETInput.app"
+cp -R "$APP" "$TMP/root/恩特输入法.app"
 chmod +x scripts/pkg/scripts/postinstall
 
 pkgbuild \

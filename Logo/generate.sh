@@ -1,161 +1,334 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MASTER="$DIR/et-logo.svg"
-MENU_MASTER="$DIR/menubar-template.svg"
-ICONSET="$DIR/AppIcon.iconset"
-ICNS="$DIR/AppIcon.icns"
-SWIFT_RENDERER="$DIR/render-svg.swift"
-SWIFT_CACHE="$DIR/.swift-module-cache"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
 
-fail() {
-  echo "generate.sh: $*" >&2
-  exit 1
-}
-
-need_file() {
-  [ -f "$1" ] || fail "missing $1"
-}
-
-render_with_swift() {
-  command -v swift >/dev/null 2>&1 || return 1
-  mkdir -p "$SWIFT_CACHE"
-  swift -module-cache-path "$SWIFT_CACHE" "$SWIFT_RENDERER" "$1" "$2" "$3" "$4" >/dev/null 2>&1
-}
-
-render_with_sips() {
-  command -v sips >/dev/null 2>&1 || return 1
-  sips -s format png -z "$4" "$3" "$1" --out "$2" >/dev/null 2>&1
-}
-
-render_with_qlmanage() {
-  command -v qlmanage >/dev/null 2>&1 || return 1
-  command -v sips >/dev/null 2>&1 || return 1
-
-  local input="$1"
-  local output="$2"
-  local width="$3"
-  local height="$4"
-  local tmp
-  tmp="$(mktemp -d "${TMPDIR:-/tmp}/et-logo-render.XXXXXX")"
-
-  qlmanage -t -s "$width" -o "$tmp" "$input" >/dev/null 2>&1 || {
-    rm -rf "$tmp"
-    return 1
+require() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "Missing required command: $1" >&2
+    exit 1
   }
-
-  local thumb
-  thumb="$(find "$tmp" -maxdepth 1 -type f -name '*.png' -print | head -n 1)"
-  if [ -z "$thumb" ]; then
-    rm -rf "$tmp"
-    return 1
-  fi
-
-  sips -s format png -z "$height" "$width" "$thumb" --out "$output" >/dev/null 2>&1
-  rm -rf "$tmp"
 }
 
-render_svg() {
-  local input="$1"
-  local output="$2"
-  local width="$3"
-  local height="$4"
+require sips
+require iconutil
+require swift
+require python3
 
-  rm -f "$output"
-  if render_with_swift "$input" "$output" "$width" "$height" && [ -s "$output" ]; then
-    return 0
-  fi
-  rm -f "$output"
-  if render_with_sips "$input" "$output" "$width" "$height" && [ -s "$output" ]; then
-    return 0
-  fi
-  rm -f "$output"
-  if render_with_qlmanage "$input" "$output" "$width" "$height" && [ -s "$output" ]; then
-    return 0
-  fi
+tmpdir="$(mktemp -d "$ROOT/.generate-tmp.XXXXXX")"
+trap 'rm -rf "$tmpdir"' EXIT
 
-  fail "could not render $input to $output"
+export SWIFT_MODULE_CACHE_PATH="$tmpdir/swift-module-cache"
+export CLANG_MODULE_CACHE_PATH="$tmpdir/clang-module-cache"
+mkdir -p "$SWIFT_MODULE_CACHE_PATH" "$CLANG_MODULE_CACHE_PATH"
+
+renderer="$tmpdir/render-svg.swift"
+cat > "$renderer" <<'SWIFT'
+import AppKit
+import CoreGraphics
+import Foundation
+
+func fail(_ message: String) -> Never {
+    FileHandle.standardError.write(Data((message + "\n").utf8))
+    exit(1)
 }
 
-build_icns_with_python() {
-  command -v python3 >/dev/null 2>&1 || fail "python3 is required for the ICNS fallback"
-  python3 - "$ICONSET" "$ICNS" <<'PY'
+func loadImage(_ path: String) -> NSImage {
+    let url = URL(fileURLWithPath: path)
+    guard let image = NSImage(contentsOf: url) else {
+        fail("Unable to load SVG: \(path)")
+    }
+    return image
+}
+
+func renderPNG(src: String, size: Int, out: String) {
+    let image = loadImage(src)
+    guard let rep = NSBitmapImageRep(
+        bitmapDataPlanes: nil,
+        pixelsWide: size,
+        pixelsHigh: size,
+        bitsPerSample: 8,
+        samplesPerPixel: 4,
+        hasAlpha: true,
+        isPlanar: false,
+        colorSpaceName: .deviceRGB,
+        bytesPerRow: 0,
+        bitsPerPixel: 0
+    ) else {
+        fail("Unable to allocate bitmap: \(out)")
+    }
+
+    rep.size = NSSize(width: size, height: size)
+    let rect = NSRect(x: 0, y: 0, width: size, height: size)
+
+    NSGraphicsContext.saveGraphicsState()
+    guard let context = NSGraphicsContext(bitmapImageRep: rep) else {
+        fail("Unable to create bitmap context: \(out)")
+    }
+    NSGraphicsContext.current = context
+    context.imageInterpolation = .high
+    NSColor.clear.setFill()
+    rect.fill()
+    image.draw(
+        in: rect,
+        from: NSRect(origin: .zero, size: image.size),
+        operation: .sourceOver,
+        fraction: 1.0,
+        respectFlipped: false,
+        hints: [.interpolation: NSImageInterpolation.high]
+    )
+    NSGraphicsContext.restoreGraphicsState()
+
+    guard let data = rep.representation(using: .png, properties: [:]) else {
+        fail("Unable to encode PNG: \(out)")
+    }
+
+    do {
+        try data.write(to: URL(fileURLWithPath: out), options: .atomic)
+    } catch {
+        fail("Unable to write PNG \(out): \(error)")
+    }
+}
+
+func renderPDF(src: String, out: String) {
+    let image = loadImage(src)
+    let data = NSMutableData()
+    guard let consumer = CGDataConsumer(data: data as CFMutableData) else {
+        fail("Unable to create PDF data consumer: \(out)")
+    }
+
+    var mediaBox = CGRect(x: 0, y: 0, width: image.size.width, height: image.size.height)
+    guard let pdf = CGContext(consumer: consumer, mediaBox: &mediaBox, nil) else {
+        fail("Unable to create PDF context: \(out)")
+    }
+
+    pdf.beginPDFPage(nil)
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(cgContext: pdf, flipped: false)
+    image.draw(
+        in: NSRect(x: 0, y: 0, width: image.size.width, height: image.size.height),
+        from: NSRect(origin: .zero, size: image.size),
+        operation: .sourceOver,
+        fraction: 1.0
+    )
+    NSGraphicsContext.restoreGraphicsState()
+    pdf.endPDFPage()
+    pdf.closePDF()
+
+    do {
+        try data.write(to: URL(fileURLWithPath: out), options: .atomic)
+    } catch {
+        fail("Unable to write PDF \(out): \(error)")
+    }
+}
+
+let args = CommandLine.arguments
+if args.count == 5 && args[1] == "png" {
+    guard let size = Int(args[3]) else {
+        fail("Invalid PNG size: \(args[3])")
+    }
+    renderPNG(src: args[2], size: size, out: args[4])
+} else if args.count == 4 && args[1] == "pdf" {
+    renderPDF(src: args[2], out: args[3])
+} else {
+    fail("Usage: render-svg.swift png input.svg size output.png | pdf input.svg output.pdf")
+}
+SWIFT
+
+render_png() {
+  local src="$1"
+  local size="$2"
+  local out="$3"
+
+  swift "$renderer" png "$src" "$size" "$out"
+}
+
+render_pdf() {
+  local src="$1"
+  local out="$2"
+
+  swift "$renderer" pdf "$src" "$out"
+}
+
+assert_nonempty() {
+  local file="$1"
+  if [[ ! -s "$file" ]]; then
+    echo "Generated file is missing or empty: $file" >&2
+    exit 1
+  fi
+}
+
+assert_png_size() {
+  local file="$1"
+  local expected="$2"
+  local width height
+  width="$(sips -g pixelWidth "$file" 2>/dev/null | awk '/pixelWidth:/ {print $2}')"
+  height="$(sips -g pixelHeight "$file" 2>/dev/null | awk '/pixelHeight:/ {print $2}')"
+  if [[ "$width" != "$expected" || "$height" != "$expected" ]]; then
+    echo "Unexpected PNG size for $file: ${width}x${height}, expected ${expected}x${expected}" >&2
+    exit 1
+  fi
+}
+
+rm -rf AppIcon.iconset AppIcon.icns menubar-template.png inputsource.pdf
+mkdir -p AppIcon.iconset
+
+render_png app-icon.svg 16 AppIcon.iconset/icon_16x16.png
+render_png app-icon.svg 32 AppIcon.iconset/icon_16x16@2x.png
+render_png app-icon.svg 32 AppIcon.iconset/icon_32x32.png
+render_png app-icon.svg 64 AppIcon.iconset/icon_32x32@2x.png
+render_png app-icon.svg 128 AppIcon.iconset/icon_128x128.png
+render_png app-icon.svg 256 AppIcon.iconset/icon_128x128@2x.png
+render_png app-icon.svg 256 AppIcon.iconset/icon_256x256.png
+render_png app-icon.svg 512 AppIcon.iconset/icon_256x256@2x.png
+render_png app-icon.svg 512 AppIcon.iconset/icon_512x512.png
+render_png app-icon.svg 1024 AppIcon.iconset/icon_512x512@2x.png
+
+iconutil_log="$tmpdir/iconutil.log"
+if ! iconutil -c icns AppIcon.iconset -o AppIcon.icns 2>"$iconutil_log"; then
+  echo "iconutil rejected the iconset; writing a PNG-backed ICNS fallback." >&2
+  sed 's/^/  /' "$iconutil_log" >&2
+  python3 - <<'PY'
 from pathlib import Path
 import struct
-import sys
 
-iconset = Path(sys.argv[1])
-output = Path(sys.argv[2])
-
-members = [
-    ("icp4", "icon_16x16.png"),
-    ("ic11", "icon_16x16@2x.png"),
-    ("icp5", "icon_32x32.png"),
-    ("ic12", "icon_32x32@2x.png"),
-    ("ic07", "icon_128x128.png"),
-    ("ic13", "icon_128x128@2x.png"),
-    ("ic08", "icon_256x256.png"),
-    ("ic14", "icon_256x256@2x.png"),
-    ("ic09", "icon_512x512.png"),
-    ("ic10", "icon_512x512@2x.png"),
+root = Path(".")
+entries = [
+    ("icp4", root / "AppIcon.iconset/icon_16x16.png"),
+    ("ic11", root / "AppIcon.iconset/icon_16x16@2x.png"),
+    ("icp5", root / "AppIcon.iconset/icon_32x32.png"),
+    ("icp6", root / "AppIcon.iconset/icon_32x32@2x.png"),
+    ("ic12", root / "AppIcon.iconset/icon_32x32@2x.png"),
+    ("ic07", root / "AppIcon.iconset/icon_128x128.png"),
+    ("ic13", root / "AppIcon.iconset/icon_128x128@2x.png"),
+    ("ic08", root / "AppIcon.iconset/icon_256x256.png"),
+    ("ic14", root / "AppIcon.iconset/icon_256x256@2x.png"),
+    ("ic09", root / "AppIcon.iconset/icon_512x512.png"),
+    ("ic10", root / "AppIcon.iconset/icon_512x512@2x.png"),
 ]
-
 chunks = []
-for code, filename in members:
-    data = (iconset / filename).read_bytes()
+for code, path in entries:
+    data = path.read_bytes()
     chunks.append(code.encode("ascii") + struct.pack(">I", len(data) + 8) + data)
-
-payload = b"".join(chunks)
-output.write_bytes(b"icns" + struct.pack(">I", len(payload) + 8) + payload)
+body = b"".join(chunks)
+(root / "AppIcon.icns").write_bytes(b"icns" + struct.pack(">I", len(body) + 8) + body)
 PY
-}
-
-need_file "$MASTER"
-need_file "$MENU_MASTER"
-need_file "$SWIFT_RENDERER"
-command -v iconutil >/dev/null 2>&1 || fail "iconutil is required"
-trap 'rm -rf "$SWIFT_CACHE"' EXIT
-
-rm -rf "$ICONSET"
-mkdir -p "$ICONSET"
-
-render_svg "$MASTER" "$ICONSET/icon_16x16.png" 16 16
-render_svg "$MASTER" "$ICONSET/icon_16x16@2x.png" 32 32
-render_svg "$MASTER" "$ICONSET/icon_32x32.png" 32 32
-render_svg "$MASTER" "$ICONSET/icon_32x32@2x.png" 64 64
-render_svg "$MASTER" "$ICONSET/icon_128x128.png" 128 128
-render_svg "$MASTER" "$ICONSET/icon_128x128@2x.png" 256 256
-render_svg "$MASTER" "$ICONSET/icon_256x256.png" 256 256
-render_svg "$MASTER" "$ICONSET/icon_256x256@2x.png" 512 512
-render_svg "$MASTER" "$ICONSET/icon_512x512.png" 512 512
-render_svg "$MASTER" "$ICONSET/icon_512x512@2x.png" 1024 1024
-
-rm -f "$ICNS"
-if ! iconutil -c icns -o "$ICNS" "$ICONSET" >/dev/null 2>&1 || [ ! -s "$ICNS" ]; then
-  rm -f "$ICNS"
-  echo "generate.sh: iconutil could not build this iconset here; using ICNS container fallback" >&2
-  build_icns_with_python
 fi
-[ -s "$ICNS" ] || fail "failed to create $ICNS"
 
-render_svg "$MENU_MASTER" "$DIR/menubar-template.png" 36 36
-[ -s "$DIR/menubar-template.png" ] || fail "failed to create menu bar PNG"
+render_png menubar.svg 36 menubar-template.png
+render_pdf inputsource.svg inputsource.pdf
 
-for path in \
-  "$ICONSET/icon_16x16.png" \
-  "$ICONSET/icon_16x16@2x.png" \
-  "$ICONSET/icon_32x32.png" \
-  "$ICONSET/icon_32x32@2x.png" \
-  "$ICONSET/icon_128x128.png" \
-  "$ICONSET/icon_128x128@2x.png" \
-  "$ICONSET/icon_256x256.png" \
-  "$ICONSET/icon_256x256@2x.png" \
-  "$ICONSET/icon_512x512.png" \
-  "$ICONSET/icon_512x512@2x.png" \
-  "$DIR/menubar-template.png" \
-  "$ICNS"; do
-  [ -s "$path" ] || fail "expected non-empty output missing: $path"
+for spec in \
+  "AppIcon.iconset/icon_16x16.png:16" \
+  "AppIcon.iconset/icon_16x16@2x.png:32" \
+  "AppIcon.iconset/icon_32x32.png:32" \
+  "AppIcon.iconset/icon_32x32@2x.png:64" \
+  "AppIcon.iconset/icon_128x128.png:128" \
+  "AppIcon.iconset/icon_128x128@2x.png:256" \
+  "AppIcon.iconset/icon_256x256.png:256" \
+  "AppIcon.iconset/icon_256x256@2x.png:512" \
+  "AppIcon.iconset/icon_512x512.png:512" \
+  "AppIcon.iconset/icon_512x512@2x.png:1024" \
+  "menubar-template.png:36"; do
+  file="${spec%%:*}"
+  size="${spec##*:}"
+  assert_nonempty "$file"
+  assert_png_size "$file" "$size"
 done
 
-echo "Generated AppIcon.iconset, AppIcon.icns, and menubar-template.png"
+assert_nonempty AppIcon.icns
+assert_nonempty inputsource.pdf
+
+python3 - menubar-template.png <<'PY'
+import struct
+import sys
+import zlib
+
+path = sys.argv[1]
+data = open(path, "rb").read()
+if data[:8] != b"\x89PNG\r\n\x1a\n":
+    raise SystemExit(f"{path} is not a PNG")
+
+pos = 8
+width = height = bit_depth = color_type = None
+idat = []
+while pos < len(data):
+    length = struct.unpack(">I", data[pos:pos + 4])[0]
+    ctype = data[pos + 4:pos + 8]
+    payload = data[pos + 8:pos + 8 + length]
+    pos += 12 + length
+    if ctype == b"IHDR":
+      width, height, bit_depth, color_type = struct.unpack(">IIBB", payload[:10])
+    elif ctype == b"IDAT":
+      idat.append(payload)
+    elif ctype == b"IEND":
+      break
+
+if bit_depth != 8 or color_type not in (4, 6):
+    raise SystemExit(f"{path} must be 8-bit grayscale+alpha or RGBA, got bit_depth={bit_depth}, color_type={color_type}")
+
+channels = 2 if color_type == 4 else 4
+bpp = channels
+raw = zlib.decompress(b"".join(idat))
+stride = width * channels
+
+def paeth(a, b, c):
+    p = a + b - c
+    pa = abs(p - a)
+    pb = abs(p - b)
+    pc = abs(p - c)
+    if pa <= pb and pa <= pc:
+        return a
+    if pb <= pc:
+        return b
+    return c
+
+rows = []
+offset = 0
+prev = bytearray(stride)
+for _ in range(height):
+    filter_type = raw[offset]
+    offset += 1
+    row = bytearray(raw[offset:offset + stride])
+    offset += stride
+    for i in range(stride):
+        left = row[i - bpp] if i >= bpp else 0
+        up = prev[i]
+        up_left = prev[i - bpp] if i >= bpp else 0
+        if filter_type == 1:
+            row[i] = (row[i] + left) & 0xff
+        elif filter_type == 2:
+            row[i] = (row[i] + up) & 0xff
+        elif filter_type == 3:
+            row[i] = (row[i] + ((left + up) // 2)) & 0xff
+        elif filter_type == 4:
+            row[i] = (row[i] + paeth(left, up, up_left)) & 0xff
+        elif filter_type != 0:
+            raise SystemExit(f"Unsupported PNG filter {filter_type}")
+    rows.append(row)
+    prev = row
+
+opaque_pixels = 0
+transparent_pixels = 0
+for row in rows:
+    for i in range(0, stride, channels):
+        if color_type == 4:
+            gray, alpha = row[i], row[i + 1]
+            rgb = (gray, gray, gray)
+        else:
+            rgb = (row[i], row[i + 1], row[i + 2])
+            alpha = row[i + 3]
+        if alpha:
+            opaque_pixels += 1
+            if rgb != (0, 0, 0):
+                raise SystemExit(f"{path} contains non-black visible pixels: {rgb}")
+        else:
+            transparent_pixels += 1
+
+if opaque_pixels == 0 or transparent_pixels == 0:
+    raise SystemExit(f"{path} must contain both visible black pixels and transparency")
+PY
+
+echo "Generated Logo2 assets:"
+find . -maxdepth 2 -path './.generate-tmp.*' -prune -o -type f -print | sort | sed 's#^\./##'

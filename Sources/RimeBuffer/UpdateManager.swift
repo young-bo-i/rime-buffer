@@ -285,7 +285,7 @@ final class UpdateManager {
 
             let contents = try fm.contentsOfDirectory(at: extractDir, includingPropertiesForKeys: nil)
             guard let newApp = contents.first(where: { $0.pathExtension == "app" }) else {
-                setStatus(.error("解压后未找到 ETInput.app")); return
+                setStatus(.error("解压后未找到恩特输入法.app")); return
             }
             runTool("/usr/bin/xattr", ["-cr", newApp.path])
 
@@ -295,7 +295,7 @@ final class UpdateManager {
             let target = current.pathExtension == "app"
                 ? current
                 : URL(fileURLWithPath: NSHomeDirectory())
-                    .appendingPathComponent("Library/Input Methods/ETInput.app")
+                    .appendingPathComponent("Library/Input Methods/恩特输入法.app")
 
             let pid = ProcessInfo.processInfo.processIdentifier
             let lsregister = "/System/Library/Frameworks/CoreServices.framework"

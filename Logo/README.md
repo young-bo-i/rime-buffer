@@ -1,3 +1,3 @@
-# ET Input Method Logo
+# 恩特输入法 Logo2
 
-The mark uses a sturdy geometric `ET` monogram, echoing 恩特 as the phonetic rendering of ET, inside a deep-teal macOS-style rounded-square badge so it remains clear from 16px menu-bar scale through 1024px app-icon scale. Regenerate all raster assets with `bash Logo/generate.sh`; the script renders the SVG masters, asks `iconutil` to build `AppIcon.icns` with a local ICNS fallback if needed, and writes the monochrome menu-bar template PNG.
+The new icon set uses a rounded ET monogram as a phonetic cue for 恩特, with a small candidate-bar underline to connect the mark to Chinese input and IME composition. The primary color is a deep teal chosen for macOS light/dark contrast, with white and a mint accent kept bold enough to survive 16px rendering. Regenerate all derived assets with `bash Logo2/generate.sh`.

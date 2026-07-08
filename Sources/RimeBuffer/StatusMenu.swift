@@ -45,11 +45,25 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         refreshButton()
     }
 
+    /// The custom monochrome menu-bar glyph (bundled), rendered as a template so
+    /// macOS tints it for light/dark menu bars.
+    private static let menubarImage: NSImage? = {
+        guard let url = Bundle.main.url(forResource: "menubar-template", withExtension: "png"),
+              let img = NSImage(contentsOf: url) else { return nil }
+        img.isTemplate = true
+        img.size = NSSize(width: 18, height: 18)
+        return img
+    }()
+
     private func refreshButton() {
         guard let button = item?.button else { return }
-        button.image = NSImage(
-            systemSymbolName: healthy ? "keyboard.badge.ellipsis" : "keyboard.badge.exclamationmark",
-            accessibilityDescription: "恩特输入法")
+        if healthy, let img = Self.menubarImage {
+            button.image = img
+        } else {
+            button.image = NSImage(
+                systemSymbolName: healthy ? "keyboard.badge.ellipsis" : "keyboard.badge.exclamationmark",
+                accessibilityDescription: "恩特输入法")
+        }
         button.contentTintColor = UpdateManager.shared.pendingVersion != nil ? .controlAccentColor : nil
     }
 

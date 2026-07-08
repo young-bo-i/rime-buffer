@@ -2,7 +2,7 @@
 # Runs as root after the payload lands in /Library/Input Methods. Clears any
 # quarantine and (re)registers the input source with Launch Services so it shows
 # up in System Settings → Keyboard → Input Sources.
-APP="/Library/Input Methods/ETInput.app"
+APP="/Library/Input Methods/恩特输入法.app"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
 /usr/bin/xattr -cr "$APP" 2>/dev/null || true

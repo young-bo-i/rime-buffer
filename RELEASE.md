@@ -1,7 +1,7 @@
 # 发布与自动更新
 
 恩特输入法 (ETInput) 通过 **GitHub Actions + GitHub Releases + 应用内自动更新** 分发。
-产物是**自包含** app：librime 引擎与 Rime 词库都打包在 `ETInput.app` 内，终端用户无需
+产物是**自包含** app：librime 引擎与 Rime 词库都打包在 `恩特输入法.app` 内，终端用户无需
 单独安装 Squirrel。
 
 > 仓库/内部代号是 RimeBuffer（SPM target、源码目录、控制器类）；对外产品名是 ETInput /
@@ -19,7 +19,7 @@
 
 1. `swift build -c release --arch arm64 --arch x86_64`（**通用二进制**，Intel/Apple Silicon 通用）
 2. `scripts/fetch-rime.sh` 下载 librime 运行时（从 Squirrel 官方 pkg 提取，见下）
-3. 组装 `ETInput.app`：二进制 → `MacOS/ETInput`，`Info.plist`，并把 librime + 插件 + Rime
+3. 组装 `恩特输入法.app`：二进制 → `MacOS/ETInput`，`Info.plist`，并把 librime + 插件 + Rime
    词库拷进 `Contents/Frameworks` 与 `Contents/SharedSupport`；`--deep` ad-hoc 签名
 4. `ditto` 打包为 `ETInput-X.Y.Z.zip`，创建 GitHub Release，附带 SHA256
 
@@ -47,7 +47,7 @@ librime 是**静态链接**的（依赖只有系统 libSystem/libc++），所以
 - 版本更新（按 semver 逐段比较 `CFBundleShortVersionString`）时**后台静默下载** zip；
 - 下载完成后，状态栏图标变色，菜单顶部出现「🎉 有新版本 vX — 立即更新」；
 - 用户确认后：等待旧进程退出 → `pkill -x ETInput` 兜底 → 暂存新 bundle → 原子交换
-  `~/Library/Input Methods/ETInput.app`（失败回滚）→ `xattr` 清除隔离 →
+  `~/Library/Input Methods/恩特输入法.app`（失败回滚）→ `xattr` 清除隔离 →
   **`lsregister -f` 重新注册** → `open` 重启。
 - 也可从菜单「检查更新…」手动触发。
 

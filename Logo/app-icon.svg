@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">恩特输入法 app icon</title>
+  <desc id="desc">A teal macOS squircle containing a rounded ET monogram and a small input candidate bar.</desc>
+  <defs>
+    <linearGradient id="badge" x1="512" y1="64" x2="512" y2="960" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0A8D84"/>
+      <stop offset="1" stop-color="#046D76"/>
+    </linearGradient>
+    <clipPath id="squircle">
+      <rect x="64" y="64" width="896" height="896" rx="220"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#squircle)">
+    <rect x="64" y="64" width="896" height="896" fill="url(#badge)"/>
+    <path d="M64 64h896v332c-112 48-239 72-381 72-216 0-389-54-515-162V64Z" fill="#FFFFFF" opacity=".12"/>
+    <path d="M64 720c154 88 328 132 522 132 138 0 262-21 374-64v172H64V720Z" fill="#002F35" opacity=".14"/>
+  </g>
+
+  <rect x="70" y="70" width="884" height="884" rx="214" fill="none" stroke="#FFFFFF" stroke-width="10" opacity=".18"/>
+
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M318 296H560M318 512H504M318 728H560M318 296V728" stroke="#F8FFFC" stroke-width="86"/>
+    <path d="M574 296H738M656 296V728" stroke="#F8FFFC" stroke-width="86"/>
+    <path d="M308 822H716" stroke="#B9FFF2" stroke-width="58"/>
+  </g>
+</svg>
