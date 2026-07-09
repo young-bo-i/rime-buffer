@@ -30,3 +30,11 @@ tail -f ~/rimebuffer.log          # 行为日志
 配对是「请求 → 同意」，**没有配对码**：A 菜单点「配对新设备 → B」→ 两台各显示同一个 4 位验证码
 → A 核对后点「配对」、B 点「同意」→ 之后自动静默连接。基于 X25519 身份 + TOFU 信任，只有已
 互相同意的设备能传字/收字（`RemoteTypingService`）。首次两台各弹一次「本地网络」授权。
+
+## 已知问题
+
+- **macOS 26 上，在微信窗口聚焦时切换输入法可能让微信崩溃**（崩在 Apple 的
+  `TextInputUIMacHelper`／输入法切换 HUD，`*** CFRelease() called with NULL ***`）。
+  这是 macOS／微信侧的上游问题，同样影响原生 Rime/Squirrel
+  （[rime/squirrel#951](https://github.com/rime/squirrel/issues/951)）；恩特在其他 App 均正常。
+  **规避**：不要在微信窗口聚焦时切换输入法——先在别处切好输入法，再点进微信打字。
