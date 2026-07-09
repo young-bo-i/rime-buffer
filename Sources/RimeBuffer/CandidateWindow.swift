@@ -33,19 +33,19 @@ enum CandidateWindowMetric: String, CaseIterable {
     var defaultValue: Double {
         switch self {
         case .baseWidth: return 460
-        case .compactStripHeight: return 40
-        case .compactCandidateHeight: return 30
-        case .preeditHeight: return 22
+        case .compactStripHeight: return 34
+        case .compactCandidateHeight: return 24
+        case .preeditHeight: return 20
         case .candidateFontSize: return 16
-        case .labelFontSize: return 11
+        case .labelFontSize: return 10
         }
     }
 
     var range: ClosedRange<Double> {
         switch self {
         case .baseWidth: return 360...900
-        case .compactStripHeight: return 40...64
-        case .compactCandidateHeight: return 26...44
+        case .compactStripHeight: return 32...64
+        case .compactCandidateHeight: return 22...44
         case .preeditHeight: return 18...36
         case .candidateFontSize: return 12...24
         case .labelFontSize: return 9...18
@@ -65,6 +65,8 @@ enum CandidateWindowMetric: String, CaseIterable {
 }
 
 struct CandidateWindowMetrics {
+    private static let compactDefaultsMigrationKey = "candidateWindow.compactDefaultsMigrated.v1"
+
     let baseWidth: CGFloat
     let compactStripHeight: CGFloat
     let compactCandidateHeight: CGFloat
@@ -84,6 +86,7 @@ struct CandidateWindowMetrics {
     }
 
     static func value(for metric: CandidateWindowMetric) -> CGFloat {
+        migrateCompactDefaultsIfNeeded()
         let defaults = UserDefaults.standard
         guard defaults.object(forKey: metric.userDefaultsKey) != nil else {
             return CGFloat(metric.defaultValue)
@@ -119,18 +122,42 @@ struct CandidateWindowMetrics {
     private static func clamp(_ value: Double, to range: ClosedRange<Double>) -> Double {
         min(max(value, range.lowerBound), range.upperBound)
     }
+
+    private static func migrateCompactDefaultsIfNeeded() {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: compactDefaultsMigrationKey) else { return }
+        let oldDefaults: [CandidateWindowMetric: Double] = [
+            .compactStripHeight: 40,
+            .compactCandidateHeight: 30,
+            .preeditHeight: 22,
+            .labelFontSize: 11,
+        ]
+        for (metric, oldValue) in oldDefaults {
+            guard defaults.object(forKey: metric.userDefaultsKey) != nil else { continue }
+            if abs(defaults.double(forKey: metric.userDefaultsKey) - oldValue) < 0.001 {
+                defaults.set(metric.defaultValue, forKey: metric.userDefaultsKey)
+            }
+        }
+        defaults.set(true, forKey: compactDefaultsMigrationKey)
+    }
 }
 
 /// In-process candidate window. Candidates are shown as width-bounded pages in
 /// a compact strip; the first item is always the local "0 Buffer" action.
 final class CandidateWindow {
+    private static let candidateSpacing: CGFloat = 3
+    private static let candidateSeparatorWidth: CGFloat = 8
+    private static let barSpacing: CGFloat = 4
+    private static let barHorizontalPadding: CGFloat = 5
+    private static let actionButtonSize: CGFloat = 28
+    private static let compactCandidateHorizontalPadding: CGFloat = 6
+
     private let panel: NSPanel
     private let root = NSStackView()
     private let preeditLabel = NSTextField(labelWithString: "")
     private let strip = NSView()
     private let candidateScroll = NSScrollView()
     private let candidateStack = NSStackView()
-    private let pageButton = CandidateActionButton(symbolName: "chevron.down", title: "")
     private let settingsButton = CandidateActionButton(symbolName: "gearshape", title: "")
     private let inlineBuffer = BufferInlineView()
     private var stripHeightConstraint: NSLayoutConstraint!
@@ -152,7 +179,6 @@ final class CandidateWindow {
     private var bufferFlushProgress: Double?
 
     var onSelect: ((Int) -> Void)?
-    var onPage: ((Int) -> Void)?
     var onSettings: (() -> Void)?
 
     var hasCandidates: Bool { panel.isVisible && !currentContext.candidates.isEmpty }
@@ -196,7 +222,7 @@ final class CandidateWindow {
 
         candidateStack.orientation = .horizontal
         candidateStack.alignment = .centerY
-        candidateStack.spacing = 6
+        candidateStack.spacing = Self.candidateSpacing
         candidateStack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
 
         candidateScroll.drawsBackground = false
@@ -218,30 +244,24 @@ final class CandidateWindow {
         dividerHeightConstraint = divider.heightAnchor.constraint(equalToConstant: dividerHeight(for: metrics))
         dividerHeightConstraint.isActive = true
 
-        pageButton.target = self
-        pageButton.action = #selector(pageDownTapped)
-        pageButton.toolTip = "下一页"
-        pageButton.widthAnchor.constraint(equalToConstant: 32).isActive = true
-        pageButton.heightAnchor.constraint(equalToConstant: 32).isActive = true
-
         settingsButton.target = self
         settingsButton.action = #selector(settingsTapped)
         settingsButton.toolTip = "打开设置"
-        settingsButton.widthAnchor.constraint(equalToConstant: 32).isActive = true
-        settingsButton.heightAnchor.constraint(equalToConstant: 32).isActive = true
+        settingsButton.widthAnchor.constraint(equalToConstant: Self.actionButtonSize).isActive = true
+        settingsButton.heightAnchor.constraint(equalToConstant: Self.actionButtonSize).isActive = true
 
-        let barRow = NSStackView(views: [candidateScroll, divider, pageButton, settingsButton])
+        let barRow = NSStackView(views: [candidateScroll, divider, settingsButton])
         barRow.orientation = .horizontal
         barRow.alignment = .centerY
-        barRow.spacing = 7
+        barRow.spacing = Self.barSpacing
         barRow.translatesAutoresizingMaskIntoConstraints = false
         strip.addSubview(barRow)
         let padding = barVerticalPadding(for: metrics)
         barTopConstraint = barRow.topAnchor.constraint(equalTo: strip.topAnchor, constant: padding)
         barBottomConstraint = barRow.bottomAnchor.constraint(equalTo: strip.bottomAnchor, constant: -padding)
         NSLayoutConstraint.activate([
-            barRow.leadingAnchor.constraint(equalTo: strip.leadingAnchor, constant: 7),
-            barRow.trailingAnchor.constraint(equalTo: strip.trailingAnchor, constant: -7),
+            barRow.leadingAnchor.constraint(equalTo: strip.leadingAnchor, constant: Self.barHorizontalPadding),
+            barRow.trailingAnchor.constraint(equalTo: strip.trailingAnchor, constant: -Self.barHorizontalPadding),
             barTopConstraint,
             barBottomConstraint,
         ])
@@ -490,12 +510,7 @@ final class CandidateWindow {
 
         applyMetrics()
         visualPageIndex = clampVisualPage(visualPageIndex, panelWidth: activePanelWidth())
-        pageButton.isEnabled = !currentContext.candidates.isEmpty
         candidateScroll.isHidden = false
-        pageButton.image = RimeUI.symbol("chevron.down",
-                                         pointSize: 17,
-                                         weight: .semibold)
-        pageButton.toolTip = "下一页"
 
         renderCompactRow()
         applyAppearance()
@@ -514,11 +529,15 @@ final class CandidateWindow {
     private func renderCompactRow() {
         candidateStack.orientation = .horizontal
         candidateStack.alignment = .centerY
-        candidateStack.spacing = 6
+        candidateStack.spacing = Self.candidateSpacing
 
         let panelWidth = activePanelWidth()
         let available = candidateAvailableWidth(panelWidth: panelWidth)
-        for i in currentVisualCandidateIndices(panelWidth: panelWidth) {
+        let indices = currentVisualCandidateIndices(panelWidth: panelWidth)
+        for (offset, i) in indices.enumerated() {
+            if offset > 0 {
+                candidateStack.addArrangedSubview(candidateSeparatorView())
+            }
             let c = currentContext.candidates[i]
             candidateStack.addArrangedSubview(candidateButton(
                 index: i,
@@ -531,6 +550,9 @@ final class CandidateWindow {
         }
 
         if !BufferModel.shared.active {
+            if !indices.isEmpty {
+                candidateStack.addArrangedSubview(candidateSeparatorView())
+            }
             candidateStack.addArrangedSubview(bufferActionButton(width: min(bufferActionWidth(), available)))
         }
     }
@@ -548,13 +570,8 @@ final class CandidateWindow {
         button.target = self
         button.action = #selector(candidateTapped(_:))
         button.attributedTitle = candidateTitle(candidate, highlighted: highlighted)
-        button.layer?.backgroundColor = highlighted
-            ? RimeUI.selectedCandidateColor.cgColor
-            : NSColor.clear.cgColor
-        button.layer?.borderColor = highlighted
-            ? NSColor.clear.cgColor
-            : RimeUI.border.withAlphaComponent(0.35).cgColor
-        button.layer?.borderWidth = highlighted ? 0 : 1
+        button.layer?.backgroundColor = NSColor.clear.cgColor
+        button.layer?.borderWidth = 0
         button.toolTip = candidate.comment.isEmpty
             ? candidate.text
             : "\(candidate.text)  \(candidate.comment)"
@@ -573,8 +590,8 @@ final class CandidateWindow {
     private func candidateTitle(_ c: RimeCandidateModel, highlighted: Bool) -> NSAttributedString {
         let metrics = CandidateWindowMetrics.current
         let line = NSMutableAttributedString()
-        let labelColor = highlighted ? NSColor.white.withAlphaComponent(0.86) : RimeUI.textMuted
-        let textColor = highlighted ? NSColor.white : RimeUI.textSecondary
+        let labelColor = highlighted ? RimeUI.selectedCandidateColor.withAlphaComponent(0.85) : RimeUI.textMuted
+        let textColor = highlighted ? RimeUI.selectedCandidateColor : RimeUI.textPrimary
         let baseline = (metrics.candidateFontSize - metrics.labelFontSize) / 2
 
         line.append(NSAttributedString(
@@ -597,6 +614,7 @@ final class CandidateWindow {
         button.action = #selector(candidateTapped(_:))
         button.attributedTitle = candidateTitle(bufferActionCandidate(), highlighted: false)
         button.layer?.backgroundColor = NSColor.clear.cgColor
+        button.layer?.borderWidth = 0
         button.toolTip = "开启缓冲区"
         NSLayoutConstraint.activate([
             button.widthAnchor.constraint(equalToConstant: width),
@@ -607,8 +625,20 @@ final class CandidateWindow {
         return button
     }
 
+    private func candidateSeparatorView() -> NSView {
+        let label = NSTextField(labelWithString: "|")
+        label.font = .systemFont(ofSize: max(12, CandidateWindowMetrics.current.candidateFontSize - 1),
+                                 weight: .regular)
+        label.textColor = RimeUI.borderStrong
+        label.alignment = .center
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.widthAnchor.constraint(equalToConstant: Self.candidateSeparatorWidth).isActive = true
+        return label
+    }
+
     private func measuredCandidateWidth(_ c: RimeCandidateModel, highlighted: Bool, compact: Bool) -> CGFloat {
-        candidateTitle(c, highlighted: highlighted).size().width + (compact ? 20 : 14)
+        candidateTitle(c, highlighted: highlighted).size().width
+            + (compact ? Self.compactCandidateHorizontalPadding : 14)
     }
 
     private func activePanelWidth() -> CGFloat {
@@ -616,8 +646,8 @@ final class CandidateWindow {
     }
 
     private func candidateAvailableWidth(panelWidth: CGFloat) -> CGFloat {
-        let sideControlsWidth: CGFloat = 1 + 32 + 32 + 7 * 3
-        return max(80, panelWidth - 14 - sideControlsWidth)
+        let sideControlsWidth: CGFloat = 1 + Self.actionButtonSize + Self.barSpacing * 2
+        return max(80, panelWidth - Self.barHorizontalPadding * 2 - sideControlsWidth)
     }
 
     private func bufferActionCandidate() -> RimeCandidateModel {
@@ -625,14 +655,14 @@ final class CandidateWindow {
     }
 
     private func bufferActionWidth() -> CGFloat {
-        max(44, ceil(measuredCandidateWidth(bufferActionCandidate(), highlighted: false, compact: true)))
+        max(38, ceil(measuredCandidateWidth(bufferActionCandidate(), highlighted: false, compact: true)))
     }
 
     private func candidateMaxWidth(panelWidth: CGFloat) -> CGFloat {
         let available = candidateAvailableWidth(panelWidth: panelWidth)
         let bufferSpace = BufferModel.shared.active
             ? 0
-            : min(bufferActionWidth(), available) + candidateStack.spacing
+            : min(bufferActionWidth(), available) + separatorRunWidth()
         let remaining = available - bufferSpace
         return max(64, remaining)
     }
@@ -643,7 +673,7 @@ final class CandidateWindow {
         let available = candidateAvailableWidth(panelWidth: panelWidth)
         let bufferSpace = BufferModel.shared.active
             ? 0
-            : min(bufferActionWidth(), available) + candidateStack.spacing
+            : min(bufferActionWidth(), available) + separatorRunWidth()
         let remaining = available - bufferSpace
         let pageWidth = max(64, remaining)
         let maxItemWidth = max(64, pageWidth)
@@ -657,7 +687,7 @@ final class CandidateWindow {
                                                       highlighted: false,
                                                       compact: true))
             let width = min(natural, maxItemWidth)
-            let nextWidth = page.isEmpty ? width : usedWidth + candidateStack.spacing + width
+            let nextWidth = page.isEmpty ? width : usedWidth + separatorRunWidth() + width
             if !page.isEmpty, nextWidth > pageWidth {
                 pages.append(page)
                 page = [i]
@@ -670,6 +700,10 @@ final class CandidateWindow {
 
         if !page.isEmpty { pages.append(page) }
         return pages
+    }
+
+    private func separatorRunWidth() -> CGFloat {
+        Self.candidateSeparatorWidth + Self.candidateSpacing * 2
     }
 
     private func currentVisualCandidateIndices(panelWidth: CGFloat) -> [Int] {
@@ -712,7 +746,6 @@ final class CandidateWindow {
         preeditLabel.textColor = RimeUI.textPrimary
         strip.layer?.backgroundColor = RimeUI.candidateBackgroundColor.cgColor
         strip.layer?.borderColor = RimeUI.borderStrong.cgColor
-        pageButton.contentTintColor = RimeUI.textSecondary
         settingsButton.contentTintColor = RimeUI.textSecondary
     }
 
@@ -730,17 +763,17 @@ final class CandidateWindow {
     }
 
     private func dividerHeight(for metrics: CandidateWindowMetrics) -> CGFloat {
-        min(30, max(24, metrics.compactStripHeight - 12))
+        min(26, max(20, metrics.compactStripHeight - 10))
     }
 
     private func barVerticalPadding(for metrics: CandidateWindowMetrics) -> CGFloat {
-        let tallestChild = max(32, min(metrics.compactCandidateHeight, metrics.compactStripHeight - 2))
+        let tallestChild = max(Self.actionButtonSize, min(metrics.compactCandidateHeight, metrics.compactStripHeight - 2))
         return max(1, floor((metrics.compactStripHeight - tallestChild) / 2))
     }
 
     private func compactCandidateButtonHeight(for metrics: CandidateWindowMetrics) -> CGFloat {
         let available = metrics.compactStripHeight - 2 * barVerticalPadding(for: metrics)
-        return min(metrics.compactCandidateHeight, max(24, available))
+        return min(metrics.compactCandidateHeight, max(22, available))
     }
 
     private func contextSignature(_ ctx: RimeContextModel) -> String {
@@ -763,12 +796,6 @@ final class CandidateWindow {
         onSelect?(selectedIndex)
     }
 
-    @objc private func pageDownTapped() {
-        if !movePage(delta: 1) {
-            onPage?(1)
-        }
-    }
-
     @objc private func settingsTapped() {
         onSettings?()
     }
@@ -782,7 +809,7 @@ private final class CandidatePillButton: NSButton {
         focusRingType = .none
         alignment = .center
         wantsLayer = true
-        layer?.cornerRadius = 9
+        layer?.cornerRadius = 0
         layer?.masksToBounds = true
         cell?.lineBreakMode = .byTruncatingTail
         cell?.usesSingleLineMode = true
@@ -797,8 +824,6 @@ private final class CandidatePillButton: NSButton {
 }
 
 private final class BufferActionPillButton: NSButton {
-    private let dashedBorder = CAShapeLayer()
-
     init() {
         super.init(frame: .zero)
         isBordered = false
@@ -806,33 +831,16 @@ private final class BufferActionPillButton: NSButton {
         focusRingType = .none
         alignment = .center
         wantsLayer = true
-        layer?.cornerRadius = 9
-        layer?.masksToBounds = false
+        layer?.cornerRadius = 0
+        layer?.masksToBounds = true
         cell?.lineBreakMode = .byTruncatingTail
         cell?.usesSingleLineMode = true
         translatesAutoresizingMaskIntoConstraints = false
         setContentHuggingPriority(.required, for: .horizontal)
         setContentCompressionResistancePriority(.required, for: .horizontal)
-
-        dashedBorder.fillColor = NSColor.clear.cgColor
-        dashedBorder.strokeColor = RimeUI.border.withAlphaComponent(0.55).cgColor
-        dashedBorder.lineWidth = 1
-        dashedBorder.lineDashPattern = [3, 2]
-        layer?.addSublayer(dashedBorder)
     }
 
     required init?(coder: NSCoder) { fatalError() }
-
-    override func layout() {
-        super.layout()
-        dashedBorder.frame = bounds
-        dashedBorder.path = CGPath(
-            roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
-            cornerWidth: 9,
-            cornerHeight: 9,
-            transform: nil
-        )
-    }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
@@ -841,7 +849,7 @@ private final class CandidateActionButton: NSButton {
     init(symbolName: String, title: String) {
         super.init(frame: .zero)
         self.title = title
-        image = RimeUI.symbol(symbolName, pointSize: title.isEmpty ? 17 : 14, weight: .semibold)
+        image = RimeUI.symbol(symbolName, pointSize: title.isEmpty ? 15 : 14, weight: .semibold)
         image?.isTemplate = true
         imagePosition = title.isEmpty ? .imageOnly : .imageLeading
         imageScaling = .scaleProportionallyDown
@@ -851,7 +859,7 @@ private final class CandidateActionButton: NSButton {
         font = .systemFont(ofSize: 14, weight: .semibold)
         contentTintColor = RimeUI.textSecondary
         wantsLayer = true
-        layer?.cornerRadius = 9
+        layer?.cornerRadius = 7
         layer?.backgroundColor = NSColor.clear.cgColor
         translatesAutoresizingMaskIntoConstraints = false
         setContentHuggingPriority(.required, for: .horizontal)

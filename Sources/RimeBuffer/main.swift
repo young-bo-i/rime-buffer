@@ -57,9 +57,6 @@ _ = rimeEngine.start()
 candidateWindow.onSelect = { index in
     RimeBufferController.active?.selectCandidate(onPage: index)
 }
-candidateWindow.onPage = { delta in
-    RimeBufferController.active?.pageCandidates(delta: delta)
-}
 candidateWindow.onSettings = {
     SettingsWindowController.shared.show()
 }

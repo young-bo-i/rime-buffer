@@ -186,6 +186,12 @@ final class RimeBufferController: IMKInputController {
             if composition.composing || chord.hasPending { forceCommit() }
             return false
         }
+        if let shiftedText = shiftedDirectText(for: event) {
+            if rimeEngine.start(), ensureSessionReady() {
+                return insertDirectText(shiftedText, client: client, source: "shift")
+            }
+            return insertDirectText(shiftedText, client: client, source: "shift fallback")
+        }
         // Engine down → raw fallback so the user can still type latin.
         guard rimeEngine.start(), ensureSessionReady() else {
             return rawFallback(event, client: client)
@@ -652,6 +658,45 @@ final class RimeBufferController: IMKInputController {
         }
         BufferModel.shared.compositionActive = false
         updateUI(client: client)
+        return true
+    }
+
+    private func shiftedDirectText(for event: NSEvent) -> String? {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard flags.contains(.shift),
+              flags.intersection([.control, .option, .command]).isEmpty,
+              let text = event.characters,
+              !text.isEmpty,
+              text.unicodeScalars.allSatisfy({ $0.value >= 0x20 && $0.value != 0x7f }) else {
+            return nil
+        }
+        return text
+    }
+
+    private func insertDirectText(_ text: String, client: IMKTextInput, source: String) -> Bool {
+        if rimeEngine.isHealthy, session != 0 {
+            let ctx = rimeEngine.getContext(session: session)
+            if chord.hasPending || composition.composing || ctx.active || !ctx.input.isEmpty || !ctx.preedit.isEmpty {
+                resolveComposition(client: client)
+            }
+        }
+
+        if BufferModel.shared.active {
+            BufferModel.shared.append(text)
+            composition.clear(client: client)
+            IMELog.write("\(source) text '\(text)' -> buffer (\(BufferModel.shared.blocks.count) blocks)")
+        } else {
+            Delivery.insert(text, into: client)
+            composition.commitDidInsert()
+            RemoteTypingService.shared.send(text)
+            IMELog.write("\(source) text '\(text)' -> \(bundleId(of: client))")
+        }
+        BufferModel.shared.compositionActive = false
+        if BufferModel.shared.shouldDisplay {
+            refreshBufferDisplay()
+        } else {
+            candidateWindow.hide()
+        }
         return true
     }
 
