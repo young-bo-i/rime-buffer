@@ -13,3 +13,6 @@ Vendor/
 *.swp
 
 *.log
+
+# Local installer builds (CI produces the released pkg)
+*.pkg

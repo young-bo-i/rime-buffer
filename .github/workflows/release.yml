@@ -61,7 +61,7 @@ jobs:
 
       - name: Assemble the app bundle
         run: |
-          APP="恩特输入法.app"
+          APP="ETInput.app"
           rm -rf "$APP"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" \
                    "$APP/Contents/Frameworks" "$APP/Contents/SharedSupport"
@@ -72,7 +72,8 @@ jobs:
           cp -R Vendor/rime/SharedSupport/* "$APP/Contents/SharedSupport/"
           [ -f Logo/AppIcon.icns ] && cp Logo/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns" || true
           cp -R Resources/*.lproj "$APP/Contents/Resources/" 2>/dev/null || true   # localized display name
-          cp Resources/etinput.pdf "$APP/Contents/Resources/" 2>/dev/null || true  # input-mode menu icon
+          cp Resources/etinput.pdf "$APP/Contents/Resources/" 2>/dev/null || true  # colored brand icon (Settings row)
+          cp Resources/etinput-menu.pdf "$APP/Contents/Resources/" 2>/dev/null || true  # monochrome input-menu glyph
           cp Resources/menubar-template.png "$APP/Contents/Resources/" 2>/dev/null || true  # status-bar glyph
           # --deep: sign the nested librime + plugin dylibs too.
           codesign --force --deep --sign - "$APP"
@@ -89,7 +90,7 @@ jobs:
           ZIP="ETInput-${VERSION}.zip"
           # ditto preserves the bundle structure + ad-hoc signature; the in-app
           # updater unzips this with /usr/bin/unzip.
-          ditto -c -k --sequesterRsrc --keepParent "恩特输入法.app" "$ZIP"
+          ditto -c -k --sequesterRsrc --keepParent "ETInput.app" "$ZIP"
           SHA256=$(shasum -a 256 "$ZIP" | awk '{print $1}')
           echo "ZIP=$ZIP" >> "$GITHUB_OUTPUT"
           echo "SHA256=$SHA256" >> "$GITHUB_OUTPUT"
@@ -101,7 +102,7 @@ jobs:
         id: pkg
         run: |
           VERSION="${{ steps.version.outputs.VERSION }}"
-          ./scripts/make-pkg.sh "$VERSION" "恩特输入法.app" "ETInput-${VERSION}.pkg"
+          ./scripts/make-pkg.sh "$VERSION" "ETInput.app" "ETInput-${VERSION}.pkg"
           PKG="ETInput-${VERSION}.pkg"
           PKG_SHA256=$(shasum -a 256 "$PKG" | awk '{print $1}')
           echo "PKG=$PKG" >> "$GITHUB_OUTPUT"

@@ -1029,33 +1029,11 @@ final class RimeBufferController: IMKInputController {
     // MARK: Schema switching (IMK menu + StatusMenu)
 
     override func menu() -> NSMenu! {
+        // The system input menu is the ONE home for all features (方案切换、
+        // 缓冲模式、隔空传字、更新、日志) — same place Sogou/简体拼音 put theirs.
         let m = NSMenu()
-        for schema in StatusMenu.availableSchemas() {
-            let mi = NSMenuItem(title: schema.title, action: #selector(chooseSchema(_:)), keyEquivalent: "")
-            mi.target = self
-            mi.representedObject = schema.id
-            mi.state = currentSchemaId == schema.id ? .on : .off
-            m.addItem(mi)
-        }
-        m.addItem(.separator())
-        let log = NSMenuItem(title: "打开日志", action: #selector(openLog), keyEquivalent: "")
-        log.target = self
-        m.addItem(log)
+        StatusMenu.shared.populate(m)
         return m
-    }
-
-    @objc private func chooseSchema(_ sender: Any!) {
-        // IMK passes the NSMenuItem directly or wrapped in a dictionary
-        // depending on macOS version.
-        let item = (sender as? NSMenuItem)
-            ?? ((sender as? [String: Any])?["IMKCommandMenuItem"] as? NSMenuItem)
-        guard let id = item?.representedObject as? String else { return }
-        Self.applyPreferredSchema(id)
-    }
-
-    @objc private func openLog() {
-        NSWorkspace.shared.open(
-            URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("rimebuffer.log"))
     }
 
     /// Set the preferred schema globally: persist it, apply to the live

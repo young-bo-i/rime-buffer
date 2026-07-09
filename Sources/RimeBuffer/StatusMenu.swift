@@ -1,9 +1,10 @@
 import Cocoa
 
-/// Menu-bar entry point (user-requested): a persistent NSStatusItem mirroring
-/// what the IMK input-source menu offers — schema switching, engine health,
-/// log access, process restart. The IMK menu() on the controller is the
-/// primary channel; this item is the always-visible backup.
+/// Menu provider for the SYSTEM input-source menu: RimeBufferController.menu()
+/// calls populate(_:) so all features (schema switching, buffer mode, remote
+/// typing, updates, log, restart) live under the system input menu — the same
+/// place every input method exposes its options. The standalone NSStatusItem
+/// is no longer installed by default (install() kept for debugging).
 final class StatusMenu: NSObject, NSMenuDelegate {
     static let shared = StatusMenu()
 
@@ -69,6 +70,15 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
     // Rebuild on every open so state is always current.
     func menuNeedsUpdate(_ menu: NSMenu) {
+        populate(menu)
+    }
+
+    /// Build the full feature menu. Shared by the (optional) status item and
+    /// the IMK menu() on the controller, so the system input menu carries
+    /// everything. All targets point at self — IMK keeps the NSMenu object in
+    /// this process and invokes target/action on click (sender may arrive as
+    /// the item or wrapped in a dictionary; handlers unwrap both).
+    func populate(_ menu: NSMenu) {
         menu.removeAllItems()
 
         let version = UpdateManager.shared.currentVersion
@@ -190,15 +200,22 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         IMELog.write("remote typing enabled -> \(RemoteConfig.enabled)")
     }
 
-    @objc private func pairDevice(_ sender: NSMenuItem) {
+    /// IMK delivers the clicked item either directly or wrapped in a
+    /// dictionary under IMKCommandMenuItem, depending on macOS version.
+    private func menuItem(from sender: Any?) -> NSMenuItem? {
+        (sender as? NSMenuItem)
+            ?? ((sender as? [String: Any])?["IMKCommandMenuItem"] as? NSMenuItem)
+    }
+
+    @objc private func pairDevice(_ sender: Any?) {
         // Connects + handshakes; the SAS-confirm dialog (onPairConfirm) pops once
         // we've reached the peer, then the other Mac shows 同意.
-        guard let id = sender.representedObject as? String else { return }
+        guard let id = menuItem(from: sender)?.representedObject as? String else { return }
         RemoteTypingService.shared.requestPair(peerID: id)
     }
 
-    @objc private func unpairDevice(_ sender: NSMenuItem) {
-        guard let pubB64 = sender.representedObject as? String else { return }
+    @objc private func unpairDevice(_ sender: Any?) {
+        guard let pubB64 = menuItem(from: sender)?.representedObject as? String else { return }
         RemoteTypingService.shared.unpair(pubB64: pubB64)
     }
 
@@ -225,8 +242,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         return response == .alertFirstButtonReturn ? field.stringValue : nil
     }
 
-    @objc private func chooseSchema(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String else { return }
+    @objc private func chooseSchema(_ sender: Any?) {
+        guard let id = menuItem(from: sender)?.representedObject as? String else { return }
         RimeBufferController.applyPreferredSchema(id)
     }
 

@@ -91,29 +91,35 @@ func renderPNG(src: String, size: Int, out: String) {
     }
 }
 
-func renderPDF(src: String, out: String) {
-    let image = loadImage(src)
+// Input-source icons MUST be 16x16 pt pages (Sogou/Apple convention) — a
+// bigger MediaBox renders oversized in System Settings. Multiple sources
+// become multiple pages: page 1 = normal (black), page 2 = selected/dark
+// (white), the same two-page layout Sogou's menubarpinyin.pdf uses.
+func renderPDF(srcs: [String], pageSize: CGFloat, out: String) {
     let data = NSMutableData()
     guard let consumer = CGDataConsumer(data: data as CFMutableData) else {
         fail("Unable to create PDF data consumer: \(out)")
     }
 
-    var mediaBox = CGRect(x: 0, y: 0, width: image.size.width, height: image.size.height)
+    var mediaBox = CGRect(x: 0, y: 0, width: pageSize, height: pageSize)
     guard let pdf = CGContext(consumer: consumer, mediaBox: &mediaBox, nil) else {
         fail("Unable to create PDF context: \(out)")
     }
 
-    pdf.beginPDFPage(nil)
-    NSGraphicsContext.saveGraphicsState()
-    NSGraphicsContext.current = NSGraphicsContext(cgContext: pdf, flipped: false)
-    image.draw(
-        in: NSRect(x: 0, y: 0, width: image.size.width, height: image.size.height),
-        from: NSRect(origin: .zero, size: image.size),
-        operation: .sourceOver,
-        fraction: 1.0
-    )
-    NSGraphicsContext.restoreGraphicsState()
-    pdf.endPDFPage()
+    for src in srcs {
+        let image = loadImage(src)
+        pdf.beginPDFPage(nil)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: pdf, flipped: false)
+        image.draw(
+            in: NSRect(x: 0, y: 0, width: pageSize, height: pageSize),
+            from: NSRect(origin: .zero, size: image.size),
+            operation: .sourceOver,
+            fraction: 1.0
+        )
+        NSGraphicsContext.restoreGraphicsState()
+        pdf.endPDFPage()
+    }
     pdf.closePDF()
 
     do {
@@ -129,10 +135,13 @@ if args.count == 5 && args[1] == "png" {
         fail("Invalid PNG size: \(args[3])")
     }
     renderPNG(src: args[2], size: size, out: args[4])
-} else if args.count == 4 && args[1] == "pdf" {
-    renderPDF(src: args[2], out: args[3])
+} else if args.count >= 5 && args[1] == "pdf" {
+    guard let size = Int(args[2]) else {
+        fail("Invalid PDF page size: \(args[2])")
+    }
+    renderPDF(srcs: Array(args[4...]), pageSize: CGFloat(size), out: args[3])
 } else {
-    fail("Usage: render-svg.swift png input.svg size output.png | pdf input.svg output.pdf")
+    fail("Usage: render-svg.swift png input.svg size output.png | pdf size output.pdf input.svg [input2.svg ...]")
 }
 SWIFT
 
@@ -145,10 +154,11 @@ render_png() {
 }
 
 render_pdf() {
-  local src="$1"
-  local out="$2"
+  local out="$1"
+  local size="$2"
+  shift 2
 
-  swift "$renderer" pdf "$src" "$out"
+  swift "$renderer" pdf "$size" "$out" "$@"
 }
 
 assert_nonempty() {
@@ -171,7 +181,7 @@ assert_png_size() {
   fi
 }
 
-rm -rf AppIcon.iconset AppIcon.icns menubar-template.png inputsource.pdf
+rm -rf AppIcon.iconset AppIcon.icns menubar-template.png inputsource.pdf menuicon.pdf
 mkdir -p AppIcon.iconset
 
 render_png app-icon.svg 16 AppIcon.iconset/icon_16x16.png
@@ -217,7 +227,15 @@ PY
 fi
 
 render_png menubar.svg 36 menubar-template.png
-render_pdf inputsource.svg inputsource.pdf
+
+# Colored brand icon: System Settings row (tsInputMethodIconFileKey).
+render_pdf inputsource.pdf 16 inputsource.svg
+
+# Monochrome ET glyph for the system input menu / menu bar (tsInputMode*Icon
+# keys): page 1 black for light menus, page 2 white for the selected/dark
+# state — mirrors Sogou's two-page menubarpinyin.pdf.
+sed 's/#000000/#FFFFFF/g' menubar.svg > "$tmpdir/menubar-white.svg"
+render_pdf menuicon.pdf 16 menubar.svg "$tmpdir/menubar-white.svg"
 
 for spec in \
   "AppIcon.iconset/icon_16x16.png:16" \
@@ -239,6 +257,7 @@ done
 
 assert_nonempty AppIcon.icns
 assert_nonempty inputsource.pdf
+assert_nonempty menuicon.pdf
 
 python3 - menubar-template.png <<'PY'
 import struct

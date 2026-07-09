@@ -1,11 +1,42 @@
 #!/bin/bash
-# Runs as root after the payload lands in /Library/Input Methods. Clears any
-# quarantine and (re)registers the input source with Launch Services so it shows
-# up in System Settings → Keyboard → Input Sources.
-APP="/Library/Input Methods/恩特输入法.app"
+# Runs as root after the payload lands in /Library/Input Methods.
+#
+# Getting a 3rd-party IME to "just work" after install (no manual Add, no logout)
+# takes three things, and the last one is the one everybody misses:
+#   1. clear quarantine
+#   2. register with Launch Services
+#   3. register + enable + select the input source AS THE LOGGED-IN USER — TIS
+#      writes only persist inside the Aqua/login session, so root must drop to
+#      the console user (this mirrors rime/squirrel's postinstall).
+APP="/Library/Input Methods/ETInput.app"
+EXE="$APP/Contents/MacOS/ETInput"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+login_user="$(/usr/bin/stat -f%Su /dev/console)"
+
+# Remove any stale USER-level copy of the same input-source id. Two bundles at
+# different paths claiming one id poisons TIS/LaunchServices name+icon lookup and
+# yields a blank/greyed picker row — the exact bug this whole thing hit.
+if [ -n "$login_user" ] && [ "$login_user" != "root" ]; then
+    user_home="$(/usr/bin/dscl . -read "/Users/$login_user" NFSHomeDirectory 2>/dev/null | /usr/bin/awk '{print $2}')"
+    if [ -n "$user_home" ] && [ -e "$user_home/Library/Input Methods/ETInput.app" ]; then
+        "$LSREGISTER" -u "$user_home/Library/Input Methods/ETInput.app" 2>/dev/null || true
+        /bin/rm -rf "$user_home/Library/Input Methods/ETInput.app"
+    fi
+fi
 
 /usr/bin/xattr -cr "$APP" 2>/dev/null || true
 "$LSREGISTER" -f "$APP" 2>/dev/null || true
+
+# Stop any running instance, then self-install as the login user: the app's
+# --install does TISRegisterInputSource(bundleURL) + TISEnableInputSource +
+# TISSelectInputSource. TIS writes only stick inside the user's Aqua session
+# BOOTSTRAP — plain `sudo -u` keeps the installer's Mach bootstrap, where the
+# enable half-lands (parent enabled, input mode not). `launchctl asuser`
+# targets the console user's GUI session so all three calls persist.
+if [ -n "$login_user" ] && [ "$login_user" != "root" ]; then
+    login_uid="$(/usr/bin/id -u "$login_user")"
+    /bin/launchctl asuser "$login_uid" /usr/bin/sudo -u "$login_user" /usr/bin/killall ETInput 2>/dev/null || true
+    /bin/launchctl asuser "$login_uid" /usr/bin/sudo -u "$login_user" "$EXE" --install 2>/dev/null || true
+fi
 
 exit 0

@@ -2,6 +2,7 @@ import Cocoa
 import InputMethodKit
 import Network
 import CryptoKit
+import Carbon
 
 // `swift run RimeBuffer smoke` validates the engine end-to-end without IMK.
 if CommandLine.arguments.contains("stats-smoke") {
@@ -15,6 +16,17 @@ if CommandLine.arguments.contains("remote-smoke") {
 }
 if CommandLine.arguments.contains("smoke") {
     runEngineSmokeTest()
+    exit(0)
+}
+
+// Self-install into the input-source list. TIS enable/select only persist when
+// run INSIDE the login (Aqua) session — a detached CLI's writes return success
+// but never land. So the installer / build script launches THIS bundle in the
+// user session (`open -n ETInput.app --args --install`) to register + enable +
+// select itself, exactly like Squirrel's --install. Runs before the IMK server
+// so this short-lived instance never contends for the connection.
+if CommandLine.arguments.contains("--install") {
+    installInputSource()
     exit(0)
 }
 
@@ -59,9 +71,9 @@ BufferModel.shared.onChange = {
 }
 candidateWindow.refreshBuffer()
 
-// Menu-bar entry (schema switching / health / log) + a safety net that hides a
-// stray candidate panel when the user switches apps mid-composition.
-StatusMenu.shared.install()
+// No standalone menu-bar icon: all features live in the SYSTEM input menu via
+// RimeBufferController.menu() (StatusMenu.populate builds it). setHealthy still
+// feeds the health line shown at the top of that menu.
 StatusMenu.shared.setHealthy(rimeEngine.isHealthy)
 
 // Auto-update: silently check GitHub Releases on launch + hourly, download in the
@@ -126,6 +138,35 @@ NotificationCenter.default.addObserver(
 IMELog.write("bootstrap done: server=\(imkServer != nil) engineHealthy=\(rimeEngine.isHealthy)")
 
 NSApplication.shared.run()
+
+// MARK: - Input-source self-install (register + enable + select)
+
+/// Registers this bundle's path with TIS, then enables + selects our input mode.
+/// Must run inside the login session (see call site). Mirrors Squirrel's
+/// RegisterInputSource + ActivateInputSource.
+func installInputSource() {
+    let modeID = "com.isaac.inputmethod.ETInput.Hans"
+    // Register THIS bundle's URL so the input-source id resolves to this exact
+    // copy (kills the "duplicate id at multiple paths → blank row" problem).
+    let status = TISRegisterInputSource(Bundle.main.bundleURL as CFURL)
+    print("install: register \(Bundle.main.bundleURL.path) -> \(status)")
+    guard let cf = TISCreateInputSourceList(nil, true)?.takeRetainedValue() else {
+        print("install: no input source list"); return
+    }
+    let list = cf as! [TISInputSource]
+    var done = false
+    for src in list {
+        guard let p = TISGetInputSourceProperty(src, kTISPropertyInputSourceID) else { continue }
+        let id = Unmanaged<CFString>.fromOpaque(p).takeUnretainedValue() as String
+        if id == modeID {
+            let e = TISEnableInputSource(src)
+            let s = TISSelectInputSource(src)
+            print("install: enable=\(e) select=\(s) \(id)")
+            done = true
+        }
+    }
+    if !done { print("install: mode \(modeID) not found in TIS list") }
+}
 
 // MARK: - Engine smoke harness (bring-up only)
 
