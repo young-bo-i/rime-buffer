@@ -93,6 +93,7 @@ final class BufferInlineView: NSView {
         let model = BufferModel.shared
         let shouldShow = model.shouldDisplay
         let preeditText = preedit.trimmingCharacters(in: .whitespacesAndNewlines)
+        let active = model.active
 
         chipRow.arrangedSubviews.forEach {
             chipRow.removeArrangedSubview($0)
@@ -102,11 +103,12 @@ final class BufferInlineView: NSView {
 
         let insertionIndex = min(max(model.insertionIndex, 0), model.blocks.count)
         if model.blocks.isEmpty, preeditText.isEmpty {
+            emptyLabel.stringValue = model.loadingMessage ?? "等待暂存内容"
             chipRow.addArrangedSubview(emptyLabel)
-            if model.enabled {
+            if active {
                 chipRow.addArrangedSubview(caretView)
             }
-        } else if model.enabled {
+        } else if active {
             for index in 0...model.blocks.count {
                 if index == insertionIndex {
                     if !preeditText.isEmpty {
@@ -127,7 +129,7 @@ final class BufferInlineView: NSView {
             }
         }
 
-        model.enabled ? startCaretBlinking() : stopCaretBlinking()
+        active ? startCaretBlinking() : stopCaretBlinking()
         flushButton.isEnabled = !model.blocks.isEmpty
         clearButton.isEnabled = !model.blocks.isEmpty
 
@@ -239,7 +241,7 @@ final class BufferInlineView: NSView {
 
     private func scrollChipsToInsertionPoint() {
         let maxX = max(0, chipRow.frame.width - chipScroll.contentSize.width)
-        guard BufferModel.shared.enabled else {
+        guard BufferModel.shared.active else {
             chipScroll.contentView.scroll(to: NSPoint(x: maxX, y: 0))
             chipScroll.reflectScrolledClipView(chipScroll.contentView)
             return

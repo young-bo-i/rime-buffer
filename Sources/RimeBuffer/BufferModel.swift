@@ -18,6 +18,9 @@ final class BufferModel {
 
     private(set) var blocks: [Block] = []
     private(set) var insertionIndex = 0
+    private(set) var transientEnabled = false
+    private(set) var loadingMessage: String?
+    private(set) var loadingRequestId: String?
 
     var stagedText: String {
         blocks.map(\.text).joined()
@@ -28,7 +31,11 @@ final class BufferModel {
     }
 
     var shouldDisplay: Bool {
-        enabled || !blocks.isEmpty
+        active || !blocks.isEmpty || loadingMessage != nil
+    }
+
+    var active: Bool {
+        enabled || transientEnabled
     }
 
     /// Wired in main.swift → active controller's client. Returns false when no
@@ -57,6 +64,45 @@ final class BufferModel {
         blocks.insert(Block(text: text), at: index)
         insertionIndex = index + 1
         IMELog.write("buffer insert block at \(index) count=\(blocks.count)")
+        onChange?()
+    }
+
+    func beginTransientLoading(requestId: String, message: String) {
+        transientEnabled = true
+        loadingRequestId = requestId
+        loadingMessage = message
+        IMELog.write("buffer transient loading request=\(requestId) message='\(message)'")
+        onChange?()
+    }
+
+    func appendMarineDraft(_ text: String, requestId: String) {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        transientEnabled = true
+        if loadingRequestId == requestId {
+            loadingRequestId = nil
+            loadingMessage = nil
+        }
+        append(text)
+        IMELog.write("buffer marine draft loaded request=\(requestId) chars=\(text.count)")
+    }
+
+    func failTransientLoading(requestId: String, message: String) {
+        guard loadingRequestId == nil || loadingRequestId == requestId else { return }
+        transientEnabled = true
+        loadingRequestId = requestId
+        loadingMessage = message
+        IMELog.write("buffer transient failed request=\(requestId) message='\(message)'")
+        onChange?()
+    }
+
+    func cancelActiveMode() {
+        loadingRequestId = nil
+        loadingMessage = nil
+        if transientEnabled {
+            transientEnabled = false
+        } else {
+            enabled = false
+        }
         onChange?()
     }
 
@@ -100,6 +146,7 @@ final class BufferModel {
         let count = blocks.count
         blocks.removeAll()
         insertionIndex = 0
+        settleTransientIfIdle()
         IMELog.write("buffer send end; cleared \(count) blocks; buffer mode preserved")
         onChange?()
     }
@@ -121,6 +168,7 @@ final class BufferModel {
             insertionIndex -= 1
         }
         clampInsertionIndexInPlace()
+        settleTransientIfIdle()
         IMELog.write("buffer send next attempted '\(block.text)' remaining=\(blocks.count)")
         onChange?()
         return true
@@ -132,6 +180,11 @@ final class BufferModel {
         }
         blocks.removeAll()
         insertionIndex = 0
+        loadingRequestId = nil
+        loadingMessage = nil
+        if transientEnabled {
+            transientEnabled = false
+        }
         onChange?()
     }
 
@@ -141,5 +194,11 @@ final class BufferModel {
 
     private func clampInsertionIndexInPlace() {
         insertionIndex = clampedInsertionIndex()
+    }
+
+    private func settleTransientIfIdle() {
+        if transientEnabled, blocks.isEmpty, loadingMessage == nil {
+            transientEnabled = false
+        }
     }
 }

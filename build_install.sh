@@ -103,8 +103,9 @@ pkill -x "$EXE" 2>/dev/null || true
 pkill -x RimeBuffer 2>/dev/null || true
 sleep 0.5
 # Any leftover copies in the repo tree or a previous CJK-named install.
-for stray in "恩特输入法.app" "ETInput.app" \
-             "$HOME/Library/Input Methods/恩特输入法.app"; do
+for stray in "恩特输入法.app" "ETInput.app" "RimeBuffer.app" \
+             "$HOME/Library/Input Methods/恩特输入法.app" \
+             "$HOME/Library/Input Methods/RimeBuffer.app"; do
     if [ -e "$stray" ]; then
         "$LSREGISTER" -u "$stray" 2>/dev/null || true
         rm -rf "$stray"

@@ -86,6 +86,7 @@ final class RimeBufferController: IMKInputController {
             candidateWindow.showBufferOnly(caretRect: caretRect(for: activeClient),
                                            bundleId: bundleId(of: activeClient))
         }
+        MarineBridge.shared.checkForFocusedIntent()
     }
 
     /// Post-start initialization, shared by activateServer AND the key paths —
@@ -224,7 +225,7 @@ final class RimeBufferController: IMKInputController {
 
     private func handleBufferEscape(_ keycode: Int32, mask: Int32, client: IMKTextInput) -> Bool {
         guard keycode == RimeKey.escape,
-              BufferModel.shared.enabled,
+              BufferModel.shared.active,
               mask & (RimeKey.controlMask | RimeKey.altMask | RimeKey.superMask) == 0 else {
             return false
         }
@@ -254,7 +255,7 @@ final class RimeBufferController: IMKInputController {
             return true
         }
 
-        guard BufferModel.shared.enabled else { return false }
+        guard BufferModel.shared.active else { return false }
         lastBufferEnterKeyHandledAt = now
         beginBufferEnterGesture(client: client, hardwareKeyCode: hardwareKeyCode)
         return true
@@ -282,7 +283,7 @@ final class RimeBufferController: IMKInputController {
 
     private func handleBufferBackspace(_ keycode: Int32, mask: Int32, client: IMKTextInput) -> Bool {
         guard keycode == RimeKey.backspace,
-              BufferModel.shared.enabled,
+              BufferModel.shared.active,
               mask & (RimeKey.controlMask | RimeKey.altMask | RimeKey.superMask) == 0 else {
             return false
         }
@@ -308,7 +309,7 @@ final class RimeBufferController: IMKInputController {
         case RimeKey.right: direction = 1
         default: return false
         }
-        guard BufferModel.shared.enabled,
+        guard BufferModel.shared.active,
               mask & (RimeKey.shiftMask | RimeKey.controlMask | RimeKey.altMask | RimeKey.superMask) == 0,
               canMoveBufferInsertionPoint() else {
             return false
@@ -342,7 +343,7 @@ final class RimeBufferController: IMKInputController {
                 return true
             }
 
-            guard BufferModel.shared.enabled else { return false }
+            guard BufferModel.shared.active else { return false }
             let client = (sender as? IMKTextInput) ?? (self.client() as IMKTextInput?) ?? lastClient
             if let client {
                 Self.active = self
@@ -357,7 +358,7 @@ final class RimeBufferController: IMKInputController {
             return performBufferEnter(client: client, source: "command:\(NSStringFromSelector(selector))")
         }
         if let direction = horizontalMoveDirection(for: selector) {
-            guard BufferModel.shared.enabled else { return false }
+            guard BufferModel.shared.active else { return false }
             let now = CFAbsoluteTimeGetCurrent()
             if now - lastBufferArrowKeyHandledAt < Self.duplicateArrowCommandWindow,
                lastBufferArrowKeyDirection == direction {
@@ -384,7 +385,7 @@ final class RimeBufferController: IMKInputController {
             }
             return true
         }
-        guard BufferModel.shared.enabled else {
+        guard BufferModel.shared.active else {
             return false
         }
         if isCancelOperationSelector(selector) {
@@ -464,7 +465,7 @@ final class RimeBufferController: IMKInputController {
         }
         BufferModel.shared.compositionActive = false
         BufferModel.shared.clear()
-        BufferModel.shared.enabled = false
+        BufferModel.shared.cancelActiveMode()
         IMELog.write("buffer mode cancelled by \(source)")
         if let client {
             updateUI(client: client)
@@ -515,7 +516,7 @@ final class RimeBufferController: IMKInputController {
         }
 
         guard bufferEnterPending else { return }
-        guard BufferModel.shared.enabled else {
+        guard BufferModel.shared.active else {
             resetBufferEnterGesture()
             return
         }
@@ -573,7 +574,7 @@ final class RimeBufferController: IMKInputController {
         BufferModel.shared.compositionActive = false
         let originalBlockCount = BufferModel.shared.blocks.count
         let sent = BufferModel.shared.sendNextBlock()
-        IMELog.write("buffer enter \(source) consumed; send next=\(sent) blocks=\(originalBlockCount)->\(BufferModel.shared.blocks.count) enabled=\(BufferModel.shared.enabled)")
+        IMELog.write("buffer enter \(source) consumed; send next=\(sent) blocks=\(originalBlockCount)->\(BufferModel.shared.blocks.count) active=\(BufferModel.shared.active)")
 
         if let resolvedClient {
             if BufferModel.shared.shouldDisplay {
@@ -611,7 +612,7 @@ final class RimeBufferController: IMKInputController {
         BufferModel.shared.compositionActive = false
         let originalBlockCount = BufferModel.shared.blocks.count
         BufferModel.shared.sendAll()
-        IMELog.write("buffer enter \(source) consumed; send all blocks=\(originalBlockCount)->\(BufferModel.shared.blocks.count) enabled=\(BufferModel.shared.enabled)")
+        IMELog.write("buffer enter \(source) consumed; send all blocks=\(originalBlockCount)->\(BufferModel.shared.blocks.count) active=\(BufferModel.shared.active)")
 
         if let resolvedClient {
             if BufferModel.shared.shouldDisplay {
@@ -816,7 +817,7 @@ final class RimeBufferController: IMKInputController {
             selectCandidate(onPage: index)
             return true
         case 0x30:
-            guard !BufferModel.shared.enabled else { return true }
+            guard !BufferModel.shared.active else { return true }
             candidateWindow.performBufferAction()
             return true
         default:
@@ -864,7 +865,7 @@ final class RimeBufferController: IMKInputController {
         guard !raw.isEmpty else { return false }
 
         rimeEngine.clearComposition(session: session)
-        if BufferModel.shared.enabled {
+        if BufferModel.shared.active {
             BufferModel.shared.append(raw)
             composition.clear(client: client)
             IMELog.write("raw input '\(raw)' -> buffer (\(BufferModel.shared.blocks.count) blocks)")
@@ -886,7 +887,7 @@ final class RimeBufferController: IMKInputController {
     /// cleared from the field (nothing lands until the buffer flushes).
     private func drainCommit(_ client: IMKTextInput) {
         guard let commit = rimeEngine.takeCommit(session: session) else { return }
-        if BufferModel.shared.enabled {
+        if BufferModel.shared.active {
             BufferModel.shared.append(commit)
             composition.clear(client: client)
             IMELog.write("commit '\(commit)' -> buffer (\(BufferModel.shared.blocks.count) blocks)")
@@ -976,7 +977,7 @@ final class RimeBufferController: IMKInputController {
 
         let bid = bundleId(of: client)
         let mode = CompositionSession.mode(for: bid)
-        let bufferEnabled = BufferModel.shared.enabled
+        let bufferEnabled = BufferModel.shared.active
         if bufferEnabled {
             composition.updateBufferGuard(preedit: ctx.preedit, client: client)
         } else {

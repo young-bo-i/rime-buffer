@@ -11,6 +11,9 @@ if CommandLine.arguments.contains("stats-smoke") {
 if CommandLine.arguments.contains("buffer-smoke") {
     exit(runBufferSmokeTest() ? 0 : 1)
 }
+if CommandLine.arguments.contains("marine-bridge-smoke") {
+    exit(runMarineBridgeSmokeTest() ? 0 : 1)
+}
 if CommandLine.arguments.contains("remote-smoke") {
     exit(runRemoteSmokeTest() ? 0 : 1)
 }
@@ -380,6 +383,52 @@ func runBufferSmokeTest() -> Bool {
 
     print("buffer smoke: OK")
     return true
+}
+
+func runMarineBridgeSmokeTest() -> Bool {
+    print("== ETInput Marine bridge smoke test ==")
+    let model = BufferModel.shared
+    let oldEnabled = model.enabled
+    let oldDeliver = model.deliver
+    let oldOnChange = model.onChange
+    defer {
+        model.clear()
+        model.enabled = oldEnabled
+        model.deliver = oldDeliver
+        model.onChange = oldOnChange
+    }
+
+    model.onChange = nil
+    model.deliver = nil
+    model.clear()
+
+    MarineBridge.shared.checkForFocusedIntent()
+    let deadline = Date().addingTimeInterval(5)
+    while Date() < deadline {
+        if let block = model.blocks.first {
+            let expected = ProcessInfo.processInfo.environment["MARINE_BRIDGE_SMOKE_EXPECTED"]
+            if let expected, !expected.isEmpty, block.text != expected {
+                print("FAILED: loaded unexpected draft", "got=\(block.text)", "expected=\(expected)")
+                return false
+            }
+            guard model.active, model.loadingMessage == nil else {
+                print("FAILED: draft loaded but buffer state is inconsistent",
+                      "active=\(model.active)",
+                      "loading=\(model.loadingMessage ?? "nil")")
+                return false
+            }
+            print("loaded draft chars:", block.text.count)
+            print("marine bridge smoke: OK")
+            return true
+        }
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+    }
+
+    print("FAILED: no Marine draft loaded",
+          "loading=\(model.loadingMessage ?? "nil")",
+          "active=\(model.active)",
+          "blocks=\(model.blocks.count)")
+    return false
 }
 
 // MARK: - Remote-typing transport smoke (crypto + framing + loopback socket)

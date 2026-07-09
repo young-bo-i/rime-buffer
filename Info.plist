@@ -10,6 +10,8 @@
 	<string>ETInput</string>
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
+	<key>CFBundleIconName</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.isaac.inputmethod.ETInput</string>
 	<key>CFBundleName</key>
@@ -36,13 +38,18 @@
 				<string>etinput-menu.pdf</string>
 				<key>tsInputModeCharacterRepertoireKey</key>
 				<array>
-					<string>Latn</string>
 					<string>Hans</string>
+					<string>Hant</string>
+					<string>Latn</string>
 				</array>
 				<key>tsInputModeDefaultStateKey</key>
 				<true/>
 				<key>tsInputModeIsVisibleKey</key>
 				<true/>
+				<key>tsInputModeKeyEquivalentKey</key>
+				<string></string>
+				<key>tsInputModeKeyEquivalentModifiersKey</key>
+				<integer>4608</integer>
 				<key>tsInputModeMenuIconFileKey</key>
 				<string>etinput-menu.pdf</string>
 				<key>tsInputModePaletteIconFileKey</key>
@@ -50,7 +57,7 @@
 				<key>tsInputModePrimaryInScriptKey</key>
 				<true/>
 				<key>tsInputModeScriptKey</key>
-				<string>smUnicodeScript</string>
+				<string>smSimpChinese</string>
 			</dict>
 		</dict>
 		<key>tsVisibleInputModeOrderedArrayKey</key>
@@ -82,6 +89,12 @@
 	<true/>
 	<key>TISInputSourceID</key>
 	<string>com.isaac.inputmethod.ETInput</string>
+	<key>tsInputMethodCharacterRepertoireKey</key>
+	<array>
+		<string>Hans</string>
+		<string>Hant</string>
+		<string>Latn</string>
+	</array>
 	<key>tsInputMethodIconFileKey</key>
 	<string>etinput.pdf</string>
 </dict>

@@ -318,7 +318,7 @@ final class CandidateWindow {
             visualPageIndex = clampVisualPage(visualPageIndex, panelWidth: activePanelWidth())
         }
 
-        let bufferOwnsPreedit = BufferModel.shared.enabled
+        let bufferOwnsPreedit = BufferModel.shared.active
         preeditLabel.stringValue = showPreedit && !bufferOwnsPreedit
             ? (ctx.preedit.isEmpty ? ctx.input : ctx.preedit)
             : ""
@@ -414,7 +414,7 @@ final class CandidateWindow {
     }
 
     func performBufferAction() {
-        guard !BufferModel.shared.enabled else {
+        guard !BufferModel.shared.active else {
             IMELog.write("candidate buffer action ignored; already enabled")
             renderCandidates()
             refreshBuffer()
@@ -503,7 +503,7 @@ final class CandidateWindow {
     }
 
     private func refreshInlineBuffer() {
-        let bufferPreedit = BufferModel.shared.enabled
+        let bufferPreedit = BufferModel.shared.active
             ? (currentContext.preedit.isEmpty ? currentContext.input : currentContext.preedit)
             : ""
         let visible = inlineBuffer.refresh(preedit: bufferPreedit)
@@ -530,7 +530,7 @@ final class CandidateWindow {
             ))
         }
 
-        if !BufferModel.shared.enabled {
+        if !BufferModel.shared.active {
             candidateStack.addArrangedSubview(bufferActionButton(width: min(bufferActionWidth(), available)))
         }
     }
@@ -630,7 +630,7 @@ final class CandidateWindow {
 
     private func candidateMaxWidth(panelWidth: CGFloat) -> CGFloat {
         let available = candidateAvailableWidth(panelWidth: panelWidth)
-        let bufferSpace = BufferModel.shared.enabled
+        let bufferSpace = BufferModel.shared.active
             ? 0
             : min(bufferActionWidth(), available) + candidateStack.spacing
         let remaining = available - bufferSpace
@@ -641,7 +641,7 @@ final class CandidateWindow {
         guard !currentContext.candidates.isEmpty else { return [] }
 
         let available = candidateAvailableWidth(panelWidth: panelWidth)
-        let bufferSpace = BufferModel.shared.enabled
+        let bufferSpace = BufferModel.shared.active
             ? 0
             : min(bufferActionWidth(), available) + candidateStack.spacing
         let remaining = available - bufferSpace
