@@ -30,16 +30,26 @@ LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchS
 ./scripts/fetch-rime.sh
 
 # Its OWN Rime user dir (never fights Squirrel over the userdb LevelDB lock).
-# Self-contained: the app deploys its schemas from the BUNDLED SharedSupport
-# (Vendor stock + rime-data/, default 串击 my_serial + 并击 my_combo) into this
-# dir on first launch. Wipe any stale deploy — from an older build or the
-# previous local RimeBuffer — so this install reflects exactly what ships,
-# instead of leftover data (e.g. an old 并击-first default). Set
-# RB_KEEP_USERDB=1 to preserve a prior learned userdb.
+# IMPORT: if you have a live ~/Library/Rime (Squirrel), carry your real config
+# in — your schemes, learned userdb, custom_phrase, lua, dicts — so ETInput uses
+# your actual setup. We then force ETInput's own default.custom.yaml on top so
+# 串击(my_serial) stays the default (your ~/Library/Rime has 并击 first) + 9
+# candidates; everything else you have is preserved. With no ~/Library/Rime, the
+# app deploys from the bundled schemas instead. RB_KEEP_USERDB=1 skips reseeding.
 RB_USER="$HOME/Library/RimeBuffer"
-if [ -d "$RB_USER" ] && [ "${RB_KEEP_USERDB:-0}" != "1" ]; then
-    echo "==> resetting $RB_USER so the app redeploys fresh from the bundle"
-    rm -rf "$RB_USER"
+if [ "${RB_KEEP_USERDB:-0}" != "1" ]; then
+    if [ -d "$HOME/Library/Rime" ]; then
+        echo "==> importing your ~/Library/Rime into $RB_USER (schemes, userdb, custom_phrase, lua…)"
+        rm -rf "$RB_USER"; mkdir -p "$RB_USER"
+        rsync -a --exclude 'sync' --exclude 'build' --exclude '*.log' \
+              --exclude 'installation.yaml' "$HOME/Library/Rime/" "$RB_USER/"
+    else
+        echo "==> no ~/Library/Rime; deploying from the bundled schemas"
+        rm -rf "$RB_USER"; mkdir -p "$RB_USER"
+    fi
+    # Enforce ETInput's default: 串击(my_serial) first + 9 candidates, regardless
+    # of the imported config's own schema order. Your learning/tweaks are kept.
+    cp rime-data/default.custom.yaml "$RB_USER/default.custom.yaml"
 fi
 
 echo "==> swift build ($CONFIG)"

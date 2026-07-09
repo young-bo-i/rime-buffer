@@ -71,9 +71,12 @@ BufferModel.shared.onChange = {
 }
 candidateWindow.refreshBuffer()
 
-// No standalone menu-bar icon: all features live in the SYSTEM input menu via
-// RimeBufferController.menu() (StatusMenu.populate builds it). setHealthy still
-// feeds the health line shown at the top of that menu.
+// Always-visible menu-bar icon: the schema switcher (并击/串击), buffer mode,
+// settings, remote typing, updates and log all live here — so switching schemes
+// never depends on the user having enabled the system "input menu in menu bar".
+// The same menu is ALSO served through the system input menu via
+// RimeBufferController.menu() (both call StatusMenu.populate).
+StatusMenu.shared.install()
 StatusMenu.shared.setHealthy(rimeEngine.isHealthy)
 
 // Auto-update: silently check GitHub Releases on launch + hourly, download in the
