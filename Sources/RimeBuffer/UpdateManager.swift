@@ -49,7 +49,7 @@ enum UpdateStatus: Equatable {
     }
 }
 
-/// Pulls 恩特输入法 (ETInput) releases from GitHub and installs them in place.
+/// Pulls Enter输入法 (ETInput) releases from GitHub and installs them in place.
 ///
 /// Design mirrors Toolbit's UpdateManager (silent check → silent download →
 /// notify → user-confirmed install), but:
@@ -260,7 +260,7 @@ final class UpdateManager {
     func promptAndInstall() {
         guard case let .readyToInstall(version, zip) = status else { return }
         let alert = NSAlert()
-        alert.messageText = "更新到 恩特输入法 v\(version)？"
+        alert.messageText = "更新到 Enter输入法 v\(version)？"
         alert.informativeText = "输入法进程会关闭并以新版本重启。若正在输入，请先完成再更新。"
         alert.addButton(withTitle: "立即更新")
         alert.addButton(withTitle: "稍后")

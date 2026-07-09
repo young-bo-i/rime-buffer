@@ -18,7 +18,7 @@ final class RimeBufferController: IMKInputController {
     private static let duplicateBackspaceCommandWindow: CFTimeInterval = 0.05
     private static let duplicateEnterCommandWindow: CFTimeInterval = 0.05
     private static let duplicateArrowCommandWindow: CFTimeInterval = 0.05
-    private static let bufferEnterHoldDelay: TimeInterval = 2.0
+    private static let bufferEnterHoldDelay: TimeInterval = 1.2
     private static let bufferEnterPollInterval: TimeInterval = 0.02
 
     private var session: UInt64 = 0
@@ -339,6 +339,16 @@ final class RimeBufferController: IMKInputController {
 
     override func didCommand(by selector: Selector!, client sender: Any!) -> Bool {
         guard let selector else { return false }
+        if let keycode = candidateCommandKey(for: selector),
+           candidateWindow.hasCandidates {
+            guard let client = (sender as? IMKTextInput) ?? (self.client() as IMKTextInput?) ?? lastClient else {
+                return true
+            }
+            Self.active = self
+            Self.recent = self
+            lastClient = client
+            return handleCandidateKey(keycode, client: client)
+        }
         if isInsertNewlineSelector(selector) {
             let now = CFAbsoluteTimeGetCurrent()
             if bufferEnterPending
@@ -449,6 +459,22 @@ final class RimeBufferController: IMKInputController {
         }
         if selector == #selector(NSResponder.moveRight(_:)) {
             return 1
+        }
+        return nil
+    }
+
+    private func candidateCommandKey(for selector: Selector) -> Int32? {
+        if selector == #selector(NSResponder.moveLeft(_:)) {
+            return RimeKey.left
+        }
+        if selector == #selector(NSResponder.moveRight(_:)) {
+            return RimeKey.right
+        }
+        if selector == #selector(NSResponder.moveUp(_:)) {
+            return RimeKey.up
+        }
+        if selector == #selector(NSResponder.moveDown(_:)) {
+            return RimeKey.down
         }
         return nil
     }
@@ -845,21 +871,32 @@ final class RimeBufferController: IMKInputController {
     // MARK: Candidate selection (mouse; routed here via `active` from main.swift)
 
     private func handleCandidateKey(_ keycode: Int32, client: IMKTextInput) -> Bool {
-        guard candidateWindow.isVisible else { return false }
+        guard candidateWindow.hasCandidates else { return false }
         switch keycode {
         case RimeKey.left:
             return candidateWindow.moveSelection(delta: -1)
         case RimeKey.right:
             return candidateWindow.moveSelection(delta: 1)
         case RimeKey.down:
+            if candidateWindow.isExpanded {
+                return candidateWindow.moveExpandedSelection(rowDelta: 1)
+            }
+            let pages = previewCandidatePages(maxCount: 3)
+            if pages.count > 1 {
+                IMELog.write("candidate matrix expanded rows=\(pages.count)")
+                return candidateWindow.expand(with: pages)
+            }
             return pageCandidates(delta: 1, client: client)
         case RimeKey.up:
+            if candidateWindow.isExpanded {
+                return candidateWindow.moveExpandedSelection(rowDelta: -1)
+            }
             return pageCandidates(delta: -1, client: client)
         case RimeKey.return:
             return commitRawInput(client: client)
         case 0x20:
-            guard let index = candidateWindow.selectedCandidateIndex else { return false }
-            selectCandidate(onPage: index)
+            guard let selection = candidateWindow.selectedCandidateSelection else { return false }
+            selectCandidate(selection)
             return true
         case 0x30:
             guard !BufferModel.shared.active else { return true }
@@ -884,11 +921,70 @@ final class RimeBufferController: IMKInputController {
         return true
     }
 
-    func selectCandidate(onPage index: Int) {
-        guard session != 0, let client = self.client() else { return }
-        guard rimeEngine.selectCandidate(onPage: index, session: session) else { return }
+    func selectCandidate(_ selection: CandidateSelection) {
+        guard session != 0,
+              let client = (self.client() as IMKTextInput?) ?? lastClient else { return }
+        let moved = moveRimeCandidatePage(delta: selection.pageOffset)
+        guard moved == selection.pageOffset else {
+            _ = moveRimeCandidatePage(delta: -moved)
+            updateUI(client: client)
+            return
+        }
+        guard rimeEngine.selectCandidate(onPage: selection.index, session: session) else {
+            _ = moveRimeCandidatePage(delta: -moved)
+            updateUI(client: client)
+            return
+        }
         drainCommit(client)
         updateUI(client: client)
+    }
+
+    private func previewCandidatePages(maxCount: Int) -> [RimeContextModel] {
+        guard session != 0, maxCount > 0 else { return [] }
+        let current = rimeEngine.getContext(session: session)
+        guard !current.candidates.isEmpty else { return [] }
+
+        var pages = [current]
+        var moved = 0
+        var last = current
+        while pages.count < maxCount, !last.isLastPage {
+            let before = rimeEngine.getContext(session: session)
+            guard rimeEngine.processKey(RimeKey.pageDown, mask: 0, session: session) else { break }
+            let next = rimeEngine.getContext(session: session)
+            guard !sameCandidatePage(before, next) else { break }
+            moved += 1
+            guard !next.candidates.isEmpty else { break }
+            pages.append(next)
+            last = next
+        }
+        if moved > 0 {
+            _ = moveRimeCandidatePage(delta: -moved)
+        }
+        return pages
+    }
+
+    @discardableResult
+    private func moveRimeCandidatePage(delta: Int) -> Int {
+        guard session != 0, delta != 0 else { return 0 }
+        let direction = delta > 0 ? 1 : -1
+        let keycode = direction > 0 ? RimeKey.pageDown : RimeKey.pageUp
+        var moved = 0
+        for _ in 0..<abs(delta) {
+            let before = rimeEngine.getContext(session: session)
+            guard rimeEngine.processKey(keycode, mask: 0, session: session) else { break }
+            let after = rimeEngine.getContext(session: session)
+            guard !sameCandidatePage(before, after) else { break }
+            moved += direction
+        }
+        return moved
+    }
+
+    private func sameCandidatePage(_ lhs: RimeContextModel, _ rhs: RimeContextModel) -> Bool {
+        lhs.pageNo == rhs.pageNo && candidatePageSignature(lhs) == candidatePageSignature(rhs)
+    }
+
+    private func candidatePageSignature(_ ctx: RimeContextModel) -> String {
+        ctx.candidates.map { "\($0.label):\($0.text):\($0.comment)" }.joined(separator: "|")
     }
 
     private func commitRawInput(client: IMKTextInput) -> Bool {
@@ -1072,14 +1168,13 @@ final class RimeBufferController: IMKInputController {
         }
     }
 
-    // MARK: Schema switching (IMK menu + StatusMenu)
+    // MARK: Schema switching (StatusMenu)
 
     override func menu() -> NSMenu! {
-        // The system input menu is the ONE home for all features (方案切换、
-        // 缓冲模式、隔空传字、更新、日志) — same place Sogou/简体拼音 put theirs.
-        let m = NSMenu()
-        StatusMenu.shared.populate(m)
-        return m
+        // Keep the system input-source menu clean. Product controls live in the
+        // dedicated ETInput status item because IMK menu actions are unreliable
+        // across macOS versions and duplicate the status item.
+        nil
     }
 
     /// Set the preferred schema globally: persist it, apply to the live

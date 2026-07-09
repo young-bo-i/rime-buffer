@@ -35,7 +35,7 @@ if CommandLine.arguments.contains("--install") {
 
 // IMK bootstrap. The connection name MUST match Info.plist; IMK finds our
 // controller via InputMethodServerControllerClass = RimeBufferController.
-IMELog.reset("=== 恩特输入法 (ETInput) IME launch ===")
+IMELog.reset("=== Enter输入法 (ETInput) IME launch ===")
 let connectionName = (Bundle.main.infoDictionary?["InputMethodConnectionName"] as? String)
     ?? "ETInput_1_Connection"
 
@@ -54,8 +54,8 @@ _ = rimeEngine.start()
 
 // Mouse-selection routes to whichever controller currently owns focus — the
 // shared window must never bind to one specific controller.
-candidateWindow.onSelect = { index in
-    RimeBufferController.active?.selectCandidate(onPage: index)
+candidateWindow.onSelect = { selection in
+    RimeBufferController.active?.selectCandidate(selection)
 }
 candidateWindow.onSettings = {
     SettingsWindowController.shared.show()
@@ -71,11 +71,8 @@ BufferModel.shared.onChange = {
 }
 candidateWindow.refreshBuffer()
 
-// Always-visible menu-bar icon: the schema switcher (并击/串击), buffer mode,
-// settings, remote typing, updates and log all live here — so switching schemes
-// never depends on the user having enabled the system "input menu in menu bar".
-// The same menu is ALSO served through the system input menu via
-// RimeBufferController.menu() (both call StatusMenu.populate).
+// Always-visible product control. The macOS input-source menu is left for
+// switching input methods; ETInput features live under this single icon.
 StatusMenu.shared.install()
 StatusMenu.shared.setHealthy(rimeEngine.isHealthy)
 
@@ -119,6 +116,9 @@ RemoteTypingService.shared.onPairConfirm = { peerName, sas, proceed in
     alert.addButton(withTitle: "取消")
     NSApp.activate(ignoringOtherApps: true)
     proceed(alert.runModal() == .alertFirstButtonReturn)
+}
+RemoteTypingService.shared.onStatusChange = {
+    SettingsWindowController.shared.remoteStatusDidChange()
 }
 RemoteTypingService.shared.restart()   // starts only if enabled
 NSWorkspace.shared.notificationCenter.addObserver(

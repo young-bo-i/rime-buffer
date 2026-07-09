@@ -7,7 +7,7 @@ config_version: '2025-02-24'
 
 
 # 方案列表
-# ETInput（恩特输入法）自包含发行：默认部署串击(my_serial)+并击(my_combo)。
+# ETInput（Enter输入法）自包含发行：默认部署串击(my_serial)+并击(my_combo)。
 # 其余雾凇方案文件仍随包提供，如需启用取消注释即可（default.custom.yaml 会
 # patch 此列表，两处保持一致，均以 my_serial 为默认首选）。
 schema_list:

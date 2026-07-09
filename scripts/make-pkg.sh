@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# 打包「恩特输入法」为向导式 .pkg 安装器（装到 /Library/Input Methods 并自动注册）。
+# 打包「Enter输入法」为向导式 .pkg 安装器（装到 /Library/Input Methods 并自动注册）。
 #
 #   ./scripts/make-pkg.sh <version> <path-to-ETInput.app> [output.pkg]
 #

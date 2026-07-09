@@ -142,8 +142,13 @@ struct CandidateWindowMetrics {
     }
 }
 
-/// In-process candidate window. Candidates are shown as width-bounded pages in
-/// a compact strip; the first item is always the local "0 Buffer" action.
+struct CandidateSelection {
+    let pageOffset: Int
+    let index: Int
+}
+
+/// In-process candidate window. Candidates default to a compact one-line strip
+/// and can expand into a three-row preview of consecutive Rime pages.
 final class CandidateWindow {
     private static let candidateSpacing: CGFloat = 3
     private static let candidateSeparatorWidth: CGFloat = 8
@@ -151,6 +156,8 @@ final class CandidateWindow {
     private static let barHorizontalPadding: CGFloat = 5
     private static let actionButtonSize: CGFloat = 28
     private static let compactCandidateHorizontalPadding: CGFloat = 6
+    private static let expandedRowSpacing: CGFloat = 3
+    private static let expandedMaxRows = 3
 
     private let panel: NSPanel
     private let root = NSStackView()
@@ -173,21 +180,32 @@ final class CandidateWindow {
     private var currentSignature = ""
     private var selectedIndex = 0
     private var visualPageIndex = 0
+    private var expandedPages: [RimeContextModel] = []
+    private var expandedSelectionPageOffset = 0
     private var bufferOnly = false
     private var lastCaretRect = NSRect.zero
     private var lastBundleId = ""
     private var bufferFlushProgress: Double?
 
-    var onSelect: ((Int) -> Void)?
+    var onSelect: ((CandidateSelection) -> Void)?
     var onSettings: (() -> Void)?
 
     var hasCandidates: Bool { panel.isVisible && !currentContext.candidates.isEmpty }
     var isShowingInlineBuffer: Bool { panel.isVisible && !inlineBuffer.isHidden }
     var isVisible: Bool { panel.isVisible }
+    var isExpanded: Bool { !expandedPages.isEmpty }
     var rawInputForCommit: String { currentContext.input }
-    var selectedCandidateIndex: Int? {
+    var selectedCandidateSelection: CandidateSelection? {
         guard hasCandidates else { return nil }
-        return clamp(selectedIndex, count: currentContext.candidates.count)
+        if isExpanded {
+            let pageOffset = clamp(expandedSelectionPageOffset, count: expandedPages.count)
+            let row = expandedPages[pageOffset].candidates
+            guard !row.isEmpty else { return nil }
+            return CandidateSelection(pageOffset: pageOffset,
+                                      index: clamp(selectedIndex, count: row.count))
+        }
+        return CandidateSelection(pageOffset: 0,
+                                  index: clamp(selectedIndex, count: currentContext.candidates.count))
     }
     private let bufferActionTag = -1000
 
@@ -325,6 +343,7 @@ final class CandidateWindow {
         let signature = contextSignature(ctx)
         let signatureChanged = signature != currentSignature
         if signature != currentSignature {
+            resetExpandedState()
             selectedIndex = clamp(ctx.highlightedIndex, count: ctx.candidates.count)
             currentSignature = signature
         }
@@ -336,6 +355,9 @@ final class CandidateWindow {
             visualPageIndex = pageIndex(containing: selectedIndex, panelWidth: activePanelWidth())
         } else {
             visualPageIndex = clampVisualPage(visualPageIndex, panelWidth: activePanelWidth())
+            if isExpanded {
+                expandedPages[0] = ctx
+            }
         }
 
         let bufferOwnsPreedit = BufferModel.shared.active
@@ -358,6 +380,7 @@ final class CandidateWindow {
         bufferOnly = true
         visualPageIndex = 0
         selectedIndex = 0
+        resetExpandedState()
         currentContext = RimeContextModel()
         currentSignature = ""
         lastCaretRect = caretRect
@@ -374,6 +397,7 @@ final class CandidateWindow {
     func hide() {
         visualPageIndex = 0
         selectedIndex = 0
+        resetExpandedState()
         bufferOnly = false
         currentContext = RimeContextModel()
         currentSignature = ""
@@ -396,6 +420,9 @@ final class CandidateWindow {
             hide()
             return
         }
+        if !currentContext.candidates.isEmpty {
+            renderCandidates()
+        }
         layoutPanel(caretRect: lastCaretRect, bundleId: lastBundleId)
         panel.orderFrontRegardless()
     }
@@ -407,12 +434,77 @@ final class CandidateWindow {
 
     @discardableResult
     func moveSelection(delta: Int) -> Bool {
+        if isExpanded {
+            return moveExpandedSelection(columnDelta: delta)
+        }
         guard !currentContext.candidates.isEmpty else { return false }
         selectedIndex = clamp(selectedIndex + delta, count: currentContext.candidates.count)
         visualPageIndex = pageIndex(containing: selectedIndex, panelWidth: activePanelWidth())
         renderCandidates()
         resetCandidateScroll()
         return true
+    }
+
+    @discardableResult
+    func moveExpandedSelection(rowDelta: Int) -> Bool {
+        guard isExpanded else { return false }
+        if rowDelta < 0, expandedSelectionPageOffset == 0 {
+            return collapseExpanded()
+        }
+        let nextOffset = expandedSelectionPageOffset + rowDelta
+        guard expandedPages.indices.contains(nextOffset) else { return true }
+        expandedSelectionPageOffset = nextOffset
+        selectedIndex = clamp(selectedIndex, count: expandedPages[nextOffset].candidates.count)
+        renderCandidates()
+        resetCandidateScroll()
+        return true
+    }
+
+    @discardableResult
+    func expand(with pages: [RimeContextModel]) -> Bool {
+        let visiblePages = Array(pages.prefix(Self.expandedMaxRows))
+            .filter { !$0.candidates.isEmpty }
+        guard !visiblePages.isEmpty else { return false }
+        expandedPages = visiblePages
+        expandedSelectionPageOffset = min(expandedSelectionPageOffset, expandedPages.count - 1)
+        selectedIndex = clamp(selectedIndex,
+                              count: expandedPages[expandedSelectionPageOffset].candidates.count)
+        renderCandidates()
+        refreshInlineBuffer()
+        layoutPanel(caretRect: lastCaretRect, bundleId: lastBundleId)
+        panel.orderFrontRegardless()
+        return true
+    }
+
+    @discardableResult
+    func collapseExpanded() -> Bool {
+        guard isExpanded else { return false }
+        resetExpandedState()
+        selectedIndex = clamp(selectedIndex, count: currentContext.candidates.count)
+        visualPageIndex = pageIndex(containing: selectedIndex, panelWidth: activePanelWidth())
+        renderCandidates()
+        refreshInlineBuffer()
+        layoutPanel(caretRect: lastCaretRect, bundleId: lastBundleId)
+        panel.orderFrontRegardless()
+        return true
+    }
+
+    private func moveExpandedSelection(columnDelta: Int) -> Bool {
+        guard isExpanded,
+              expandedPages.indices.contains(expandedSelectionPageOffset) else {
+            return false
+        }
+        let row = expandedPages[expandedSelectionPageOffset].candidates
+        guard !row.isEmpty else { return false }
+        selectedIndex = clamp(selectedIndex + columnDelta, count: row.count)
+        renderCandidates()
+        resetCandidateScroll()
+        return true
+    }
+
+    private func resetExpandedState() {
+        expandedPages.removeAll()
+        expandedSelectionPageOffset = 0
     }
 
     @discardableResult
@@ -441,7 +533,7 @@ final class CandidateWindow {
             return
         }
         BufferModel.shared.enabled = true
-        IMELog.write("candidate buffer action -> \(BufferModel.shared.enabled)")
+        IMELog.write("candidate buffer action -> on")
         renderCandidates()
         refreshBuffer()
     }
@@ -452,7 +544,7 @@ final class CandidateWindow {
         let metrics = CandidateWindowMetrics.current
         let width = panelWidth(caretRect: caretRect)
         let bufferHeight = inlineBuffer.isHidden ? 0 : inlineBuffer.preferredHeight + root.spacing
-        let stripHeight = strip.isHidden ? 0 : metrics.compactStripHeight
+        let stripHeight = strip.isHidden ? 0 : stripHeightConstraint.constant
         let height = stripHeight
             + (preeditLabel.isHidden ? 0 : metrics.preeditHeight + root.spacing)
             + bufferHeight
@@ -512,7 +604,11 @@ final class CandidateWindow {
         visualPageIndex = clampVisualPage(visualPageIndex, panelWidth: activePanelWidth())
         candidateScroll.isHidden = false
 
-        renderCompactRow()
+        if isExpanded {
+            renderExpandedMatrix()
+        } else {
+            renderCompactRow()
+        }
         applyAppearance()
         updateCandidateDocumentSize()
     }
@@ -540,6 +636,7 @@ final class CandidateWindow {
             }
             let c = currentContext.candidates[i]
             candidateStack.addArrangedSubview(candidateButton(
+                pageOffset: 0,
                 index: i,
                 candidate: c,
                 highlighted: i == selectedIndex,
@@ -557,7 +654,48 @@ final class CandidateWindow {
         }
     }
 
+    private func renderExpandedMatrix() {
+        candidateStack.orientation = .vertical
+        candidateStack.alignment = .leading
+        candidateStack.spacing = Self.expandedRowSpacing
+
+        let panelWidth = activePanelWidth()
+        let available = candidateAvailableWidth(panelWidth: panelWidth)
+        let pages = expandedPages.isEmpty ? [currentContext] : expandedPages
+        let columnCount = max(1, currentContext.pageSize, pages.map { $0.candidates.count }.max() ?? 1)
+        let separatorWidth = separatorRunWidth() * CGFloat(max(0, columnCount - 1))
+        let cellWidth = max(38, floor((available - separatorWidth) / CGFloat(columnCount)))
+
+        for (pageOffset, page) in pages.prefix(Self.expandedMaxRows).enumerated() {
+            let row = NSStackView()
+            row.orientation = .horizontal
+            row.alignment = .centerY
+            row.spacing = Self.candidateSpacing
+            row.translatesAutoresizingMaskIntoConstraints = false
+            row.widthAnchor.constraint(equalToConstant: available).isActive = true
+            row.heightAnchor.constraint(equalToConstant: compactCandidateButtonHeight(
+                for: CandidateWindowMetrics.current
+            )).isActive = true
+
+            for (index, candidate) in page.candidates.enumerated() {
+                if index > 0 {
+                    row.addArrangedSubview(candidateSeparatorView())
+                }
+                row.addArrangedSubview(candidateButton(
+                    pageOffset: pageOffset,
+                    index: index,
+                    candidate: candidate,
+                    highlighted: pageOffset == expandedSelectionPageOffset && index == selectedIndex,
+                    compact: true,
+                    width: cellWidth
+                ))
+            }
+            candidateStack.addArrangedSubview(row)
+        }
+    }
+
     private func candidateButton(
+        pageOffset: Int,
         index: Int,
         candidate: RimeCandidateModel,
         highlighted: Bool,
@@ -566,7 +704,7 @@ final class CandidateWindow {
         maxWidth: CGFloat? = nil
     ) -> NSButton {
         let button = CandidatePillButton()
-        button.tag = index
+        button.tag = candidateTag(pageOffset: pageOffset, index: index)
         button.target = self
         button.action = #selector(candidateTapped(_:))
         button.attributedTitle = candidateTitle(candidate, highlighted: highlighted)
@@ -651,7 +789,7 @@ final class CandidateWindow {
     }
 
     private func bufferActionCandidate() -> RimeCandidateModel {
-        RimeCandidateModel(text: "B", comment: "开启缓冲区", label: "0")
+        RimeCandidateModel(text: "🅔", comment: "开启缓冲区", label: "0")
     }
 
     private func bufferActionWidth() -> CGFloat {
@@ -730,7 +868,7 @@ final class CandidateWindow {
     private func updateCandidateDocumentSize() {
         let metrics = CandidateWindowMetrics.current
         let fit = candidateStack.fittingSize
-        let height = compactCandidateButtonHeight(for: metrics)
+        let height = candidateAreaHeight(for: metrics)
         candidateStack.setFrameSize(NSSize(width: max(fit.width, candidateScroll.contentSize.width),
                                            height: height))
     }
@@ -754,8 +892,8 @@ final class CandidateWindow {
         preeditLabel.font = .monospacedSystemFont(ofSize: max(12, metrics.preeditHeight - 5),
                                                   weight: .regular)
         preeditHeightConstraint.constant = metrics.preeditHeight
-        stripHeightConstraint.constant = metrics.compactStripHeight
-        candidateHeightConstraint.constant = compactCandidateButtonHeight(for: metrics)
+        stripHeightConstraint.constant = effectiveStripHeight(for: metrics)
+        candidateHeightConstraint.constant = candidateAreaHeight(for: metrics)
         dividerHeightConstraint.constant = dividerHeight(for: metrics)
         let padding = barVerticalPadding(for: metrics)
         barTopConstraint.constant = padding
@@ -763,7 +901,7 @@ final class CandidateWindow {
     }
 
     private func dividerHeight(for metrics: CandidateWindowMetrics) -> CGFloat {
-        min(26, max(20, metrics.compactStripHeight - 10))
+        min(effectiveStripHeight(for: metrics) - 8, max(20, metrics.compactStripHeight - 10))
     }
 
     private func barVerticalPadding(for metrics: CandidateWindowMetrics) -> CGFloat {
@@ -776,6 +914,17 @@ final class CandidateWindow {
         return min(metrics.compactCandidateHeight, max(22, available))
     }
 
+    private func candidateAreaHeight(for metrics: CandidateWindowMetrics) -> CGFloat {
+        let rowHeight = compactCandidateButtonHeight(for: metrics)
+        guard isExpanded else { return rowHeight }
+        let rowCount = max(1, min(Self.expandedMaxRows, expandedPages.count))
+        return CGFloat(rowCount) * rowHeight + CGFloat(max(0, rowCount - 1)) * Self.expandedRowSpacing
+    }
+
+    private func effectiveStripHeight(for metrics: CandidateWindowMetrics) -> CGFloat {
+        max(metrics.compactStripHeight, candidateAreaHeight(for: metrics) + 2 * barVerticalPadding(for: metrics))
+    }
+
     private func contextSignature(_ ctx: RimeContextModel) -> String {
         let candidates = ctx.candidates.map { "\($0.label):\($0.text):\($0.comment)" }.joined(separator: "|")
         return "\(ctx.input)#\(ctx.preedit)#\(ctx.pageNo)#\(candidates)"
@@ -786,14 +935,31 @@ final class CandidateWindow {
         return min(max(index, 0), count - 1)
     }
 
+    private func candidateTag(pageOffset: Int, index: Int) -> Int {
+        pageOffset * 1000 + index
+    }
+
+    private func candidateSelection(from tag: Int) -> CandidateSelection? {
+        guard tag >= 0 else { return nil }
+        return CandidateSelection(pageOffset: tag / 1000, index: tag % 1000)
+    }
+
     @objc private func candidateTapped(_ sender: NSButton) {
         if sender.tag == bufferActionTag {
             performBufferAction()
             return
         }
-        selectedIndex = clamp(sender.tag, count: currentContext.candidates.count)
-        visualPageIndex = pageIndex(containing: selectedIndex, panelWidth: activePanelWidth())
-        onSelect?(selectedIndex)
+        guard let selection = candidateSelection(from: sender.tag) else { return }
+        if isExpanded {
+            guard expandedPages.indices.contains(selection.pageOffset) else { return }
+            expandedSelectionPageOffset = selection.pageOffset
+            selectedIndex = clamp(selection.index,
+                                  count: expandedPages[selection.pageOffset].candidates.count)
+        } else {
+            selectedIndex = clamp(selection.index, count: currentContext.candidates.count)
+            visualPageIndex = pageIndex(containing: selectedIndex, panelWidth: activePanelWidth())
+        }
+        onSelect?(CandidateSelection(pageOffset: selection.pageOffset, index: selectedIndex))
     }
 
     @objc private func settingsTapped() {

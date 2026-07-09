@@ -29,8 +29,8 @@ final class BufferInlineView: NSView {
 
         configureIconButton(flushButton,
                             symbolName: "paperplane.fill",
-                            toolTip: "按住 2 秒发送")
-        flushButton.holdDuration = 2
+                            toolTip: "按住 1.2 秒发送")
+        flushButton.holdDuration = 1.2
         flushButton.target = self
         flushButton.action = #selector(flushTapped)
 
@@ -304,7 +304,7 @@ class FirstMouseButton: NSButton {
 }
 
 final class HoldProgressButton: FirstMouseButton {
-    var holdDuration: TimeInterval = 2
+    var holdDuration: TimeInterval = 1.2
 
     private var holdStartedAt: CFAbsoluteTime = 0
     private var completed = false

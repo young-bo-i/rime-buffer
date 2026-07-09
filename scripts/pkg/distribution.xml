@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <installer-gui-script minSpecVersion="1">
-    <title>恩特输入法 (ETInput)</title>
+    <title>Enter输入法 (ETInput)</title>
     <welcome file="welcome.html" mime-type="text/html"/>
     <readme file="readme.html" mime-type="text/html"/>
     <conclusion file="conclusion.html" mime-type="text/html"/>
@@ -9,7 +9,7 @@
     <choices-outline>
         <line choice="default"/>
     </choices-outline>
-    <choice id="default" title="恩特输入法">
+    <choice id="default" title="Enter输入法">
         <pkg-ref id="com.isaac.inputmethod.ETInput"/>
     </choice>
     <pkg-ref id="com.isaac.inputmethod.ETInput" version="0" onConclusion="none">component.pkg</pkg-ref>

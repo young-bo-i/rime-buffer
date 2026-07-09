@@ -1,5 +1,5 @@
 /* 輸入源顯示名。鍵為 TISInputSourceID / bundle id。 */
-"CFBundleDisplayName" = "恩特輸入法";
-"CFBundleName" = "恩特輸入法";
-"com.isaac.inputmethod.ETInput" = "恩特輸入法";
-"com.isaac.inputmethod.ETInput.Hans" = "恩特輸入法";
+"CFBundleDisplayName" = "Enter输入法";
+"CFBundleName" = "Enter输入法";
+"com.isaac.inputmethod.ETInput" = "Enter输入法";
+"com.isaac.inputmethod.ETInput.Hans" = "Enter输入法";

@@ -1,10 +1,9 @@
 import Cocoa
+import CRimeBridge
 
-/// Menu provider for the SYSTEM input-source menu: RimeBufferController.menu()
-/// calls populate(_:) so all features (schema switching, buffer mode, remote
-/// typing, updates, log, restart) live under the system input menu — the same
-/// place every input method exposes its options. The standalone NSStatusItem
-/// is no longer installed by default (install() kept for debugging).
+/// Menu provider for ETInput's own status-bar control. The system input-source
+/// menu is intentionally left alone; it is for choosing input sources, while
+/// this menu is the product control surface.
 final class StatusMenu: NSObject, NSMenuDelegate {
     static let shared = StatusMenu()
 
@@ -13,14 +12,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     private(set) var schemaName = ""
     private(set) var healthy = true
 
-    /// Schemas to offer — the ones Rime ACTUALLY deployed (not hard-coded), so
-    /// we never present a schema that isn't installed (which would switch the
-    /// session to an empty schema with no candidates). Falls back to a default
-    /// when the engine isn't up yet.
-    static func availableSchemas() -> [(id: String, title: String)] {
-        let list = rimeEngine.schemaList()
-        if list.isEmpty { return [("my_serial", "串击")] }
-        return list.map { ($0.id, $0.name) }
+    private var installLogURL: URL {
+        URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("rimebuffer-install.log")
     }
 
     func install() {
@@ -28,9 +21,6 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         let status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item = status
         refreshButton()
-        // An available/staged update tints the menu-bar icon so it's noticeable
-        // without a nagging alert; the menu itself offers the one-click install.
-        UpdateManager.shared.onChange = { [weak self] in self?.refreshButton() }
         let menu = NSMenu()
         menu.delegate = self
         status.menu = menu
@@ -63,9 +53,9 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         } else {
             button.image = NSImage(
                 systemSymbolName: healthy ? "keyboard.badge.ellipsis" : "keyboard.badge.exclamationmark",
-                accessibilityDescription: "恩特输入法")
+                accessibilityDescription: "Enter输入法")
         }
-        button.contentTintColor = UpdateManager.shared.pendingVersion != nil ? .controlAccentColor : nil
+        button.contentTintColor = nil
     }
 
     // Rebuild on every open so state is always current.
@@ -73,101 +63,14 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         populate(menu)
     }
 
-    /// Build the full feature menu. Shared by the (optional) status item and
-    /// the IMK menu() on the controller, so the system input menu carries
-    /// everything. All targets point at self — IMK keeps the NSMenu object in
-    /// this process and invokes target/action on click (sender may arrive as
-    /// the item or wrapped in a dictionary; handlers unwrap both).
+    /// Keep the menu bar surface as a single entry point. Detailed controls
+    /// live in Settings, not in this tiny dropdown.
     func populate(_ menu: NSMenu) {
         menu.removeAllItems()
-
-        let version = UpdateManager.shared.currentVersion
-        let health = NSMenuItem(
-            title: healthy ? "恩特输入法 v\(version) · \(schemaName.isEmpty ? "就绪" : schemaName)"
-                           : "⚠️ 引擎异常 — 已退化为英文直通",
-            action: nil, keyEquivalent: "")
-        health.isEnabled = false
-        menu.addItem(health)
-        menu.addItem(.separator())
-
-        // Staged update, if any, gets top billing with a one-click install.
-        if UpdateManager.shared.isUpdateReady, let newVersion = UpdateManager.shared.pendingVersion {
-            let update = NSMenuItem(title: "🎉 有新版本 v\(newVersion) — 立即更新",
-                                    action: #selector(installUpdate), keyEquivalent: "")
-            update.target = self
-            menu.addItem(update)
-            menu.addItem(.separator())
-        }
-
-        for schema in Self.availableSchemas() {
-            let mi = NSMenuItem(title: schema.title, action: #selector(chooseSchema(_:)), keyEquivalent: "")
-            mi.target = self
-            mi.representedObject = schema.id
-            mi.state = schemaId == schema.id ? .on : .off
-            menu.addItem(mi)
-        }
-        menu.addItem(.separator())
-
-        let buffer = NSMenuItem(title: "缓冲模式（先暂存再上屏）",
-                                action: #selector(toggleBuffer), keyEquivalent: "")
-        buffer.target = self
-        buffer.state = BufferModel.shared.enabled ? .on : .off
-        menu.addItem(buffer)
 
         let settings = NSMenuItem(title: "设置…", action: #selector(openSettings), keyEquivalent: "")
         settings.target = self
         menu.addItem(settings)
-        menu.addItem(.separator())
-
-        // 隔空传字：把 commit 的文字发到已配对的另一台 Mac。配对靠"请求→同意"，无需配对码。
-        let remote = RemoteTypingService.shared
-        let remoteStatus = NSMenuItem(title: "隔空传字 · \(remote.statusSummary)", action: nil, keyEquivalent: "")
-        remoteStatus.isEnabled = false
-        menu.addItem(remoteStatus)
-
-        let remoteToggle = NSMenuItem(title: "启用隔空传字", action: #selector(toggleRemote), keyEquivalent: "")
-        remoteToggle.target = self
-        remoteToggle.state = RemoteConfig.enabled ? .on : .off
-        menu.addItem(remoteToggle)
-
-        if RemoteConfig.enabled {
-            // 配对新设备：列出发现的、尚未配对的设备，点一下发起请求。
-            let pairSub = NSMenu()
-            let untrusted = remote.status.discovered.filter { !$0.trusted }
-            if untrusted.isEmpty {
-                let none = NSMenuItem(title: "（未发现设备）", action: nil, keyEquivalent: "")
-                none.isEnabled = false
-                pairSub.addItem(none)
-            } else {
-                for p in untrusted {
-                    let mi = NSMenuItem(title: p.name, action: #selector(pairDevice(_:)), keyEquivalent: "")
-                    mi.target = self
-                    mi.representedObject = p.id
-                    pairSub.addItem(mi)
-                }
-            }
-            let pairItem = NSMenuItem(title: "配对新设备", action: nil, keyEquivalent: "")
-            pairItem.submenu = pairSub
-            menu.addItem(pairItem)
-
-            if !remote.status.trusted.isEmpty {
-                let trustedSub = NSMenu()
-                for t in remote.status.trusted {
-                    let mi = NSMenuItem(title: "取消配对：\(t.name)", action: #selector(unpairDevice(_:)), keyEquivalent: "")
-                    mi.target = self
-                    mi.representedObject = t.pubB64
-                    trustedSub.addItem(mi)
-                }
-                let trustedItem = NSMenuItem(title: "已配对设备", action: nil, keyEquivalent: "")
-                trustedItem.submenu = trustedSub
-                menu.addItem(trustedItem)
-            }
-        }
-
-        let remoteName = NSMenuItem(title: "本机名称：\(RemoteConfig.deviceName)",
-                                    action: #selector(setDeviceName), keyEquivalent: "")
-        remoteName.target = self
-        menu.addItem(remoteName)
         menu.addItem(.separator())
 
         let checkUpdate = NSMenuItem(title: "检查更新…", action: #selector(checkUpdate), keyEquivalent: "")
@@ -178,82 +81,25 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         log.target = self
         menu.addItem(log)
 
+        let deploy = NSMenuItem(title: "重新部署并重启", action: #selector(deployAndRestart), keyEquivalent: "")
+        deploy.target = self
+        menu.addItem(deploy)
+
+        let reinstall = NSMenuItem(title: "重新安装输入法…", action: #selector(reinstallInputMethod), keyEquivalent: "")
+        reinstall.target = self
+        menu.addItem(reinstall)
+
         let restart = NSMenuItem(title: "重启输入法进程", action: #selector(restart), keyEquivalent: "")
         restart.target = self
         menu.addItem(restart)
     }
 
-    @objc private func installUpdate() {
-        UpdateManager.shared.promptAndInstall()
+    @objc private func openSettings() {
+        SettingsWindowController.shared.show()
     }
 
     @objc private func checkUpdate() {
         UpdateManager.shared.checkNowManually()
-    }
-
-    // MARK: 隔空传字
-
-    @objc private func toggleRemote() {
-        RemoteConfig.enabled.toggle()
-        if RemoteConfig.enabled { RemoteTypingService.shared.restart() }
-        else { RemoteTypingService.shared.stop() }
-        IMELog.write("remote typing enabled -> \(RemoteConfig.enabled)")
-    }
-
-    /// IMK delivers the clicked item either directly or wrapped in a
-    /// dictionary under IMKCommandMenuItem, depending on macOS version.
-    private func menuItem(from sender: Any?) -> NSMenuItem? {
-        (sender as? NSMenuItem)
-            ?? ((sender as? [String: Any])?["IMKCommandMenuItem"] as? NSMenuItem)
-    }
-
-    @objc private func pairDevice(_ sender: Any?) {
-        // Connects + handshakes; the SAS-confirm dialog (onPairConfirm) pops once
-        // we've reached the peer, then the other Mac shows 同意.
-        guard let id = menuItem(from: sender)?.representedObject as? String else { return }
-        RemoteTypingService.shared.requestPair(peerID: id)
-    }
-
-    @objc private func unpairDevice(_ sender: Any?) {
-        guard let pubB64 = menuItem(from: sender)?.representedObject as? String else { return }
-        RemoteTypingService.shared.unpair(pubB64: pubB64)
-    }
-
-    @objc private func setDeviceName() {
-        guard let name = promptText(
-            title: "本机名称",
-            message: "这个名字会显示在对方 Mac 上。", initial: RemoteConfig.deviceName) else { return }
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty { RemoteConfig.deviceName = trimmed; RemoteTypingService.shared.restart() }
-    }
-
-    private func promptText(title: String, message: String, initial: String) -> String? {
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = message
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
-        field.stringValue = initial
-        alert.accessoryView = field
-        alert.addButton(withTitle: "确定")
-        alert.addButton(withTitle: "取消")
-        NSApp.activate(ignoringOtherApps: true)
-        let response = alert.runModal()
-        alert.window.makeFirstResponder(field)
-        return response == .alertFirstButtonReturn ? field.stringValue : nil
-    }
-
-    @objc private func chooseSchema(_ sender: Any?) {
-        guard let id = menuItem(from: sender)?.representedObject as? String else { return }
-        RimeBufferController.applyPreferredSchema(id)
-    }
-
-    @objc private func toggleBuffer() {
-        BufferModel.shared.enabled.toggle()
-        IMELog.write("buffer mode -> \(BufferModel.shared.enabled)")
-    }
-
-    @objc private func openSettings() {
-        SettingsWindowController.shared.show()
     }
 
     @objc private func openLog() {
@@ -261,10 +107,77 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         NSWorkspace.shared.open(url)
     }
 
-    @objc private func restart() {
-        IMELog.write("user requested restart from status menu")
-        RimeBufferController.active?.forceCommit()   // don't strand a composition
+    @objc private func deployAndRestart() {
+        RimeBufferController.active?.forceCommit()
+        IMELog.write("status menu: deploy requested")
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = rimeEngine.start()
+            let ok = BBRimeDeploy()
+            IMELog.write("status menu: deploy=\(ok), restarting")
+            DispatchQueue.main.async {
+                KeyFrequencyStore.shared.saveNow()
+                exit(0)
+            }
+        }
+    }
+
+    @objc private func reinstallInputMethod() {
+        guard let script = installScriptURL() else {
+            showInfo("找不到 build_install.sh。")
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "重新安装 Enter输入法？"
+        alert.informativeText = "将从 \(script.deletingLastPathComponent().path) 运行 build_install.sh。构建完成后当前输入法进程会被重启。"
+        alert.addButton(withTitle: "重新安装")
+        alert.addButton(withTitle: "取消")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        RimeBufferController.active?.forceCommit()
         KeyFrequencyStore.shared.saveNow()
-        exit(0)   // the system relaunches the IME on demand
+
+        let command = [
+            "cd \(shellQuote(script.deletingLastPathComponent().path))",
+            "nohup /bin/bash ./build_install.sh > \(shellQuote(installLogURL.path)) 2>&1 &",
+        ].joined(separator: " && ")
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-lc", command]
+        do {
+            try process.run()
+            IMELog.write("status menu: launched install script \(script.path)")
+        } catch {
+            showInfo("安装启动失败：\(error.localizedDescription)")
+        }
+    }
+
+    @objc private func restart() {
+        IMELog.write("status menu: restart requested")
+        RimeBufferController.active?.forceCommit()
+        KeyFrequencyStore.shared.saveNow()
+        exit(0)
+    }
+
+    private func installScriptURL() -> URL? {
+        let home = URL(fileURLWithPath: NSHomeDirectory())
+        let candidates = [
+            home.appendingPathComponent("Documents/05-dev/apps/rime-buffer-1/build_install.sh"),
+            home.appendingPathComponent("Documents/DEV/rime-buffer/build_install.sh"),
+            home.appendingPathComponent("Documents/05-dev/apps/rime-buffer/build_install.sh"),
+        ]
+        return candidates.first { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
+    private func shellQuote(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
+    }
+
+    private func showInfo(_ message: String) {
+        let alert = NSAlert()
+        alert.messageText = message
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 }

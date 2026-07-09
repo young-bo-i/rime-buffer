@@ -2,21 +2,25 @@ import Cocoa
 import CRimeBridge
 import UniformTypeIdentifiers
 
-/// Visual settings surface for schema management, appearance/buffer toggles,
-/// and local key-frequency statistics.
+/// Central settings surface for input schemas, candidate UI, buffer mode,
+/// remote typing, and local diagnostics.
 final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     static let shared = SettingsWindowController()
 
     private enum Page: Int, CaseIterable {
-        case schemas
-        case appearance
-        case keyStats
+        case input
+        case candidateWindow
+        case buffer
+        case remote
+        case maintenance
 
         var title: String {
             switch self {
-            case .schemas: return "方案"
-            case .appearance: return "外观与缓冲"
-            case .keyStats: return "按键统计"
+            case .input: return "输入"
+            case .candidateWindow: return "候选窗"
+            case .buffer: return "缓冲区"
+            case .remote: return "隔空传字"
+            case .maintenance: return "维护"
             }
         }
     }
@@ -25,7 +29,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     private let sidebar = NSStackView()
     private let contentHost = NSView()
     private var navButtons: [Page: NSButton] = [:]
-    private var selectedPage: Page = .schemas
+    private var selectedPage: Page = .input
     private var statsObserver: NSObjectProtocol?
 
     private let schemaPopUp = NSPopUpButton()
@@ -38,6 +42,12 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     private let statsTopKey = NSTextField(labelWithString: "")
     private let installStatus = NSTextField(labelWithString: "")
     private let heatmapView = KeyboardHeatmapView()
+    private let remoteCheck = NSButton(checkboxWithTitle: "启用隔空传字", target: nil, action: nil)
+    private let remoteNameField = NSTextField(string: "")
+    private let remoteStatusLabel = NSTextField(labelWithString: "")
+    private let remoteDevicesStack = NSStackView()
+    private var remoteDiscoveredIDs: [String] = []
+    private var remoteTrustedKeys: [String] = []
 
     private var userDir: URL {
         URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/RimeBuffer")
@@ -62,7 +72,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 980, height: 680),
                            styleMask: [.titled, .closable, .resizable],
                            backing: .buffered, defer: false)
-        win.title = "恩特输入法 设置"
+        win.title = "Enter输入法 设置"
         win.isReleasedWhenClosed = false
         win.minSize = NSSize(width: 860, height: 600)
 
@@ -117,7 +127,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            guard self?.selectedPage == .keyStats else { return }
+            guard self?.selectedPage == .maintenance else { return }
             self?.refreshStats()
         }
 
@@ -153,6 +163,17 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         installStatus.textColor = .tertiaryLabelColor
         heatmapView.translatesAutoresizingMaskIntoConstraints = false
         heatmapView.heightAnchor.constraint(greaterThanOrEqualToConstant: 330).isActive = true
+
+        remoteCheck.target = self
+        remoteCheck.action = #selector(remoteToggled)
+        remoteNameField.placeholderString = Host.current().localizedName ?? "Mac"
+        remoteNameField.translatesAutoresizingMaskIntoConstraints = false
+        remoteNameField.widthAnchor.constraint(equalToConstant: 220).isActive = true
+        remoteStatusLabel.font = .systemFont(ofSize: 12)
+        remoteStatusLabel.textColor = .secondaryLabelColor
+        remoteDevicesStack.orientation = .vertical
+        remoteDevicesStack.alignment = .leading
+        remoteDevicesStack.spacing = 6
     }
 
     private func configureCandidateMetricControls() {
@@ -198,9 +219,11 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         contentHost.subviews.forEach { $0.removeFromSuperview() }
         let pageView: NSView
         switch page {
-        case .schemas: pageView = schemaPage()
-        case .appearance: pageView = appearancePage()
-        case .keyStats: pageView = keyStatsPage()
+        case .input: pageView = inputPage()
+        case .candidateWindow: pageView = candidateWindowPage()
+        case .buffer: pageView = bufferPage()
+        case .remote: pageView = remotePage()
+        case .maintenance: pageView = maintenancePage()
         }
         pageView.translatesAutoresizingMaskIntoConstraints = false
         contentHost.addSubview(pageView)
@@ -210,10 +233,11 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
             pageView.topAnchor.constraint(equalTo: contentHost.topAnchor),
             pageView.bottomAnchor.constraint(lessThanOrEqualTo: contentHost.bottomAnchor),
         ])
-        if page == .keyStats { refreshStats() }
+        if page == .maintenance { refreshStats() }
+        if page == .remote { refreshRemoteStatus() }
     }
 
-    private func schemaPage() -> NSView {
+    private func inputPage() -> NSView {
         let importBtn = NSButton(title: "导入方案…", target: self, action: #selector(importSchema))
         let exportBtn = NSButton(title: "导出选中方案…", target: self, action: #selector(exportSchema))
         let deployBtn = NSButton(title: "重新部署并重启", target: self, action: #selector(deployAndRestart))
@@ -227,19 +251,9 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
             "配置目录是 ~/Library/RimeBuffer。导入的方案会自动加入 schema_list；改动配置后点「重新部署并重启」生效。")
         note.font = .systemFont(ofSize: 11)
         note.textColor = .tertiaryLabelColor
-        let reinstallBtn = NSButton(title: "重新安装输入法", target: self, action: #selector(reinstallInputMethod))
-        let openInstallLogBtn = NSButton(title: "打开安装日志", target: self, action: #selector(openInstallLog))
-        let installButtons = NSStackView(views: [reinstallBtn, openInstallLogBtn])
-        installButtons.orientation = .horizontal
-        installButtons.spacing = 8
-        let installNote = NSTextField(wrappingLabelWithString:
-            "从当前源码目录运行 build_install.sh；会重新构建、替换并重启 恩特输入法。")
-        installNote.font = .systemFont(ofSize: 11)
-        installNote.textColor = .tertiaryLabelColor
-
         return contentColumn([
-            title("方案"),
-            caption("管理并击、串击和自定义 Rime schema。"),
+            title("输入"),
+            caption("管理当前 Rime 方案、配置目录和部署。"),
             spacer(8),
             sectionLabel("当前方案"),
             schemaPopUp,
@@ -248,31 +262,60 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
             sectionLabel("配置目录"),
             openDirBtn,
             note,
-            spacer(16),
-            sectionLabel("安装"),
-            installButtons,
-            installStatus,
-            installNote,
         ])
     }
 
-    private func appearancePage() -> NSView {
+    private func candidateWindowPage() -> NSView {
         return contentColumn([
-            title("外观与缓冲"),
-            caption("调整输入法界面外观，以及提交内容是否先进入缓冲区。"),
+            title("候选窗"),
+            caption("调整候选窗主题、尺寸和候选文字密度。"),
             spacer(8),
-            sectionLabel("缓冲区"),
-            bufferCheck,
-            spacer(16),
-            sectionLabel("外观"),
+            sectionLabel("主题"),
             appearancePopUp,
             spacer(16),
-            sectionLabel("候选窗尺寸"),
+            sectionLabel("尺寸与文字"),
             candidateMetricsView(),
         ])
     }
 
-    private func keyStatsPage() -> NSView {
+    private func bufferPage() -> NSView {
+        let note = NSTextField(wrappingLabelWithString:
+            "缓冲区开启后，Rime 提交内容会先进入输入法内部暂存区；按 Enter 手动发送，不会自动清空未确认内容。")
+        note.font = .systemFont(ofSize: 11)
+        note.textColor = .tertiaryLabelColor
+
+        return contentColumn([
+            title("缓冲区"),
+            caption("把提交内容先暂存，再由你确认发送到当前输入框。"),
+            spacer(8),
+            bufferCheck,
+            note,
+        ])
+    }
+
+    private func remotePage() -> NSView {
+        let applyNameBtn = NSButton(title: "应用名称", target: self, action: #selector(applyRemoteName))
+        let nameRow = NSStackView(views: [remoteNameField, applyNameBtn])
+        nameRow.orientation = .horizontal
+        nameRow.alignment = .centerY
+        nameRow.spacing = 8
+
+        return contentColumn([
+            title("隔空传字"),
+            caption("在已配对的 Mac 之间加密同步输入内容。"),
+            spacer(8),
+            remoteCheck,
+            remoteStatusLabel,
+            spacer(12),
+            sectionLabel("本机名称"),
+            nameRow,
+            spacer(16),
+            sectionLabel("设备"),
+            remoteDevicesStack,
+        ])
+    }
+
+    private func maintenancePage() -> NSView {
         let refreshBtn = NSButton(title: "刷新", target: self, action: #selector(refreshStatsTapped))
         let clearDayBtn = NSButton(title: "清空当天", target: self, action: #selector(clearStatsDay))
         let clearAllBtn = NSButton(title: "清空全部", target: self, action: #selector(clearStatsAll))
@@ -281,10 +324,37 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         controls.alignment = .centerY
         controls.spacing = 8
 
+        let checkUpdateBtn = NSButton(title: "检查更新…", target: self, action: #selector(checkUpdate))
+        let openLogBtn = NSButton(title: "打开运行日志", target: self, action: #selector(openRuntimeLog))
+        let restartBtn = NSButton(title: "重启输入法进程", target: self, action: #selector(restartInputMethod))
+        let runtimeButtons = NSStackView(views: [checkUpdateBtn, openLogBtn, restartBtn])
+        runtimeButtons.orientation = .horizontal
+        runtimeButtons.spacing = 8
+
+        let reinstallBtn = NSButton(title: "重新安装输入法", target: self, action: #selector(reinstallInputMethod))
+        let openInstallLogBtn = NSButton(title: "打开安装日志", target: self, action: #selector(openInstallLog))
+        let installButtons = NSStackView(views: [reinstallBtn, openInstallLogBtn])
+        installButtons.orientation = .horizontal
+        installButtons.spacing = 8
+        let installNote = NSTextField(wrappingLabelWithString:
+            "重新安装会从当前源码目录运行 build_install.sh，构建完成后替换并重启输入法进程。")
+        installNote.font = .systemFont(ofSize: 11)
+        installNote.textColor = .tertiaryLabelColor
+
         return contentColumn([
-            title("按键统计"),
-            caption("按天统计本输入法收到的物理按键次数；只保存按键计数，不保存输入内容。"),
+            title("维护"),
+            caption("更新、日志、重启、重新安装和本地诊断。"),
             spacer(8),
+            sectionLabel("运行状态"),
+            runtimeButtons,
+            spacer(12),
+            sectionLabel("安装"),
+            installButtons,
+            installStatus,
+            installNote,
+            spacer(16),
+            sectionLabel("按键统计"),
+            caption("按天统计本输入法收到的物理按键次数；只保存按键计数，不保存输入内容。"),
             controls,
             spacer(8),
             statsSummary,
@@ -329,6 +399,13 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         let l = NSTextField(labelWithString: s)
         l.font = .systemFont(ofSize: 12, weight: .semibold)
         l.textColor = .secondaryLabelColor
+        return l
+    }
+
+    private func secondaryLabel(_ s: String) -> NSTextField {
+        let l = NSTextField(wrappingLabelWithString: s)
+        l.font = .systemFont(ofSize: 11)
+        l.textColor = .tertiaryLabelColor
         return l
     }
 
@@ -414,7 +491,13 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
             appearancePopUp.selectItem(at: idx)
         }
         refreshCandidateMetricControls()
+        refreshRemoteStatus()
         refreshStats()
+    }
+
+    func remoteStatusDidChange() {
+        guard selectedPage == .remote else { return }
+        refreshRemoteStatus()
     }
 
     private func refreshCandidateMetricControls() {
@@ -439,6 +522,50 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
             statsTopKey.stringValue = "最高频：\(KeyboardLayout.displayName(for: top)) · \(count) 次 · \(String(format: "%.1f", ratio))%"
         } else {
             statsTopKey.stringValue = "最高频：暂无"
+        }
+    }
+
+    private func refreshRemoteStatus() {
+        remoteCheck.state = RemoteConfig.enabled ? .on : .off
+        remoteNameField.stringValue = RemoteConfig.deviceName
+        let status = RemoteTypingService.shared.status
+        remoteStatusLabel.stringValue = "状态：\(RemoteTypingService.shared.statusSummary)"
+
+        remoteDevicesStack.arrangedSubviews.forEach {
+            remoteDevicesStack.removeArrangedSubview($0)
+            $0.removeFromSuperview()
+        }
+        remoteDiscoveredIDs.removeAll()
+        remoteTrustedKeys.removeAll()
+
+        guard RemoteConfig.enabled else {
+            remoteDevicesStack.addArrangedSubview(secondaryLabel("开启后会在局域网和附近设备中发现可配对的 Mac。"))
+            return
+        }
+
+        let untrusted = status.discovered.filter { !$0.trusted }
+        if !untrusted.isEmpty {
+            remoteDevicesStack.addArrangedSubview(secondaryLabel("发现的设备"))
+            for peer in untrusted {
+                let button = NSButton(title: "配对：\(peer.name)", target: self, action: #selector(pairRemoteDevice(_:)))
+                button.tag = remoteDiscoveredIDs.count
+                remoteDiscoveredIDs.append(peer.id)
+                remoteDevicesStack.addArrangedSubview(button)
+            }
+        }
+
+        if !status.trusted.isEmpty {
+            remoteDevicesStack.addArrangedSubview(secondaryLabel("已配对设备"))
+            for peer in status.trusted {
+                let button = NSButton(title: "取消配对：\(peer.name)", target: self, action: #selector(unpairRemoteDevice(_:)))
+                button.tag = remoteTrustedKeys.count
+                remoteTrustedKeys.append(peer.pubB64)
+                remoteDevicesStack.addArrangedSubview(button)
+            }
+        }
+
+        if untrusted.isEmpty, status.trusted.isEmpty {
+            remoteDevicesStack.addArrangedSubview(secondaryLabel("尚未发现设备。确认另一台 Mac 已开启隔空传字。"))
         }
     }
 
@@ -562,7 +689,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         }
 
         let alert = NSAlert()
-        alert.messageText = "重新安装 恩特输入法？"
+        alert.messageText = "重新安装 Enter输入法？"
         alert.informativeText = "将从 \(script.deletingLastPathComponent().path) 运行 build_install.sh。构建完成后当前输入法进程会被重启。"
         alert.addButton(withTitle: "重新安装")
         alert.addButton(withTitle: "取消")
@@ -591,6 +718,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     private func installScriptURL() -> URL? {
         let home = URL(fileURLWithPath: NSHomeDirectory())
         let candidates = [
+            home.appendingPathComponent("Documents/05-dev/apps/rime-buffer-1/build_install.sh"),
             home.appendingPathComponent("Documents/DEV/rime-buffer/build_install.sh"),
             home.appendingPathComponent("Documents/05-dev/apps/rime-buffer/build_install.sh"),
         ]
@@ -603,6 +731,36 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
 
     @objc private func bufferToggled() {
         BufferModel.shared.enabled = bufferCheck.state == .on
+    }
+
+    @objc private func remoteToggled() {
+        RemoteConfig.enabled = remoteCheck.state == .on
+        if RemoteConfig.enabled {
+            RemoteTypingService.shared.restart()
+        } else {
+            RemoteTypingService.shared.stop()
+        }
+        IMELog.write("settings: remote typing enabled -> \(RemoteConfig.enabled)")
+        refreshRemoteStatus()
+    }
+
+    @objc private func applyRemoteName() {
+        let trimmed = remoteNameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        RemoteConfig.deviceName = trimmed
+        if RemoteConfig.enabled { RemoteTypingService.shared.restart() }
+        IMELog.write("settings: remote device name -> \(trimmed)")
+        refreshRemoteStatus()
+    }
+
+    @objc private func pairRemoteDevice(_ sender: NSButton) {
+        guard remoteDiscoveredIDs.indices.contains(sender.tag) else { return }
+        RemoteTypingService.shared.requestPair(peerID: remoteDiscoveredIDs[sender.tag])
+    }
+
+    @objc private func unpairRemoteDevice(_ sender: NSButton) {
+        guard remoteTrustedKeys.indices.contains(sender.tag) else { return }
+        RemoteTypingService.shared.unpair(pubB64: remoteTrustedKeys[sender.tag])
     }
 
     @objc private func appearanceChosen() {
@@ -675,6 +833,22 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
 
     @objc private func openDir() {
         NSWorkspace.shared.open(userDir)
+    }
+
+    @objc private func checkUpdate() {
+        UpdateManager.shared.checkNowManually()
+    }
+
+    @objc private func openRuntimeLog() {
+        let url = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("rimebuffer.log")
+        NSWorkspace.shared.open(url)
+    }
+
+    @objc private func restartInputMethod() {
+        RimeBufferController.active?.forceCommit()
+        KeyFrequencyStore.shared.saveNow()
+        IMELog.write("settings: restart requested")
+        exit(0)
     }
 
     @objc private func openInstallLog() {

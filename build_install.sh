@@ -1,5 +1,5 @@
 #!/bin/bash
-# Builds ETInput.app (恩特输入法, an IMK input method) as a SELF-CONTAINED bundle:
+# Builds ETInput.app (Enter输入法, an IMK input method) as a SELF-CONTAINED bundle:
 # librime + the Rime shared data are packaged inside, so no separate Squirrel
 # install is needed. Installs into the per-user Input Methods folder and
 # registers + enables + selects it so it shows in System Settings / the input menu.
@@ -14,7 +14,7 @@
 #     we assemble in a throwaway staging dir and delete it after installing.
 #
 # (The SPM target / source dir stay named "RimeBuffer" — internal codename / repo;
-# the shipped product is ETInput / 恩特输入法.)
+# the shipped product is ETInput / Enter输入法.)
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -86,7 +86,7 @@ if [ -f "Logo/AppIcon.icns" ]; then
     cp "Logo/AppIcon.icns" "$APP_PATH/Contents/Resources/AppIcon.icns"
 fi
 
-# Localized input-source display name (恩特输入法) + the input-mode menu icon.
+# Localized input-source display name (Enter输入法) + the input-mode menu icon.
 # Without the .lproj the source shows its raw id; without the icon it renders as
 # a blank row and won't enable.
 cp -R Resources/*.lproj "$APP_PATH/Contents/Resources/" 2>/dev/null || true
@@ -103,7 +103,8 @@ pkill -x "$EXE" 2>/dev/null || true
 pkill -x RimeBuffer 2>/dev/null || true
 sleep 0.5
 # Any leftover copies in the repo tree or a previous CJK-named install.
-for stray in "恩特输入法.app" "ETInput.app" "RimeBuffer.app" \
+for stray in "Enter输入法.app" "恩特输入法.app" "ETInput.app" "RimeBuffer.app" \
+             "$HOME/Library/Input Methods/Enter输入法.app" \
              "$HOME/Library/Input Methods/恩特输入法.app" \
              "$HOME/Library/Input Methods/RimeBuffer.app"; do
     if [ -e "$stray" ]; then
@@ -132,7 +133,7 @@ cat <<EOF
 
 ==> done. Installed a single ASCII-named bundle and self-enabled it.
 
-If 恩特输入法 doesn't appear in the input menu (⌃Space) immediately, run:
+If Enter输入法 doesn't appear in the input menu (⌃Space) immediately, run:
   killall TextInputMenuAgent SystemUIServer
 (or log out / back in once). Then switch to it and type 'nihao' -> 你好.
 

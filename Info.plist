@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
-	<string>恩特输入法</string>
+	<string>Enter输入法</string>
 	<key>CFBundleExecutable</key>
 	<string>ETInput</string>
 	<key>CFBundleIconFile</key>
@@ -15,7 +15,7 @@
 	<key>CFBundleIdentifier</key>
 	<string>com.isaac.inputmethod.ETInput</string>
 	<key>CFBundleName</key>
-	<string>恩特输入法</string>
+	<string>Enter输入法</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -82,7 +82,7 @@
 		<string>_etinput._tcp</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>恩特输入法用局域网直连，把你打的字即时发送到已配对的另一台 Mac。</string>
+	<string>Enter输入法用局域网直连，把你打的字即时发送到已配对的另一台 Mac。</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 	<key>TICapsLockLanguageSwitchCapable</key>
