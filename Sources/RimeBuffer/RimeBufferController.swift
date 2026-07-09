@@ -39,6 +39,8 @@ final class RimeBufferController: IMKInputController {
     private var bufferEnterHardwareKeyCode: CGKeyCode = 36
     private var bufferEnterStartedAt: CFAbsoluteTime = 0
     private var bufferEnterPollTimer: Timer?
+    private var candidateOptionSelecting = false
+    private var candidateOptionClient: IMKTextInput?
     private let composition = CompositionSession()
     private let chord = ChordController()
 
@@ -58,6 +60,7 @@ final class RimeBufferController: IMKInputController {
 
     deinit {
         resetBufferEnterGesture()
+        resetCandidateOptionGesture()
         chord.invalidate()
         if session != 0 { rimeEngine.destroySession(session) }
     }
@@ -118,6 +121,7 @@ final class RimeBufferController: IMKInputController {
         // IMK sometimes passes a nil/non-client sender here — fall back to
         // client() (Squirrel-proven) so live marked text never strands.
         resetBufferEnterGesture()
+        resetCandidateOptionGesture()
         resolveComposition(client: (sender as? IMKTextInput) ?? (self.client() as IMKTextInput?))
         Self.recent = self
         if Self.active === self { Self.active = nil }
@@ -137,6 +141,7 @@ final class RimeBufferController: IMKInputController {
     /// Commit-on-blur: flush the chord, commit what Rime holds, close the
     /// marked-text session. Safe to call redundantly.
     private func resolveComposition(client: IMKTextInput?) {
+        resetCandidateOptionGesture()
         chord.flush()
         guard session != 0 else { return }
         if let client {
@@ -213,6 +218,14 @@ final class RimeBufferController: IMKInputController {
             return true
         }
         if handleBufferEnter(keycode, mask: mask, client: client, hardwareKeyCode: event.keyCode) {
+            return true
+        }
+        if candidateOptionSelecting {
+            if mask == 0 {
+                _ = handleCandidateKey(keycode, client: client)
+            } else {
+                _ = handleCandidateOptionSelectionKey(keycode, client: client)
+            }
             return true
         }
         if mask == 0 {
@@ -582,6 +595,120 @@ final class RimeBufferController: IMKInputController {
         CGEventSource.keyState(.combinedSessionState, key: bufferEnterHardwareKeyCode)
     }
 
+    @discardableResult
+    private func beginCandidateOptionSelection(client: IMKTextInput) -> Bool {
+        if candidateOptionSelecting { return true }
+        guard candidateWindow.hasCandidates,
+              let candidateText = candidateWindow.selectedCandidateText,
+              candidateWindow.beginSingleCharacterSelection(candidateText: candidateText) else {
+            return false
+        }
+        candidateOptionSelecting = true
+        candidateOptionClient = client
+        Self.active = self
+        Self.recent = self
+        lastClient = client
+        IMELog.write("candidate option selection started text='\(candidateText)'")
+        return true
+    }
+
+    private func resetCandidateOptionGesture() {
+        candidateOptionSelecting = false
+        candidateOptionClient = nil
+        candidateWindow.cancelSingleCharacterSelection()
+    }
+
+    private func finishCandidateOptionSelection(client: IMKTextInput?, source: String) {
+        guard candidateOptionSelecting else { return }
+        let resolvedClient = client ?? candidateOptionClient ?? (self.client() as IMKTextInput?) ?? lastClient
+        IMELog.write("candidate option released by \(source); commit selected character")
+        _ = commitSelectedSingleCharacter(client: resolvedClient, source: source)
+        resetCandidateOptionGesture()
+    }
+
+    private func handleCandidateOptionSelectionKey(_ keycode: Int32, client: IMKTextInput) -> Bool {
+        guard candidateOptionSelecting || candidateWindow.isSingleCharacterSelectionActive else { return false }
+        switch keycode {
+        case RimeKey.left:
+            return candidateWindow.moveSingleCharacterSelection(delta: -1)
+        case RimeKey.right:
+            return candidateWindow.moveSingleCharacterSelection(delta: 1)
+        case RimeKey.space, RimeKey.return:
+            finishCandidateOptionSelection(client: client, source: "candidate key")
+            return true
+        case RimeKey.escape:
+            resetCandidateOptionGesture()
+            return true
+        default:
+            return true
+        }
+    }
+
+    @discardableResult
+    private func commitCandidateSpaceTap(client: IMKTextInput?, source: String) -> Bool {
+        let resolvedClient = client ?? (self.client() as IMKTextInput?) ?? lastClient
+        if let resolvedClient {
+            Self.active = self
+            Self.recent = self
+            lastClient = resolvedClient
+        }
+        guard let selection = candidateWindow.selectedCandidateSelection else {
+            if let resolvedClient {
+                return processRimeKey(RimeKey.space, mask: 0, client: resolvedClient)
+            }
+            return true
+        }
+        IMELog.write("candidate space \(source); commit pageOffset=\(selection.pageOffset) index=\(selection.index)")
+        selectCandidate(selection)
+        return true
+    }
+
+    @discardableResult
+    private func commitSelectedSingleCharacter(client: IMKTextInput?, source: String) -> Bool {
+        let resolvedClient = client ?? (self.client() as IMKTextInput?) ?? lastClient
+        if let resolvedClient {
+            Self.active = self
+            Self.recent = self
+            lastClient = resolvedClient
+        }
+        guard let text = candidateWindow.selectedSingleCharacterText, !text.isEmpty else {
+            return commitCandidateSpaceTap(client: resolvedClient, source: "\(source) fallback")
+        }
+
+        if session != 0 {
+            rimeEngine.clearComposition(session: session)
+        }
+
+        if BufferModel.shared.active {
+            BufferModel.shared.append(text)
+            if let resolvedClient {
+                composition.clear(client: resolvedClient)
+            } else {
+                composition.markCleared()
+            }
+            IMELog.write("candidate single-character '\(text)' -> buffer by \(source) (\(BufferModel.shared.blocks.count) blocks)")
+        } else if let resolvedClient {
+            Delivery.insert(text, into: resolvedClient)
+            composition.commitDidInsert()
+            RemoteTypingService.shared.send(text)
+            IMELog.write("candidate single-character '\(text)' -> \(bundleId(of: resolvedClient)) by \(source)")
+        } else {
+            IMELog.write("candidate single-character '\(text)' dropped by \(source); no client")
+            composition.markCleared()
+            return true
+        }
+
+        BufferModel.shared.compositionActive = false
+        if let resolvedClient {
+            updateUI(client: resolvedClient)
+        } else if BufferModel.shared.shouldDisplay {
+            candidateWindow.refreshBuffer()
+        } else {
+            candidateWindow.hide()
+        }
+        return true
+    }
+
     private func performBufferEnter(client: IMKTextInput?, source: String) -> Bool {
         let resolvedClient = client ?? (self.client() as IMKTextInput?) ?? lastClient
         if let resolvedClient {
@@ -733,6 +860,7 @@ final class RimeBufferController: IMKInputController {
         switch event.keyCode {
         case 36, 76: return RimeKey.return
         case 48:     return RimeKey.tab
+        case 49:     return RimeKey.space
         case 50:
             // grave/backtick. Ctrl+grave & Ctrl+Shift+grave are the user's
             // switcher hotkeys (Rime matches keysym `grave`); a plain Shift+`
@@ -805,6 +933,23 @@ final class RimeBufferController: IMKInputController {
             return false
         }
 
+        if changes.contains(.option) {
+            if modifiers.contains(.option) {
+                if beginCandidateOptionSelection(client: client) {
+                    lastModifiers = modifiers
+                    return true
+                }
+            } else if candidateOptionSelecting {
+                finishCandidateOptionSelection(client: client, source: "option release")
+                lastModifiers = modifiers
+                return true
+            }
+        }
+        if candidateOptionSelecting {
+            lastModifiers = modifiers
+            return true
+        }
+
         var keyCode = event.keyCode
         if RimeKey.fromVirtualKeyCode(keyCode) == nil,
            let inferred = RimeKey.changedModifierKeyCode(from: changes) {
@@ -872,6 +1017,9 @@ final class RimeBufferController: IMKInputController {
 
     private func handleCandidateKey(_ keycode: Int32, client: IMKTextInput) -> Bool {
         guard candidateWindow.hasCandidates else { return false }
+        if candidateOptionSelecting || candidateWindow.isSingleCharacterSelectionActive {
+            return handleCandidateOptionSelectionKey(keycode, client: client)
+        }
         switch keycode {
         case RimeKey.left:
             return candidateWindow.moveSelection(delta: -1)
@@ -894,7 +1042,7 @@ final class RimeBufferController: IMKInputController {
             return pageCandidates(delta: -1, client: client)
         case RimeKey.return:
             return commitRawInput(client: client)
-        case 0x20:
+        case RimeKey.space:
             guard let selection = candidateWindow.selectedCandidateSelection else { return false }
             selectCandidate(selection)
             return true

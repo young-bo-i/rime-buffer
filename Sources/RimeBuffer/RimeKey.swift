@@ -15,6 +15,7 @@ enum RimeKey {
     static let tab: Int32 = 0xff09
     static let `return`: Int32 = 0xff0d
     static let escape: Int32 = 0xff1b
+    static let space: Int32 = 0x20
     static let deleteForward: Int32 = 0xffff
     static let home: Int32 = 0xff50
     static let left: Int32 = 0xff51

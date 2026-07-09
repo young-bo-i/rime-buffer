@@ -158,6 +158,7 @@ final class CandidateWindow {
     private static let compactCandidateHorizontalPadding: CGFloat = 6
     private static let expandedRowSpacing: CGFloat = 3
     private static let expandedMaxRows = 3
+    private static let characterSelectionTagBase = 200_000
 
     private let panel: NSPanel
     private let root = NSStackView()
@@ -182,6 +183,8 @@ final class CandidateWindow {
     private var visualPageIndex = 0
     private var expandedPages: [RimeContextModel] = []
     private var expandedSelectionPageOffset = 0
+    private var characterSelectionText = ""
+    private var characterSelectionIndex = 0
     private var bufferOnly = false
     private var lastCaretRect = NSRect.zero
     private var lastBundleId = ""
@@ -194,7 +197,25 @@ final class CandidateWindow {
     var isShowingInlineBuffer: Bool { panel.isVisible && !inlineBuffer.isHidden }
     var isVisible: Bool { panel.isVisible }
     var isExpanded: Bool { !expandedPages.isEmpty }
+    var isSingleCharacterSelectionActive: Bool { !characterSelectionText.isEmpty }
     var rawInputForCommit: String { currentContext.input }
+    var selectedCandidateText: String? {
+        guard hasCandidates else { return nil }
+        if isExpanded {
+            let pageOffset = clamp(expandedSelectionPageOffset, count: expandedPages.count)
+            let row = expandedPages[pageOffset].candidates
+            guard !row.isEmpty else { return nil }
+            return row[clamp(selectedIndex, count: row.count)].text
+        }
+        guard !currentContext.candidates.isEmpty else { return nil }
+        return currentContext.candidates[clamp(selectedIndex, count: currentContext.candidates.count)].text
+    }
+    var selectedSingleCharacterText: String? {
+        guard isSingleCharacterSelectionActive else { return nil }
+        let chars = Array(characterSelectionText)
+        guard !chars.isEmpty else { return nil }
+        return String(chars[clamp(characterSelectionIndex, count: chars.count)])
+    }
     var selectedCandidateSelection: CandidateSelection? {
         guard hasCandidates else { return nil }
         if isExpanded {
@@ -344,6 +365,7 @@ final class CandidateWindow {
         let signatureChanged = signature != currentSignature
         if signature != currentSignature {
             resetExpandedState()
+            resetCharacterSelectionState()
             selectedIndex = clamp(ctx.highlightedIndex, count: ctx.candidates.count)
             currentSignature = signature
         }
@@ -381,6 +403,7 @@ final class CandidateWindow {
         visualPageIndex = 0
         selectedIndex = 0
         resetExpandedState()
+        resetCharacterSelectionState()
         currentContext = RimeContextModel()
         currentSignature = ""
         lastCaretRect = caretRect
@@ -398,6 +421,7 @@ final class CandidateWindow {
         visualPageIndex = 0
         selectedIndex = 0
         resetExpandedState()
+        resetCharacterSelectionState()
         bufferOnly = false
         currentContext = RimeContextModel()
         currentSignature = ""
@@ -430,6 +454,42 @@ final class CandidateWindow {
     func setBufferFlushProgress(_ progress: Double?) {
         bufferFlushProgress = progress
         inlineBuffer.setFlushProgress(progress)
+    }
+
+    @discardableResult
+    func beginSingleCharacterSelection(candidateText: String) -> Bool {
+        let chars = Array(candidateText)
+        guard chars.count > 1 else { return false }
+        resetExpandedState()
+        characterSelectionText = candidateText
+        characterSelectionIndex = 0
+        renderCandidates()
+        refreshInlineBuffer()
+        layoutPanel(caretRect: lastCaretRect, bundleId: lastBundleId)
+        panel.orderFrontRegardless()
+        return true
+    }
+
+    @discardableResult
+    func moveSingleCharacterSelection(delta: Int) -> Bool {
+        guard isSingleCharacterSelectionActive else { return false }
+        let chars = Array(characterSelectionText)
+        guard !chars.isEmpty else { return false }
+        characterSelectionIndex = clamp(characterSelectionIndex + delta, count: chars.count)
+        renderCandidates()
+        resetCandidateScroll()
+        return true
+    }
+
+    func cancelSingleCharacterSelection() {
+        guard isSingleCharacterSelectionActive else { return }
+        resetCharacterSelectionState()
+        selectedIndex = clamp(selectedIndex, count: currentContext.candidates.count)
+        visualPageIndex = pageIndex(containing: selectedIndex, panelWidth: activePanelWidth())
+        renderCandidates()
+        refreshInlineBuffer()
+        layoutPanel(caretRect: lastCaretRect, bundleId: lastBundleId)
+        panel.orderFrontRegardless()
     }
 
     @discardableResult
@@ -505,6 +565,11 @@ final class CandidateWindow {
     private func resetExpandedState() {
         expandedPages.removeAll()
         expandedSelectionPageOffset = 0
+    }
+
+    private func resetCharacterSelectionState() {
+        characterSelectionText = ""
+        characterSelectionIndex = 0
     }
 
     @discardableResult
@@ -604,7 +669,9 @@ final class CandidateWindow {
         visualPageIndex = clampVisualPage(visualPageIndex, panelWidth: activePanelWidth())
         candidateScroll.isHidden = false
 
-        if isExpanded {
+        if isSingleCharacterSelectionActive {
+            renderSingleCharacterSelectionRow()
+        } else if isExpanded {
             renderExpandedMatrix()
         } else {
             renderCompactRow()
@@ -694,6 +761,30 @@ final class CandidateWindow {
         }
     }
 
+    private func renderSingleCharacterSelectionRow() {
+        candidateStack.orientation = .horizontal
+        candidateStack.alignment = .centerY
+        candidateStack.spacing = Self.candidateSpacing
+
+        let chars = Array(characterSelectionText)
+        guard !chars.isEmpty else { return }
+
+        for (index, char) in chars.enumerated() {
+            if index > 0 {
+                candidateStack.addArrangedSubview(candidateSeparatorView())
+            }
+            candidateStack.addArrangedSubview(candidateButton(
+                pageOffset: 0,
+                index: index,
+                candidate: RimeCandidateModel(text: String(char), comment: "", label: ""),
+                highlighted: index == characterSelectionIndex,
+                compact: true,
+                width: nil,
+                tag: Self.characterSelectionTagBase + index
+            ))
+        }
+    }
+
     private func candidateButton(
         pageOffset: Int,
         index: Int,
@@ -701,10 +792,11 @@ final class CandidateWindow {
         highlighted: Bool,
         compact: Bool,
         width: CGFloat?,
-        maxWidth: CGFloat? = nil
+        maxWidth: CGFloat? = nil,
+        tag: Int? = nil
     ) -> NSButton {
         let button = CandidatePillButton()
-        button.tag = candidateTag(pageOffset: pageOffset, index: index)
+        button.tag = tag ?? candidateTag(pageOffset: pageOffset, index: index)
         button.target = self
         button.action = #selector(candidateTapped(_:))
         button.attributedTitle = candidateTitle(candidate, highlighted: highlighted)
@@ -732,11 +824,13 @@ final class CandidateWindow {
         let textColor = highlighted ? RimeUI.selectedCandidateColor : RimeUI.textPrimary
         let baseline = (metrics.candidateFontSize - metrics.labelFontSize) / 2
 
-        line.append(NSAttributedString(
-            string: "\(c.label.isEmpty ? "" : c.label) ",
-            attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: metrics.labelFontSize, weight: .semibold),
-                         .foregroundColor: labelColor,
-                         .baselineOffset: baseline]))
+        if !c.label.isEmpty {
+            line.append(NSAttributedString(
+                string: "\(c.label) ",
+                attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: metrics.labelFontSize, weight: .semibold),
+                             .foregroundColor: labelColor,
+                             .baselineOffset: baseline]))
+        }
         line.append(NSAttributedString(
             string: c.text,
             attributes: [.font: NSFont.systemFont(ofSize: metrics.candidateFontSize,
@@ -916,7 +1010,7 @@ final class CandidateWindow {
 
     private func candidateAreaHeight(for metrics: CandidateWindowMetrics) -> CGFloat {
         let rowHeight = compactCandidateButtonHeight(for: metrics)
-        guard isExpanded else { return rowHeight }
+        guard isExpanded, !isSingleCharacterSelectionActive else { return rowHeight }
         let rowCount = max(1, min(Self.expandedMaxRows, expandedPages.count))
         return CGFloat(rowCount) * rowHeight + CGFloat(max(0, rowCount - 1)) * Self.expandedRowSpacing
     }
@@ -947,6 +1041,13 @@ final class CandidateWindow {
     @objc private func candidateTapped(_ sender: NSButton) {
         if sender.tag == bufferActionTag {
             performBufferAction()
+            return
+        }
+        if isSingleCharacterSelectionActive, sender.tag >= Self.characterSelectionTagBase {
+            let chars = Array(characterSelectionText)
+            characterSelectionIndex = clamp(sender.tag - Self.characterSelectionTagBase,
+                                            count: chars.count)
+            renderCandidates()
             return
         }
         guard let selection = candidateSelection(from: sender.tag) else { return }
