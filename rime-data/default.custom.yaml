@@ -1,0 +1,6 @@
+patch:
+  schema_list:
+    - schema: my_serial         # 串击（默认）
+    - schema: my_combo          # 并击
+  menu:
+    page_size: 9                # 候选词个数

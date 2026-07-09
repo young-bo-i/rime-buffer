@@ -13,8 +13,13 @@ final class RimeEngine {
 
     // Prefer the app's OWN bundled data + librime (self-contained install, no
     // Squirrel needed); fall back to a system Squirrel install for dev builds
-    // run outside the .app.
+    // run outside the .app. RIMEBUFFER_SHARED_DIR/RIMEBUFFER_FRAMEWORKS_DIR let
+    // the CLI smoke harness point at a staged bundle without a full .app.
     private let sharedDataDir: String = {
+        if let override = ProcessInfo.processInfo.environment["RIMEBUFFER_SHARED_DIR"],
+           !override.isEmpty {
+            return override
+        }
         if let ss = Bundle.main.sharedSupportPath,
            FileManager.default.fileExists(atPath: ss + "/default.yaml") {
             return ss
@@ -22,6 +27,10 @@ final class RimeEngine {
         return RimeEngine.squirrelShared
     }()
     private let frameworksDir: String = {
+        if let override = ProcessInfo.processInfo.environment["RIMEBUFFER_FRAMEWORKS_DIR"],
+           !override.isEmpty {
+            return override
+        }
         if let fw = Bundle.main.privateFrameworksPath,
            FileManager.default.fileExists(atPath: fw + "/librime.1.dylib") {
             return fw

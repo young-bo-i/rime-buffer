@@ -70,6 +70,9 @@ jobs:
           cp Info.plist "$APP/Contents/Info.plist"
           cp -R Vendor/rime/Frameworks/* "$APP/Contents/Frameworks/"
           cp -R Vendor/rime/SharedSupport/* "$APP/Contents/SharedSupport/"
+          # Overlay our schemas (雾凇 rime_ice + 串击 my_serial 默认 + 并击 my_combo)
+          # so a fresh install deploys the real schemas, not just luna_pinyin.
+          cp -R rime-data/* "$APP/Contents/SharedSupport/"
           [ -f Logo/AppIcon.icns ] && cp Logo/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns" || true
           cp -R Resources/*.lproj "$APP/Contents/Resources/" 2>/dev/null || true   # localized display name
           cp Resources/etinput.pdf "$APP/Contents/Resources/" 2>/dev/null || true  # colored brand icon (Settings row)

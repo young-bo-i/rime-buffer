@@ -29,15 +29,17 @@ LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchS
 # Fetch the bundled librime runtime (cached in Vendor/, not committed to git).
 ./scripts/fetch-rime.sh
 
-# Its OWN Rime user dir so it never fights Squirrel over the userdb LevelDB lock.
-# If a live ~/Library/Rime exists (Squirrel installed), seed from it so custom
-# schemas carry over; otherwise the app deploys from the bundled SharedSupport on
-# first run. Re-run `rm -rf ~/Library/RimeBuffer` to reseed.
+# Its OWN Rime user dir (never fights Squirrel over the userdb LevelDB lock).
+# Self-contained: the app deploys its schemas from the BUNDLED SharedSupport
+# (Vendor stock + rime-data/, default 串击 my_serial + 并击 my_combo) into this
+# dir on first launch. Wipe any stale deploy — from an older build or the
+# previous local RimeBuffer — so this install reflects exactly what ships,
+# instead of leftover data (e.g. an old 并击-first default). Set
+# RB_KEEP_USERDB=1 to preserve a prior learned userdb.
 RB_USER="$HOME/Library/RimeBuffer"
-if [ ! -d "$RB_USER/build" ] && [ -d "$HOME/Library/Rime" ]; then
-    echo "==> seeding $RB_USER from ~/Library/Rime"
-    rm -rf "$RB_USER"; mkdir -p "$RB_USER"
-    rsync -a --exclude 'sync' "$HOME/Library/Rime/" "$RB_USER/"
+if [ -d "$RB_USER" ] && [ "${RB_KEEP_USERDB:-0}" != "1" ]; then
+    echo "==> resetting $RB_USER so the app redeploys fresh from the bundle"
+    rm -rf "$RB_USER"
 fi
 
 echo "==> swift build ($CONFIG)"
@@ -61,6 +63,13 @@ printf 'APPL????' > "$APP_PATH/Contents/PkgInfo"
 # Bundle the self-contained runtime: librime + plugins + Rime shared data.
 cp -R Vendor/rime/Frameworks/* "$APP_PATH/Contents/Frameworks/"
 cp -R Vendor/rime/SharedSupport/* "$APP_PATH/Contents/SharedSupport/"
+
+# Overlay OUR Rime schemas (雾凇 rime_ice base + 串击 my_serial 默认 + 并击 my_combo,
+# 及 cn_dicts/en_dicts/lua/opencc/custom_phrase) onto the stock SharedSupport so a
+# fresh install deploys the real schemas — not just default luna_pinyin. This is
+# what makes 串击/并击 work WITHOUT a separate Squirrel/~/Library/Rime. The secret
+# rime_ai.local.json is intentionally NOT bundled (only rime_ai.example.json).
+cp -R rime-data/* "$APP_PATH/Contents/SharedSupport/"
 
 # App icon, if it's been generated.
 if [ -f "Logo/AppIcon.icns" ]; then

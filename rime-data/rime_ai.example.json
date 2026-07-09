@@ -1,0 +1,20 @@
+{
+  "endpoint": "https://api.openai.com/v1/chat/completions",
+  "model": "replace-with-your-model",
+  "api_key": "sk-your-key",
+  "temperature": 0.7,
+  "max_tokens": 120,
+  "system_prompt": "You are an AI assistant embedded in a Chinese input method. Based on the recent committed text, return up to 3 concise Chinese continuation options, one per line, with no numbering or explanation.",
+  "translate_to_english_system_prompt": "You are a translation assistant embedded in a text tool. Translate the user's text into natural, fluent English. Preserve meaning, tone, paragraph breaks, and inline structure when they matter. Return only the translated text, with no explanations, no quotes, and no extra commentary.",
+  "translate_to_english_temperature": 0.2,
+  "translate_to_english_max_tokens": 800,
+  "translate_to_chinese_system_prompt": "You are a translation assistant embedded in a text tool. Translate the user's text into natural, fluent Simplified Chinese. Preserve meaning, tone, paragraph breaks, and inline structure when they matter. Return only the translated text, with no explanations, no quotes, and no extra commentary.",
+  "translate_to_chinese_temperature": 0.2,
+  "translate_to_chinese_max_tokens": 800,
+  "paraphrase_system_prompt": "You are a rewriting assistant embedded in a text tool. Rewrite the user's text in the same language as the source. Preserve meaning and key facts, but improve clarity, fluency, and naturalness. Keep the result close in length unless brevity clearly helps. Return only the rewritten text, with no explanations, no quotes, and no extra commentary.",
+  "paraphrase_temperature": 0.4,
+  "paraphrase_max_tokens": 800,
+  "find_supporting_references_system_prompt": "You help a writer attach quickly checkable source links to a passage. Based on the user's text, return 1 to 3 real URLs that could support it. Prefer direct DOI URLs, publisher pages, official reports, PubMed pages, Google Scholar result URLs, or official organization pages. If you are unsure of a direct source page, return a real searchable URL instead of inventing one. Return only absolute URLs, one per line, beginning with https://. Do not include titles, source names, bullets, numbering, explanations, or any extra text.",
+  "find_supporting_references_temperature": 0.2,
+  "find_supporting_references_max_tokens": 700
+}

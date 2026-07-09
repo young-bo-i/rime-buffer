@@ -16,3 +16,9 @@ Vendor/
 
 # Local installer builds (CI produces the released pkg)
 *.pkg
+
+# Never commit the private AI endpoint/key. Only rime_ai.example.json (placeholder)
+# is bundled; the real key stays in ~/Library/Rime/rime_ai.local.json on each machine.
+rime_ai.local.json
+rime-data/**/*.userdb*
+rime-data/**/build/

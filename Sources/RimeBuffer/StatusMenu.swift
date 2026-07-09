@@ -19,7 +19,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     /// when the engine isn't up yet.
     static func availableSchemas() -> [(id: String, title: String)] {
         let list = rimeEngine.schemaList()
-        if list.isEmpty { return [("luna_pinyin", "朙月拼音")] }
+        if list.isEmpty { return [("my_serial", "串击")] }
         return list.map { ($0.id, $0.name) }
     }
 
