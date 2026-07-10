@@ -13,7 +13,7 @@ cd "$(dirname "$0")/.."
 VERSION="${1:?用法: make-pkg.sh <version> <ETInput.app> [out.pkg]}"
 APP="${2:?缺少 ETInput.app 路径}"
 OUT="${3:-ETInput-${VERSION}.pkg}"
-IDENT="com.isaac.inputmethod.ETInput"
+IDENT="com.isaac.inputmethod.RimeBuffer"
 
 [ -d "$APP" ] || { echo "!! 找不到 $APP"; exit 1; }
 

@@ -6,11 +6,21 @@
 
 **接手开发者：先读 [ARCHITECTURE.md](ARCHITECTURE.md)**——交接版全局架构，含模块规格、关键契约、实测修正（v2：marked-text 会话常驻）、P1' 任务清单与验收标准。
 
+## 安装
+
+普通用户优先下载 GitHub Release 里的 `ETInput-版本号.pkg`，双击按向导安装。安装器会把
+`ETInput.app` 放进 `/Library/Input Methods`，并在当前登录用户会话里自动注册、启用、尝试切换到
+「Enter输入法」。
+
+开发者本机调试再用脚本：
+
 ```bash
-./build_install.sh                # 构建+安装+注册
+./build_install.sh                # 构建+安装到当前用户+注册
 .build/release/RimeBuffer smoke   # 免安装引擎自检
 tail -f ~/rimebuffer.log          # 行为日志
 ```
+
+如果安装后输入菜单暂时没刷新，先运行 `killall TextInputMenuAgent SystemUIServer`，仍看不到再注销重登一次。
 
 ## 发布 / 自动更新
 

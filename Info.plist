@@ -13,7 +13,7 @@
 	<key>CFBundleIconName</key>
 	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.isaac.inputmethod.ETInput</string>
+	<string>com.isaac.inputmethod.RimeBuffer</string>
 	<key>CFBundleName</key>
 	<string>Enter输入法</string>
 	<key>CFBundlePackageType</key>
@@ -28,14 +28,16 @@
 	<dict>
 		<key>tsInputModeListKey</key>
 		<dict>
-			<key>com.isaac.inputmethod.ETInput.Hans</key>
+			<key>com.isaac.inputmethod.RimeBuffer</key>
 			<dict>
 				<key>TISInputSourceID</key>
-				<string>com.isaac.inputmethod.ETInput.Hans</string>
+				<string>com.isaac.inputmethod.RimeBuffer</string>
 				<key>TISIntendedLanguage</key>
 				<string>zh-Hans</string>
 				<key>tsInputModeAlternateMenuIconFileKey</key>
 				<string>etinput-menu.pdf</string>
+				<key>tsInputModeAlternateMenuTitleKey</key>
+				<string>Enter输入法</string>
 				<key>tsInputModeCharacterRepertoireKey</key>
 				<array>
 					<string>Hans</string>
@@ -57,12 +59,12 @@
 				<key>tsInputModePrimaryInScriptKey</key>
 				<true/>
 				<key>tsInputModeScriptKey</key>
-				<string>smSimpChinese</string>
+				<string>smUnicodeScript</string>
 			</dict>
 		</dict>
 		<key>tsVisibleInputModeOrderedArrayKey</key>
 		<array>
-			<string>com.isaac.inputmethod.ETInput.Hans</string>
+			<string>com.isaac.inputmethod.RimeBuffer</string>
 		</array>
 	</dict>
 	<key>InputMethodConnectionName</key>
@@ -88,7 +90,7 @@
 	<key>TICapsLockLanguageSwitchCapable</key>
 	<true/>
 	<key>TISInputSourceID</key>
-	<string>com.isaac.inputmethod.ETInput</string>
+	<string>com.isaac.inputmethod.RimeBuffer</string>
 	<key>tsInputMethodCharacterRepertoireKey</key>
 	<array>
 		<string>Hans</string>

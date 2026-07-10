@@ -148,7 +148,11 @@ NSApplication.shared.run()
 /// Must run inside the login session (see call site). Mirrors Squirrel's
 /// RegisterInputSource + ActivateInputSource.
 func installInputSource() {
-    let modeID = "com.isaac.inputmethod.ETInput.Hans"
+    // Product name is ETInput / Enter输入法, but the input-source id intentionally
+    // stays on the legacy RimeBuffer id. macOS stores this id in protected TIS
+    // preferences, so changing it leaves existing users with stale, hard-to-edit
+    // rows and can hide the newly installed input method.
+    let modeID = "com.isaac.inputmethod.RimeBuffer"
     // Register THIS bundle's URL so the input-source id resolves to this exact
     // copy (kills the "duplicate id at multiple paths → blank row" problem).
     let status = TISRegisterInputSource(Bundle.main.bundleURL as CFURL)

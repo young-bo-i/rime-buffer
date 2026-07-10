@@ -37,6 +37,7 @@ if [ -n "$login_user" ] && [ "$login_user" != "root" ]; then
     login_uid="$(/usr/bin/id -u "$login_user")"
     /bin/launchctl asuser "$login_uid" /usr/bin/sudo -u "$login_user" /usr/bin/killall ETInput 2>/dev/null || true
     /bin/launchctl asuser "$login_uid" /usr/bin/sudo -u "$login_user" "$EXE" --install 2>/dev/null || true
+    /bin/launchctl asuser "$login_uid" /usr/bin/sudo -u "$login_user" /usr/bin/open "$APP" 2>/dev/null || true
 fi
 
 exit 0

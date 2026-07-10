@@ -22,6 +22,15 @@ jobs:
       - name: Swift version
         run: swift --version
 
+      # Catch malformed input-source/package metadata before the release-only
+      # workflow tries to assemble an installer.
+      - name: Validate installer metadata
+        run: |
+          plutil -lint Info.plist
+          xmllint --noout scripts/pkg/distribution.xml
+          bash -n scripts/make-pkg.sh
+          bash -n scripts/pkg/scripts/postinstall
+
       # librime is dlopen'd at runtime (see CRimeBridge.cpp), so the build has no
       # link-time dependency on Squirrel — a stock runner compiles it cleanly.
       - name: Build (debug)

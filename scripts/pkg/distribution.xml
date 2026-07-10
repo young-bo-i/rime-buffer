@@ -10,7 +10,7 @@
         <line choice="default"/>
     </choices-outline>
     <choice id="default" title="Enter输入法">
-        <pkg-ref id="com.isaac.inputmethod.ETInput"/>
+        <pkg-ref id="com.isaac.inputmethod.RimeBuffer"/>
     </choice>
-    <pkg-ref id="com.isaac.inputmethod.ETInput" version="0" onConclusion="none">component.pkg</pkg-ref>
+    <pkg-ref id="com.isaac.inputmethod.RimeBuffer" version="0" onConclusion="none">component.pkg</pkg-ref>
 </installer-gui-script>
