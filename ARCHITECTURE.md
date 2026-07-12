@@ -17,7 +17,7 @@
 | 进程模型 | **单进程**。IMK 输入法进程内：dlopen librime、键路由、候选窗、buffer、菜单。**禁止任何跨进程 IPC**（前身项目的 state.json 轮询是事故根源，已废除） |
 | 引擎 | dlopen Squirrel 自带的 `librime.1.dylib` + lua/octagram/predict 插件；用户配置复用（见 §2） |
 | 上屏 | 只经 `client.insertText`（IMK 一等公民通道，网页/Electron/原生通吃） |
-| 已验证 | 引擎链路 smoke 通过（my_serial 打 nihao→9候选→上屏「你好」）；.app 可安装可注册可打中文 |
+| 已验证 | 引擎 smoke 覆盖四方案列表、F4、雾凇拼音上屏，以及英文补全/空格/生词兜底；.app 可安装可注册可输入 |
 | 实测遗留 | 3 个现场 bug（§4），根因已定位，修复规格已写好（§9 P1'），**这是接手者的第一批任务** |
 | 兜底 | Squirrel 保持安装不动，用户随时切回；引擎宕机时输入法自动退化为原生 latin 直通 |
 
@@ -34,7 +34,7 @@
 
 ### 1.2 目标（按优先级）
 
-1. **P1 日常可打**：用户两个活跃方案（my_combo 并击 / my_serial 串击）在 Safari、Electron、终端全部正常；候选窗自绘；insertText 上屏；引擎宕机不砸打字。
+1. **P1 日常可打**：并击、自然码双拼、雾凇拼音、英文四方案在 Safari、Electron、终端全部正常；候选窗自绘；insertText 上屏；引擎宕机不砸打字。
 2. **P2 buffer 平台**：提交文字可先落缓冲面板，编辑/暂存后再冲刷到目标框。
 3. **P3 语音 + AI**：在 buffer 上做听写和 AI 变换。
 4. **P4 转正**：进程内自部署（改配置不用开 Squirrel）、per-app 精调、签名公证、设为默认。
@@ -53,8 +53,8 @@
 
 | 项 | 值 | 对实现的约束 |
 |---|---|---|
-| 活跃方案 | `my_combo`（并击，chord_composer）+ `my_serial`（串击，顺序输入） | chord 子系统**只对 my_combo 生效**（schema_id 门控） |
-| 默认方案 | my_combo | 状态菜单需显示并可切换 |
+| 用户可见方案 | `my_combo`（并击）/ `double_pinyin`（自然码）/ `rime_ice`（雾凇拼音）/ `english`（英文） | 只有这四项进入 schema_list 与 F4；melt_eng/radical_pinyin 只作隐藏依赖 |
+| 默认方案 | my_combo | 系统输入法菜单需能进入设置并切换 |
 | `page_size` | **9**（default.custom.yaml patch；default.yaml 原值 5） | 候选窗渲染 `menu.page_size` 行，**不许硬编码** |
 | `chord_duration` | **0.05s**（squirrel.custom.yaml，用户特调"减少单击被吞"） | chord 重放定时器**从部署后的 squirrel 配置读**，不许硬编码 0.10 |
 | 方案切换热键 | **F4 / Control+grave / Control+Shift+grave**（default.yaml switcher） | 键位表必须映射 F 键与 grave；切换器以**候选形式**渲染（就是一页候选），候选窗必须能正确显示它 |
@@ -106,14 +106,14 @@
 ```
 ┌─ RimeBuffer.app (IMK 输入法进程, LSBackgroundOnly + .accessory) ─────────────┐
 │                                                                              │
-│  main.swift ── IMKServer 引导 · 引擎预热 · 菜单/StatusItem 安装               │
+│  main.swift ── IMKServer 引导 · 引擎预热 · 系统输入法菜单状态                  │
 │                                                                              │
 │  RimeBufferController (IMKInputController, 每个客户端一个实例)                │
 │    │  键路由: keysym 映射 → processRimeKey → commit drain → UI 更新           │
 │    ├─ CompositionSession   ★v2 组字协议(marked text 常驻, inline/placeholder) │
 │    ├─ ChordController      并击重放(仅 my_combo; duration 读配置=0.05s)       │
 │    ├─ CandidateWindow      自绘候选窗(NSPanel, 定位链见 §5.5)                 │
-│    ├─ StatusMenu           IMK menu() + NSStatusItem(方案切换/健康/重载)      │
+│    ├─ StatusMenu           IMK menu() 构建器(设置/健康/更新/重载)             │
 │    ├─ FocusObserver        失焦强制 flush chord + 提交/清组字                 │
 │    └─ Delivery             唯一上屏出口 insertText                            │
 │                                                                              │
@@ -179,14 +179,18 @@
 - **duration 从配置读**：`BBRimeConfigGetDouble("squirrel", "chord_duration")`，用户=0.05s；读不到才退 0.10。
 - flush 时机：非 chord 键按下前 / `deactivateServer` / `commitComposition` 前 / FocusObserver 触发。flush 期间**强持有** client 引用。
 
-### 5.7 StatusMenu ★新模块 — 状态：❌ 待实现（P1'）
+### 5.7 StatusMenu — 状态：✅ 系统输入法菜单单入口
 
-用户明确要求"从状态栏或哪里进去的菜单"。双通道：
+只使用 macOS 已有的输入法专属位置，不再创建独立 `NSStatusItem`。`RimeBufferController.menu()`
+每次打开系统输入法菜单时返回最新 `NSMenu`；设置、更新检查、日志、重新部署、重新安装与重启
+均放在这里，引擎异常则在菜单顶部显示禁用的警告行。
 
-1. **IMK `menu()`**（主）：重写 `IMKInputController.menu()`——条目出现在系统输入法菜单（国旗/图标下拉，Squirrel 的"部署/同步"就在这）。条目：方案切换（并击 my_combo / 串击 my_serial，勾选当前）、简繁、中英、重载配置、打开日志、关于/健康状态。
-2. **NSStatusItem**（辅）：常驻状态栏图标，镜像同一菜单 + 引擎健康 pill（"引擎异常—已退化英文，建议切回 Squirrel"）。IMK menu() 在个别系统版本抽风时用户仍有入口。
+InputMethodKit 会把菜单命令经 `doCommandBySelector:commandDictionary:` 发回当前
+`IMKInputController`，因此每个条目的 target/action 必须落在当前 `RimeBufferController`，再转发给
+`StatusMenu` 的共享操作。不要把 action 只挂到菜单单例上——旧实现曾因此出现菜单可见但动作在部分
+macOS 版本不可靠。`Info.plist` 的 `etinput-menu.pdf` 继续负责系统输入法位置的图标。
 
-方案切换实现：`select_schema(session)` 立即生效 + UserDefaults 记 `preferredSchema`，各控制器 `activateServer` 时若当前 schema ≠ preferred 则切换（体感全局）。
+方案切换只经 F4。Rime 内切换成功后把 schema id 记为 `preferredSchema`，各控制器激活时恢复该选择；设置页复选框只管理 F4 的 `schema_list`。
 
 ### 5.8 FocusObserver — 状态：❌ 待实现（P1'，规模缩小）
 
@@ -218,7 +222,7 @@ v1 里它是"无 marked 模式"的救生员；v2 有 marked 会话后 IMK 的 `c
 - **vtable 顺序 load-bearing**；`RIME_STRUCT_INIT` 每个 Rime 结构体必做（data_size 版本协商）。
 - keysym：X11/ibus 体系。修饰 mask：shift 1<<0 / lock 1<<1 / ctrl 1<<2 / alt 1<<3 / super 1<<6 / **release 1<<30**。特殊键 0xff08(BS) 0xff09(Tab) 0xff0d(CR) 0xff1b(Esc) 0xff51–54(箭头) 0xff55/56(翻页) 0xffe1–ec(修饰) **0xffbe+n(Fn)**；可打印 0x20–0x7e 原码直传。
 - 线程：IMK 键回调在主线程；P1 全部 librime 调用留主线程 + **watchdog**（单次 process_key/get_context >250ms 记日志定 Lua 嫌疑）。gMutex 不可重入。
-- IMK 注册：Info.plist 的 `InputMethodConnectionName`（`RimeBuffer_1_Connection`，与旧原型区分）/ `InputMethodServerControllerClass=RimeBufferController`（对应 `@objc(RimeBufferController)`）/ `ComponentInputModeDict` 挂 `com.isaac.inputmethod.RimeBuffer`。IMKServer 引用存顶层变量保活；为 nil 时大声记日志退出，不留僵尸输入源。
+- IMK 注册：bundle id=`com.isaac.inputmethod.RimeBuffer`，可选择 mode id=`com.isaac.inputmethod.RimeBuffer.Hans`（父/子 TIS id 必须不同），`InputMethodConnectionName=RimeBuffer_1_Connection`，`InputMethodServerControllerClass=RimeBufferController`（对应 `@objc(RimeBufferController)`）。父输入法不声明 repertoire，使 TIS 保持标准的 ASCII-capable parent；只有中文 child mode 声明 `Hans/Hant`，且不可含 `Latn`。底层键盘布局遵循 `squirrel.yaml`：`last`/空值不 override，`default` 才映射 ABC。重装/更新必须先选到 ABC 等 fallback，等旧 controller 正常 deactivate 后才能 kill/swap bundle；macOS 26 程序化切源漏发 deactivate 时，再由 TIS change notification 兜底收尾。IMKServer 引用存顶层变量保活；为 nil 时大声记日志退出，不留僵尸输入源。
 - 日志 `~/rimebuffer.log`（IMELog）。**每个修复都要先能在日志里看见**（哪个键、哪个 client、走了哪条路径）——这是无 GUI 调试的生命线。
 
 ---
@@ -235,7 +239,7 @@ rime-buffer/
 │   ├── include/CRimeBridge.h  ✅ C 接口 + BBRimeContext/BBRimeStatus 结构
 │   └── CRimeBridge.cpp        ✅ vtable/dlopen/健康门控/结构体 API   ▶P1'加 ConfigGetDouble
 └── Sources/RimeBuffer/
-    ├── main.swift             ✅ smoke 分支 + IMK 引导            ▶P1'加 StatusMenu 安装
+    ├── main.swift             ✅ smoke 分支 + IMK 引导（不创建独立 StatusItem）
     ├── RimeEngine.swift       ✅ 可实例化封装
     ├── RimeKey.swift          ✅ keysym/mask 表                  ▶P1'补 F1-F12、grave
     ├── RimeModels.swift       ✅ RimeContextModel/RimeStatusModel
@@ -245,11 +249,12 @@ rime-buffer/
     ├── Log.swift              ✅
     ├── CompositionSession.swift  ✅ v2 组字协议(inline/placeholder)
     ├── ChordController.swift     ✅ duration 读配置(用户 0.05s)
-    ├── StatusMenu.swift          ✅ NSStatusItem + IMK menu() 双入口
+    ├── StatusMenu.swift          ✅ IMK menu() 单入口 + 菜单操作协调
     ├── (FocusObserver)           ✅ 以 main.swift 的 NSWorkspace 观察器实现(forceCommit+藏窗)
     ├── BufferModel.swift          ✅ P2 缓冲模型(append-only 块/手动冲刷/不自动丢内容)
     ├── BufferSurface.swift        ✅ P2 底部暂存条(被动显示/块 chips/发送到输入框/清空)
-    ├── SettingsWindow.swift       ✅ 可视化设置 v1(方案列表/导入+自动进 schema_list/导出/部署重启/缓冲配置)
+    ├── SettingsWindow.swift       ✅ 四方案复选框/F4 列表/部署重启/候选窗与缓冲配置
+    ├── InputSchemaCatalog.swift   ✅ 四方案产品目录 + schema_list 安全读写
     └── [P3+] AIOps/CaretLocator/精细 Deploy
 
 **键路由铁则补充(实测 bug 修正)**：Cmd 按住的 keyDown 一律直通 App(先 forceCommit 再放行)——
@@ -268,13 +273,14 @@ cd ~/Documents/05-dev/apps/rime-buffer
 ./build_install.sh                 # 构建+签名+安装+注册（幂等）
 # 启用（一次性）：系统设置→键盘→输入法→编辑→＋→简体中文→RimeBuffer→添加
 tail -f ~/rimebuffer.log           # 行为日志
-.build/release/RimeBuffer smoke    # 免安装引擎自检(打 nihao 应出 9 候选+上屏你好)
+.build/release/RimeBuffer smoke    # 四方案/F4/中文/英文引擎自检
+.build/release/RimeBuffer schema-smoke  # 设置页 schema_list 读写自检
 rm -rf ~/Library/RimeBuffer && ./build_install.sh   # 用户改了 Rime 配置后 reseed
 pkill -x RimeBuffer                # 系统会按需重新拉起
 # 卸载：rm -rf ~/Library/Input\ Methods/RimeBuffer.app && 输入源列表移除
 ```
 
-已踩坑速查：签名用 ad-hoc（后台 shell 取不到自签身份私钥 `errSecInternalComponent`；trusted 身份留到 P4 公证）· 我方 Bash 沙盒里 `open` GUI app 会假失败，装完由系统拉起或用户双击 · smoke 若 0 候选先查 schema 是否 my_serial/my_combo（rime_ice 只是基座没独立部署）以及 userdb LOCK。
+已踩坑速查：签名用 ad-hoc（后台 shell 取不到自签身份私钥 `errSecInternalComponent`；trusted 身份留到 P4 公证）· 我方 Bash 沙盒里 `open` GUI app 会假失败，装完由系统拉起或用户双击 · smoke 若 0 候选先查四方案是否已部署以及 userdb LOCK。
 
 ---
 
@@ -294,11 +300,11 @@ pkill -x RimeBuffer                # 系统会按需重新拉起
 | 1 | CompositionSession：marked text 常驻（inline 默认 + placeholder per-app） | 微信打 zuoye→空格：**只出现「作业」，无字母残留**；组字串内联可见带下划线 |
 | 2 | 候选窗定位链接入 marked 会话 caret rect | 候选窗贴在光标正下方，Safari/微信/终端一致；不再沉底 |
 | 3 | RimeKey 补 F1–F12 + grave；确认 Ctrl+Shift+3 通路 | **F4 弹出方案选单**（候选窗渲染），可选到并击；Ctrl+Shift+3 切标点生效 |
-| 4 | ChordController 抽出 + duration 读配置(0.05s) + my_combo 实测 | 并击单击不被吞、连击成词；串击方案无合成 release（日志验证） |
-| 5 | StatusMenu（IMK menu + NSStatusItem） | 菜单可见；点击切方案立即生效且跨 App 记忆 |
+| 4 | ChordController 抽出 + duration 读配置(0.05s) + my_combo 实测 | 并击单击不被吞、连击成词；其他方案无合成 release（日志验证） |
+| 5 | StatusMenu（仅 IMK menu） | 无重复状态栏图标；系统输入法菜单可见且操作可用 |
 | 6 | 兜底收口 + watchdog | kill -STOP 模拟引擎挂：打字退化英文不丢键；日志出现 watchdog 行 |
 
-**P1 总闸**：用户以 RimeBuffer 为唯一输入法工作一整天（Squirrel 不卸载仅待命），并击/串击/翻页/简繁/标点全程无需切回。
+**P1 总闸**：用户以 RimeBuffer 为唯一输入法工作一整天（Squirrel 不卸载仅待命），四方案/F4/翻页/简繁/标点全程无需切回。
 
 ### P2 buffer / P3 语音+AI / P4 转正
 

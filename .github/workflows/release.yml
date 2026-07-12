@@ -26,6 +26,27 @@ jobs:
         with:
           xcode-version: latest-stable
 
+      - name: Validate input-source metadata
+        run: |
+          plutil -lint Info.plist
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' Info.plist)
+          PARENT_ID=$(/usr/libexec/PlistBuddy -c 'Print :TISInputSourceID' Info.plist)
+          MODE_ID=$(/usr/libexec/PlistBuddy -c 'Print :ComponentInputModeDict:tsVisibleInputModeOrderedArrayKey:0' Info.plist)
+          DECLARED_MODE_ID=$(/usr/libexec/PlistBuddy -c "Print :ComponentInputModeDict:tsInputModeListKey:${MODE_ID}:TISInputSourceID" Info.plist)
+          CONNECTION=$(/usr/libexec/PlistBuddy -c 'Print :InputMethodConnectionName' Info.plist)
+          CHILD_REPERTOIRE=$(/usr/libexec/PlistBuddy -c "Print :ComponentInputModeDict:tsInputModeListKey:${MODE_ID}:tsInputModeCharacterRepertoireKey" Info.plist | tr -d '[:space:]')
+          test "$PARENT_ID" = "$BUNDLE_ID"
+          test "$PARENT_ID" != "$MODE_ID"
+          test "$MODE_ID" = "$DECLARED_MODE_ID"
+          test "$CONNECTION" = 'RimeBuffer_1_Connection'
+          test "$CHILD_REPERTOIRE" = 'Array{HansHant}'
+          if /usr/libexec/PlistBuddy -c 'Print :tsInputMethodCharacterRepertoireKey' Info.plist >/dev/null 2>&1; then
+            echo 'Parent input method must not declare a repertoire; only the Hans child mode does.'
+            exit 1
+          fi
+          bash -n build_install.sh
+          bash -n scripts/pkg/scripts/postinstall
+
       - name: Resolve version
         id: version
         run: |
@@ -70,8 +91,9 @@ jobs:
           cp Info.plist "$APP/Contents/Info.plist"
           cp -R Vendor/rime/Frameworks/* "$APP/Contents/Frameworks/"
           cp -R Vendor/rime/SharedSupport/* "$APP/Contents/SharedSupport/"
-          # Overlay our schemas (雾凇 rime_ice + 串击 my_serial 默认 + 并击 my_combo)
-          # so a fresh install deploys the real schemas, not just luna_pinyin.
+          find "$APP/Contents/SharedSupport" -maxdepth 1 -type f -name '*.schema.yaml' -delete
+          # Overlay the four product schemas plus their hidden dictionaries and
+          # reverse-lookup dependencies so a fresh install is self-contained.
           cp -R rime-data/* "$APP/Contents/SharedSupport/"
           [ -f Logo/AppIcon.icns ] && cp Logo/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns" || true
           cp -R Resources/*.lproj "$APP/Contents/Resources/" 2>/dev/null || true   # localized display name

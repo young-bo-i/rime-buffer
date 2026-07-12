@@ -12,19 +12,43 @@ APP="/Library/Input Methods/ETInput.app"
 EXE="$APP/Contents/MacOS/ETInput"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 login_user="$(/usr/bin/stat -f%Su /dev/console)"
+user_home=""
+login_uid=""
+/usr/bin/xattr -cr "$APP" 2>/dev/null || true
+
+# The payload is already present, but the old input-method process can still be
+# serving clients from its previous inode. Before unregistering either user- or
+# system-level copies, move the session to ABC so those clients receive a normal
+# deactivate and discard their old IMK document connection.
+if [ -n "$login_user" ] && [ "$login_user" != "root" ]; then
+    login_uid="$(/usr/bin/id -u "$login_user")"
+    user_home="$(/usr/bin/dscl . -read "/Users/$login_user" NFSHomeDirectory 2>/dev/null | /usr/bin/awk '{print $2}')"
+    [ -n "$user_home" ] || exit 1
+    /bin/launchctl asuser "$login_uid" /usr/bin/sudo -u "$login_user" "$EXE" --prepare-update > "$user_home/rimebuffer-install.log" 2>&1 || exit 1
+    /bin/sleep 0.5
+fi
 
 # Remove any stale USER-level copy of the same input-source id. Two bundles at
 # different paths claiming one id poisons TIS/LaunchServices name+icon lookup and
 # yields a blank/greyed picker row — the exact bug this whole thing hit.
 if [ -n "$login_user" ] && [ "$login_user" != "root" ]; then
-    user_home="$(/usr/bin/dscl . -read "/Users/$login_user" NFSHomeDirectory 2>/dev/null | /usr/bin/awk '{print $2}')"
-    if [ -n "$user_home" ] && [ -e "$user_home/Library/Input Methods/ETInput.app" ]; then
-        "$LSREGISTER" -u "$user_home/Library/Input Methods/ETInput.app" 2>/dev/null || true
-        /bin/rm -rf "$user_home/Library/Input Methods/ETInput.app"
+    if [ -n "$user_home" ]; then
+        for stale in "$user_home/Library/Input Methods/ETInput.app" \
+                     "$user_home/Library/Input Methods/RimeBuffer.app" \
+                     "$user_home/Library/Input Methods/Enter输入法.app" \
+                     "$user_home/Library/Input Methods/恩特输入法.app"; do
+            [ -e "$stale" ] || continue
+            stale_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$stale/Contents/Info.plist" 2>/dev/null || true)"
+            case "$stale_id" in
+                com.isaac.inputmethod.RimeBuffer|com.isaac.inputmethod.ETInput)
+                    "$LSREGISTER" -u "$stale" 2>/dev/null || true
+                    /bin/rm -rf "$stale"
+                    ;;
+            esac
+        done
     fi
 fi
 
-/usr/bin/xattr -cr "$APP" 2>/dev/null || true
 "$LSREGISTER" -f "$APP" 2>/dev/null || true
 
 # Stop any running instance, then self-install as the login user: the app's
@@ -34,9 +58,12 @@ fi
 # enable half-lands (parent enabled, input mode not). `launchctl asuser`
 # targets the console user's GUI session so all three calls persist.
 if [ -n "$login_user" ] && [ "$login_user" != "root" ]; then
-    login_uid="$(/usr/bin/id -u "$login_user")"
     /bin/launchctl asuser "$login_uid" /usr/bin/sudo -u "$login_user" /usr/bin/killall ETInput 2>/dev/null || true
-    /bin/launchctl asuser "$login_uid" /usr/bin/sudo -u "$login_user" "$EXE" --install 2>/dev/null || true
+    /bin/launchctl asuser "$login_uid" /usr/bin/sudo -u "$login_user" /usr/bin/killall RimeBuffer 2>/dev/null || true
+    /bin/launchctl asuser "$login_uid" /usr/bin/sudo -u "$login_user" /usr/bin/killall imklaunchagent 2>/dev/null || true
+    /bin/launchctl asuser "$login_uid" /usr/bin/sudo -u "$login_user" /usr/bin/killall TextInputMenuAgent 2>/dev/null || true
+    /bin/launchctl asuser "$login_uid" /usr/bin/sudo -u "$login_user" "$EXE" --install >> "$user_home/rimebuffer-install.log" 2>&1 || exit 1
+    /bin/launchctl asuser "$login_uid" /usr/bin/sudo -u "$login_user" /usr/bin/killall TextInputMenuAgent 2>/dev/null || true
     /bin/launchctl asuser "$login_uid" /usr/bin/sudo -u "$login_user" /usr/bin/open "$APP" 2>/dev/null || true
 fi
 

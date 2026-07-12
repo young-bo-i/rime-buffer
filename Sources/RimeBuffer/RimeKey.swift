@@ -66,6 +66,11 @@ enum RimeKey {
         case 15: return ascii("r")
         case 16: return ascii("y")
         case 17: return ascii("t")
+        // These two physical keys can arrive as C0 text (U+001E/U+001F)
+        // under Control+Shift. Preserve their printable keysyms and carry the
+        // modifiers separately in Rime's mask.
+        case 22: return ascii("6")
+        case 27: return ascii("-")
         case 31: return ascii("o")
         case 32: return ascii("u")
         case 34: return ascii("i")

@@ -321,6 +321,14 @@ final class UpdateManager {
             VERSION=\(q(version))
             echo "ETInput update -> v$VERSION"
 
+            # Select ABC (or another non-ETInput ASCII source) while the old
+            # controller is still alive. This gives the active host a normal
+            # IMK deactivate before we exit and replace the bundle.
+            if ! "$NEWAPP/Contents/MacOS/ETInput" --prepare-update; then
+              echo "could not select a safe fallback; refusing hot replacement"
+              exit 1
+            fi
+
             # Wait for the old process to exit, then kill any instance the
             # text-input system may have relaunched so nothing holds the bundle.
             for i in $(seq 1 40); do
@@ -337,6 +345,8 @@ final class UpdateManager {
             if ! cp -R "$NEWAPP" "$STAGED"; then
               echo "stage copy failed; leaving current install in place"
               rm -rf "$STAGED"
+              "$TARGET/Contents/MacOS/ETInput" --install || true
+              open "$TARGET" || true
               exit 1
             fi
             xattr -cr "$STAGED" 2>/dev/null || true
@@ -348,19 +358,37 @@ final class UpdateManager {
             if [ -e "$TARGET" ] && ! mv "$TARGET" "$BACKUP"; then
               echo "could not move current bundle aside; aborting"
               rm -rf "$STAGED"
+              "$TARGET/Contents/MacOS/ETInput" --install || true
+              open "$TARGET" || true
               exit 1
             fi
             if ! mv "$STAGED" "$TARGET"; then
               echo "swap failed; rolling back"
               [ -e "$BACKUP" ] && mv "$BACKUP" "$TARGET"
               rm -rf "$STAGED"
+              "$TARGET/Contents/MacOS/ETInput" --install || true
+              open "$TARGET" || true
               exit 1
             fi
+            echo "re-registering and activating input source"
+            "$LSREGISTER" -f "$TARGET" || true
+            killall imklaunchagent 2>/dev/null || true
+            killall TextInputMenuAgent 2>/dev/null || true
+            if ! "$TARGET/Contents/MacOS/ETInput" --install; then
+              echo "input-source activation failed; rolling back"
+              "$LSREGISTER" -u "$TARGET" 2>/dev/null || true
+              rm -rf "$TARGET"
+              [ -e "$BACKUP" ] && mv "$BACKUP" "$TARGET"
+              "$LSREGISTER" -f "$TARGET" || true
+              killall imklaunchagent 2>/dev/null || true
+              killall TextInputMenuAgent 2>/dev/null || true
+              "$TARGET/Contents/MacOS/ETInput" --install || true
+              open "$TARGET" || true
+              exit 1
+            fi
+            killall TextInputMenuAgent 2>/dev/null || true
             rm -rf "$BACKUP"
 
-            echo "re-registering with Launch Services"
-            "$LSREGISTER" -f "$TARGET" || true
-            sleep 0.3
             echo "relaunching"
             open "$TARGET"
 
@@ -380,12 +408,12 @@ final class UpdateManager {
             proc.arguments = ["/bin/bash", scriptURL.path]
             proc.standardOutput = nil
             proc.standardError = nil
-            try proc.run()
-
-            IMELog.write("update: install script launched for v\(version), exiting")
             // Don't strand a composition or lose key stats before we go.
             RimeBufferController.active?.forceCommit()
             KeyFrequencyStore.shared.saveNow()
+            try proc.run()
+
+            IMELog.write("update: install script launched for v\(version), exiting")
 
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { exit(0) }
         } catch {

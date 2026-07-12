@@ -1,6 +1,6 @@
 # Enter输入法 (ETInput)
 
-从零做的现代 macOS 中文输入法：librime 引擎 + 自绘候选窗 + 常驻缓冲区（buffer），支持并击（my_combo）。**自包含**——librime 与 Rime 词库打包在 app 内，装一个就能用，无需单独安装 Squirrel。
+从零做的现代 macOS 输入法：librime 引擎 + 自绘候选窗 + 常驻缓冲区（buffer），提供并击、自然码双拼、雾凇拼音和英文四个方案。**自包含**——librime 与 Rime 词库打包在 app 内，装一个就能用，无需单独安装 Squirrel。
 
 > 仓库/内部代号仍是 **RimeBuffer**（SPM target、`Sources/RimeBuffer/`、控制器类）；对外产品名是 **Enter输入法 / ETInput**。
 
@@ -17,6 +17,7 @@
 ```bash
 ./build_install.sh                # 构建+安装到当前用户+注册
 .build/release/RimeBuffer smoke   # 免安装引擎自检
+.build/release/RimeBuffer schema-smoke  # 设置页方案列表读写自检
 tail -f ~/rimebuffer.log          # 行为日志
 ```
 
@@ -24,7 +25,7 @@ tail -f ~/rimebuffer.log          # 行为日志
 
 ## 发布 / 自动更新
 
-已装的 Enter输入法 会自动检查 GitHub Release 并在状态栏菜单提示一键更新。发布新版本：
+已装的 Enter输入法 会自动检查 GitHub Release；相关控制入口位于系统输入法菜单。发布新版本：
 
 ```bash
 ./scripts/release.sh minor        # 打 tag 触发 CI 构建并发布 Release
@@ -34,7 +35,7 @@ tail -f ~/rimebuffer.log          # 行为日志
 
 ## 隔空传字（Mac ↔ Mac）
 
-在状态栏菜单启用「隔空传字」，两台 Mac 即可把你打的字即时发到对方的输入框——加密的局域网
+从系统输入法菜单打开「设置…」并启用「隔空传字」，两台 Mac 即可把你打的字即时发到对方的输入框——加密的局域网
 点对点直连（Network.framework + Bonjour + AWDL，无需同一 Wi-Fi、无需 Apple ID）。
 
 配对是「请求 → 同意」，**没有配对码**：A 菜单点「配对新设备 → B」→ 两台各显示同一个 4 位验证码

@@ -1,0 +1,99 @@
+# Rime schema
+# encoding: utf-8
+
+schema:
+  schema_id: english
+  name: 英文
+  version: "1.0"
+  author:
+    - Enter输入法
+  description: |
+    独立英文输入方案：常用词候选、前缀补全、用户调频，
+    并以原始输入候选兜底未收录的生词和技术字符串。
+
+switches:
+  - name: ascii_mode
+    reset: 0
+    states: [ 候选, 直通 ]
+
+engine:
+  processors:
+    - ascii_composer
+    - recognizer
+    - key_binder
+    - speller
+    - punctuator
+    - selector
+    - navigator
+    - express_editor
+  segmentors:
+    - matcher
+    - ascii_segmentor
+    - abc_segmentor
+    - punct_segmentor
+    - fallback_segmentor
+  translators:
+    - table_translator
+    - echo_translator
+    - punct_translator
+  filters:
+    - lua_filter@*en_spacer
+    - uniquifier
+
+speller:
+  alphabet: zyxwvutsrqponmlkjihgfedcbaZYXWVUTSRQPONMLKJIHGFEDCBA
+  delimiter: " '"
+
+translator:
+  dictionary: easy_en
+  user_dict: english
+  enable_user_dict: true
+  enable_completion: true
+  enable_sentence: false
+  spelling_hints: 0
+
+# English mode must never inherit the Chinese punctuation table from
+# default.yaml. Space is intentionally left to selector so it commits the
+# highlighted word; en_spacer supplies the separator before the next word.
+punctuator:
+  half_shape:
+    "!": "!"
+    "\"": "\""
+    "#": "#"
+    "$": "$"
+    "%": "%"
+    "&": "&"
+    "'": "'"
+    "(": "("
+    ")": ")"
+    "*": "*"
+    "+": "+"
+    ",": ","
+    "-": "-"
+    ".": "."
+    "/": "/"
+    ":": ":"
+    ";": ";"
+    "<": "<"
+    "=": "="
+    ">": ">"
+    "?": "?"
+    "@": "@"
+    "[": "["
+    "\\": "\\"
+    "]": "]"
+    "^": "^"
+    "_": "_"
+    "`": "`"
+    "{": "{"
+    "|": "|"
+    "}": "}"
+    "~": "~"
+
+key_binder:
+  import_preset: default
+
+recognizer:
+  import_preset: default
+  patterns:
+    uppercase: ''

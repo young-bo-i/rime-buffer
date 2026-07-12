@@ -1,29 +1,18 @@
 import Cocoa
 import CRimeBridge
 
-/// Menu provider for ETInput's own status-bar control. The system input-source
-/// menu is intentionally left alone; it is for choosing input sources, while
-/// this menu is the product control surface.
-final class StatusMenu: NSObject, NSMenuDelegate {
+/// Builds ETInput's commands for the system input-source menu. The menu items
+/// target the live IMKInputController because InputMethodKit dispatches text
+/// input menu commands through that controller.
+final class StatusMenu {
     static let shared = StatusMenu()
 
-    private var item: NSStatusItem?
     private(set) var schemaId = ""
     private(set) var schemaName = ""
     private(set) var healthy = true
 
     private var installLogURL: URL {
         URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("rimebuffer-install.log")
-    }
-
-    func install() {
-        guard item == nil else { return }
-        let status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item = status
-        refreshButton()
-        let menu = NSMenu()
-        menu.delegate = self
-        status.menu = menu
     }
 
     func update(schemaId: String, schemaName: String) {
@@ -33,87 +22,89 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
     func setHealthy(_ ok: Bool) {
         healthy = ok
-        refreshButton()
     }
 
-    /// The custom monochrome menu-bar glyph (bundled), rendered as a template so
-    /// macOS tints it for light/dark menu bars.
-    private static let menubarImage: NSImage? = {
-        guard let url = Bundle.main.url(forResource: "menubar-template", withExtension: "png"),
-              let img = NSImage(contentsOf: url) else { return nil }
-        img.isTemplate = true
-        img.size = NSSize(width: 18, height: 18)
-        return img
-    }()
+    /// InputMethodKit asks the active controller for a fresh menu whenever the
+    /// system input menu opens, so every item reflects current engine state.
+    func makeInputSourceMenu(target: RimeBufferController) -> NSMenu {
+        let menu = NSMenu()
 
-    private func refreshButton() {
-        guard let button = item?.button else { return }
-        if healthy, let img = Self.menubarImage {
-            button.image = img
-        } else {
-            button.image = NSImage(
-                systemSymbolName: healthy ? "keyboard.badge.ellipsis" : "keyboard.badge.exclamationmark",
-                accessibilityDescription: "Enter输入法")
+        if !healthy {
+            let health = NSMenuItem(
+                title: "⚠️ 输入引擎异常 — 已退化为英文直通",
+                action: nil,
+                keyEquivalent: "")
+            health.isEnabled = false
+            menu.addItem(health)
+            menu.addItem(.separator())
         }
-        button.contentTintColor = nil
-    }
 
-    // Rebuild on every open so state is always current.
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        populate(menu)
-    }
-
-    /// Keep the menu bar surface as a single entry point. Detailed controls
-    /// live in Settings, not in this tiny dropdown.
-    func populate(_ menu: NSMenu) {
-        menu.removeAllItems()
-
-        let settings = NSMenuItem(title: "设置…", action: #selector(openSettings), keyEquivalent: "")
-        settings.target = self
+        let settings = NSMenuItem(
+            title: "设置…",
+            action: #selector(RimeBufferController.openSettingsFromInputMenu(_:)),
+            keyEquivalent: "")
+        settings.target = target
         menu.addItem(settings)
         menu.addItem(.separator())
 
-        let checkUpdate = NSMenuItem(title: "检查更新…", action: #selector(checkUpdate), keyEquivalent: "")
-        checkUpdate.target = self
+        let checkUpdate = NSMenuItem(
+            title: "检查更新…",
+            action: #selector(RimeBufferController.checkUpdateFromInputMenu(_:)),
+            keyEquivalent: "")
+        checkUpdate.target = target
         menu.addItem(checkUpdate)
 
-        let log = NSMenuItem(title: "打开日志 (~/rimebuffer.log)", action: #selector(openLog), keyEquivalent: "")
-        log.target = self
+        let log = NSMenuItem(
+            title: "打开日志 (~/rimebuffer.log)",
+            action: #selector(RimeBufferController.openLogFromInputMenu(_:)),
+            keyEquivalent: "")
+        log.target = target
         menu.addItem(log)
 
-        let deploy = NSMenuItem(title: "重新部署并重启", action: #selector(deployAndRestart), keyEquivalent: "")
-        deploy.target = self
+        let deploy = NSMenuItem(
+            title: "重新部署并重启",
+            action: #selector(RimeBufferController.deployAndRestartFromInputMenu(_:)),
+            keyEquivalent: "")
+        deploy.target = target
         menu.addItem(deploy)
 
-        let reinstall = NSMenuItem(title: "重新安装输入法…", action: #selector(reinstallInputMethod), keyEquivalent: "")
-        reinstall.target = self
+        let reinstall = NSMenuItem(
+            title: "重新安装输入法…",
+            action: #selector(RimeBufferController.reinstallFromInputMenu(_:)),
+            keyEquivalent: "")
+        reinstall.target = target
         menu.addItem(reinstall)
 
-        let restart = NSMenuItem(title: "重启输入法进程", action: #selector(restart), keyEquivalent: "")
-        restart.target = self
+        let restart = NSMenuItem(
+            title: "重启输入法进程",
+            action: #selector(RimeBufferController.restartFromInputMenu(_:)),
+            keyEquivalent: "")
+        restart.target = target
         menu.addItem(restart)
+
+        return menu
     }
 
-    @objc private func openSettings() {
+    func openSettings() {
         SettingsWindowController.shared.show()
     }
 
-    @objc private func checkUpdate() {
+    func checkUpdate() {
         UpdateManager.shared.checkNowManually()
     }
 
-    @objc private func openLog() {
+    func openLog() {
         let url = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("rimebuffer.log")
         NSWorkspace.shared.open(url)
     }
 
-    @objc private func deployAndRestart() {
+    func deployAndRestart() {
         RimeBufferController.active?.forceCommit()
-        IMELog.write("status menu: deploy requested")
+        IMELog.write("input menu: deploy requested")
         DispatchQueue.global(qos: .userInitiated).async {
             _ = rimeEngine.start()
             let ok = BBRimeDeploy()
-            IMELog.write("status menu: deploy=\(ok), restarting")
+            IMELog.write("input menu: deploy=\(ok), restarting")
             DispatchQueue.main.async {
                 KeyFrequencyStore.shared.saveNow()
                 exit(0)
@@ -121,7 +112,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         }
     }
 
-    @objc private func reinstallInputMethod() {
+    func reinstallInputMethod() {
         guard let script = installScriptURL() else {
             showInfo("找不到 build_install.sh。")
             return
@@ -147,14 +138,14 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         process.arguments = ["-lc", command]
         do {
             try process.run()
-            IMELog.write("status menu: launched install script \(script.path)")
+            IMELog.write("input menu: launched install script \(script.path)")
         } catch {
             showInfo("安装启动失败：\(error.localizedDescription)")
         }
     }
 
-    @objc private func restart() {
-        IMELog.write("status menu: restart requested")
+    func restart() {
+        IMELog.write("input menu: restart requested")
         RimeBufferController.active?.forceCommit()
         KeyFrequencyStore.shared.saveNow()
         exit(0)

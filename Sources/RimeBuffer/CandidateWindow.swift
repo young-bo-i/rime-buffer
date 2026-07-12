@@ -161,6 +161,7 @@ final class CandidateWindow {
     private static let characterSelectionTagBase = 200_000
 
     private let panel: NSPanel
+    private let content = NSView()
     private let root = NSStackView()
     private let preeditLabel = NSTextField(labelWithString: "")
     private let strip = NSView()
@@ -204,8 +205,9 @@ final class CandidateWindow {
         if isExpanded {
             let pageOffset = clamp(expandedSelectionPageOffset, count: expandedPages.count)
             let row = expandedPages[pageOffset].candidates
-            guard !row.isEmpty else { return nil }
-            return row[clamp(selectedIndex, count: row.count)].text
+            let visibleCount = expandedVisibleCandidateCount(pageOffset: pageOffset)
+            guard visibleCount > 0 else { return nil }
+            return row[clamp(selectedIndex, count: visibleCount)].text
         }
         guard !currentContext.candidates.isEmpty else { return nil }
         return currentContext.candidates[clamp(selectedIndex, count: currentContext.candidates.count)].text
@@ -220,10 +222,10 @@ final class CandidateWindow {
         guard hasCandidates else { return nil }
         if isExpanded {
             let pageOffset = clamp(expandedSelectionPageOffset, count: expandedPages.count)
-            let row = expandedPages[pageOffset].candidates
-            guard !row.isEmpty else { return nil }
+            let visibleCount = expandedVisibleCandidateCount(pageOffset: pageOffset)
+            guard visibleCount > 0 else { return nil }
             return CandidateSelection(pageOffset: pageOffset,
-                                      index: clamp(selectedIndex, count: row.count))
+                                      index: clamp(selectedIndex, count: visibleCount))
         }
         return CandidateSelection(pageOffset: 0,
                                   index: clamp(selectedIndex, count: currentContext.candidates.count))
@@ -241,6 +243,7 @@ final class CandidateWindow {
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
+        panel.animationBehavior = .none
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
@@ -253,7 +256,7 @@ final class CandidateWindow {
         preeditHeightConstraint.isActive = true
 
         strip.wantsLayer = true
-        strip.layer?.cornerRadius = 12
+        strip.layer?.cornerRadius = 6
         strip.layer?.borderWidth = 1
         strip.layer?.masksToBounds = true
         stripHeightConstraint = strip.heightAnchor.constraint(equalToConstant: metrics.compactStripHeight)
@@ -316,7 +319,9 @@ final class CandidateWindow {
         inlineBufferHeightConstraint = inlineBuffer.heightAnchor.constraint(equalToConstant: 0)
         inlineBufferHeightConstraint.isActive = true
 
-        let content = NSView()
+        content.wantsLayer = true
+        content.layer?.cornerRadius = 6
+        content.layer?.masksToBounds = true
         content.addSubview(root)
         NSLayoutConstraint.activate([
             root.leadingAnchor.constraint(equalTo: content.leadingAnchor),
@@ -355,7 +360,11 @@ final class CandidateWindow {
 
     func update(_ ctx: RimeContextModel, caretRect: NSRect, bundleId: String, showPreedit: Bool) {
         guard !ctx.candidates.isEmpty || (showPreedit && !ctx.preedit.isEmpty) else {
-            hide()
+            if BufferModel.shared.shouldDisplay {
+                showBufferOnly(caretRect: caretRect, bundleId: bundleId)
+            } else {
+                hide()
+            }
             return
         }
 
@@ -410,8 +419,9 @@ final class CandidateWindow {
         lastBundleId = bundleId
         preeditLabel.stringValue = ""
         preeditLabel.isHidden = true
-        strip.isHidden = true
+        strip.isHidden = false
         applyAppearance()
+        renderCandidates()
         refreshInlineBuffer()
         layoutPanel(caretRect: caretRect, bundleId: bundleId)
         panel.orderFrontRegardless()
@@ -475,7 +485,8 @@ final class CandidateWindow {
         guard isSingleCharacterSelectionActive else { return false }
         let chars = Array(characterSelectionText)
         guard !chars.isEmpty else { return false }
-        characterSelectionIndex = clamp(characterSelectionIndex + delta, count: chars.count)
+        let logicalDelta = BufferModel.shared.active ? -delta : delta
+        characterSelectionIndex = clamp(characterSelectionIndex + logicalDelta, count: chars.count)
         renderCandidates()
         resetCandidateScroll()
         return true
@@ -498,7 +509,8 @@ final class CandidateWindow {
             return moveExpandedSelection(columnDelta: delta)
         }
         guard !currentContext.candidates.isEmpty else { return false }
-        selectedIndex = clamp(selectedIndex + delta, count: currentContext.candidates.count)
+        let logicalDelta = BufferModel.shared.active ? -delta : delta
+        selectedIndex = clamp(selectedIndex + logicalDelta, count: currentContext.candidates.count)
         visualPageIndex = pageIndex(containing: selectedIndex, panelWidth: activePanelWidth())
         renderCandidates()
         resetCandidateScroll()
@@ -514,8 +526,9 @@ final class CandidateWindow {
         let nextOffset = expandedSelectionPageOffset + rowDelta
         guard expandedPages.indices.contains(nextOffset) else { return true }
         expandedSelectionPageOffset = nextOffset
-        selectedIndex = clamp(selectedIndex, count: expandedPages[nextOffset].candidates.count)
+        clampExpandedSelectionToVisiblePrefix()
         renderCandidates()
+        logExpandedVisiblePrefix(reason: "row move")
         resetCandidateScroll()
         return true
     }
@@ -527,9 +540,14 @@ final class CandidateWindow {
         guard !visiblePages.isEmpty else { return false }
         expandedPages = visiblePages
         expandedSelectionPageOffset = min(expandedSelectionPageOffset, expandedPages.count - 1)
-        selectedIndex = clamp(selectedIndex,
-                              count: expandedPages[expandedSelectionPageOffset].candidates.count)
+        guard expandedVisibleCandidateCount(pageOffset: expandedSelectionPageOffset) > 0 else {
+            IMELog.write("candidate matrix skipped; first shared column exceeds available width")
+            resetExpandedState()
+            return true
+        }
+        clampExpandedSelectionToVisiblePrefix()
         renderCandidates()
+        logExpandedVisiblePrefix(reason: "expand")
         refreshInlineBuffer()
         layoutPanel(caretRect: lastCaretRect, bundleId: lastBundleId)
         panel.orderFrontRegardless()
@@ -556,7 +574,10 @@ final class CandidateWindow {
         }
         let row = expandedPages[expandedSelectionPageOffset].candidates
         guard !row.isEmpty else { return false }
-        selectedIndex = clamp(selectedIndex + columnDelta, count: row.count)
+        let visibleCount = expandedVisibleCandidateCount(pageOffset: expandedSelectionPageOffset)
+        guard visibleCount > 0 else { return false }
+        let logicalDelta = BufferModel.shared.active ? -columnDelta : columnDelta
+        selectedIndex = clamp(selectedIndex + logicalDelta, count: visibleCount)
         renderCandidates()
         resetCandidateScroll()
         return true
@@ -601,6 +622,18 @@ final class CandidateWindow {
         IMELog.write("candidate buffer action -> on")
         renderCandidates()
         refreshBuffer()
+    }
+
+    /// Resolve a number-key selection against the row that currently owns the
+    /// matrix labels. Hidden tail candidates are deliberately not selectable.
+    func expandedSelection(atVisibleIndex index: Int) -> CandidateSelection? {
+        guard isExpanded,
+              expandedPages.indices.contains(expandedSelectionPageOffset),
+              index >= 0,
+              index < expandedVisibleCandidateCount(pageOffset: expandedSelectionPageOffset) else {
+            return nil
+        }
+        return CandidateSelection(pageOffset: expandedSelectionPageOffset, index: index)
     }
 
     // MARK: Positioning
@@ -666,6 +699,14 @@ final class CandidateWindow {
         }
 
         applyMetrics()
+        if isExpanded {
+            if expandedVisibleCandidateCount(pageOffset: expandedSelectionPageOffset) == 0 {
+                IMELog.write("candidate matrix collapsed; first shared column no longer fits")
+                resetExpandedState()
+            } else {
+                clampExpandedSelectionToVisiblePrefix()
+            }
+        }
         visualPageIndex = clampVisualPage(visualPageIndex, panelWidth: activePanelWidth())
         candidateScroll.isHidden = false
 
@@ -697,7 +738,11 @@ final class CandidateWindow {
         let panelWidth = activePanelWidth()
         let available = candidateAvailableWidth(panelWidth: panelWidth)
         let indices = currentVisualCandidateIndices(panelWidth: panelWidth)
-        for (offset, i) in indices.enumerated() {
+        let renderedIndices = BufferModel.shared.active ? Array(indices.reversed()) : indices
+        if BufferModel.shared.active {
+            candidateStack.addArrangedSubview(candidateLeadingSpacer())
+        }
+        for (offset, i) in renderedIndices.enumerated() {
             if offset > 0 {
                 candidateStack.addArrangedSubview(candidateSeparatorView())
             }
@@ -723,42 +768,110 @@ final class CandidateWindow {
 
     private func renderExpandedMatrix() {
         candidateStack.orientation = .vertical
-        candidateStack.alignment = .leading
+        candidateStack.alignment = BufferModel.shared.active ? .trailing : .leading
         candidateStack.spacing = Self.expandedRowSpacing
 
         let panelWidth = activePanelWidth()
         let available = candidateAvailableWidth(panelWidth: panelWidth)
-        let pages = expandedPages.isEmpty ? [currentContext] : expandedPages
-        let columnCount = max(1, currentContext.pageSize, pages.map { $0.candidates.count }.max() ?? 1)
-        let separatorWidth = separatorRunWidth() * CGFloat(max(0, columnCount - 1))
-        let cellWidth = max(38, floor((available - separatorWidth) / CGFloat(columnCount)))
+        let pages = Array((expandedPages.isEmpty ? [currentContext] : expandedPages)
+            .prefix(Self.expandedMaxRows))
+        let columnWidths = expandedMatrixColumnWidths(pages: pages, availableWidth: available)
 
-        for (pageOffset, page) in pages.prefix(Self.expandedMaxRows).enumerated() {
+        for (pageOffset, page) in pages.enumerated() {
+            let isActiveRow = pageOffset == expandedSelectionPageOffset
+            let renderedCandidates = Array(page.candidates.prefix(columnWidths.count))
             let row = NSStackView()
             row.orientation = .horizontal
             row.alignment = .centerY
             row.spacing = Self.candidateSpacing
             row.translatesAutoresizingMaskIntoConstraints = false
-            row.widthAnchor.constraint(equalToConstant: available).isActive = true
             row.heightAnchor.constraint(equalToConstant: compactCandidateButtonHeight(
                 for: CandidateWindowMetrics.current
             )).isActive = true
 
-            for (index, candidate) in page.candidates.enumerated() {
-                if index > 0 {
+            let indexedCandidates = Array(renderedCandidates.enumerated())
+            let displayedCandidates = BufferModel.shared.active
+                ? Array(indexedCandidates.reversed())
+                : indexedCandidates
+            for (offset, element) in displayedCandidates.enumerated() {
+                let (index, candidate) = element
+                if offset > 0 {
                     row.addArrangedSubview(candidateSeparatorView())
                 }
                 row.addArrangedSubview(candidateButton(
                     pageOffset: pageOffset,
                     index: index,
                     candidate: candidate,
-                    highlighted: pageOffset == expandedSelectionPageOffset && index == selectedIndex,
+                    highlighted: isActiveRow && index == selectedIndex,
                     compact: true,
-                    width: cellWidth
+                    width: columnWidths[index],
+                    showsLabel: isActiveRow
                 ))
             }
             candidateStack.addArrangedSubview(row)
         }
+    }
+
+    /// Every matrix row shares the same width for a given column. Width
+    /// measurement reserves the number label and selected font weight for all
+    /// rows, although only the active row renders labels. This keeps the grid
+    /// fixed while moving vertically. Once the next whole column cannot fit,
+    /// it and the tail are omitted from every row.
+    private func expandedMatrixColumnWidths(
+        pages: [RimeContextModel],
+        availableWidth: CGFloat
+    ) -> [CGFloat] {
+        let columnCount = pages.map { $0.candidates.count }.max() ?? 0
+        guard columnCount > 0 else { return [] }
+
+        var naturalWidths = Array(repeating: CGFloat(0), count: columnCount)
+        for page in pages {
+            for (index, candidate) in page.candidates.enumerated() {
+                // Reserve the maximum rendered title width so neither
+                // horizontal nor vertical navigation reflows the grid.
+                let width = ceil(measuredCandidateWidth(candidate,
+                                                        highlighted: true,
+                                                        compact: true,
+                                                        showsLabel: true))
+                naturalWidths[index] = max(naturalWidths[index], width)
+            }
+        }
+
+        var visibleWidths: [CGFloat] = []
+        var usedWidth: CGFloat = 0
+        for naturalWidth in naturalWidths {
+            let addedWidth = (visibleWidths.isEmpty ? 0 : separatorRunWidth()) + naturalWidth
+            guard usedWidth + addedWidth <= availableWidth else { break }
+            visibleWidths.append(naturalWidth)
+            usedWidth += addedWidth
+        }
+
+        return visibleWidths
+    }
+
+    private func expandedVisibleCandidateCount(pageOffset: Int) -> Int {
+        guard expandedPages.indices.contains(pageOffset) else { return 0 }
+        let columnWidths = expandedMatrixColumnWidths(
+            pages: Array(expandedPages.prefix(Self.expandedMaxRows)),
+            availableWidth: candidateAvailableWidth(panelWidth: activePanelWidth())
+        )
+        return min(expandedPages[pageOffset].candidates.count, columnWidths.count)
+    }
+
+    private func clampExpandedSelectionToVisiblePrefix() {
+        guard expandedPages.indices.contains(expandedSelectionPageOffset) else { return }
+        selectedIndex = clamp(
+            selectedIndex,
+            count: expandedVisibleCandidateCount(pageOffset: expandedSelectionPageOffset)
+        )
+    }
+
+    private func logExpandedVisiblePrefix(reason: String) {
+        guard expandedPages.indices.contains(expandedSelectionPageOffset) else { return }
+        let total = expandedPages[expandedSelectionPageOffset].candidates.count
+        let visible = expandedVisibleCandidateCount(pageOffset: expandedSelectionPageOffset)
+        guard visible < total else { return }
+        IMELog.write("candidate matrix \(reason) row=\(expandedSelectionPageOffset) visible=\(visible)/\(total) hidden=\(total - visible)")
     }
 
     private func renderSingleCharacterSelectionRow() {
@@ -769,8 +882,16 @@ final class CandidateWindow {
         let chars = Array(characterSelectionText)
         guard !chars.isEmpty else { return }
 
-        for (index, char) in chars.enumerated() {
-            if index > 0 {
+        if BufferModel.shared.active {
+            candidateStack.addArrangedSubview(candidateLeadingSpacer())
+        }
+        let indexedCharacters = Array(chars.enumerated())
+        let displayedCharacters = BufferModel.shared.active
+            ? Array(indexedCharacters.reversed())
+            : indexedCharacters
+        for (offset, element) in displayedCharacters.enumerated() {
+            let (index, char) = element
+            if offset > 0 {
                 candidateStack.addArrangedSubview(candidateSeparatorView())
             }
             candidateStack.addArrangedSubview(candidateButton(
@@ -793,20 +914,26 @@ final class CandidateWindow {
         compact: Bool,
         width: CGFloat?,
         maxWidth: CGFloat? = nil,
+        showsLabel: Bool = true,
         tag: Int? = nil
     ) -> NSButton {
         let button = CandidatePillButton()
         button.tag = tag ?? candidateTag(pageOffset: pageOffset, index: index)
         button.target = self
         button.action = #selector(candidateTapped(_:))
-        button.attributedTitle = candidateTitle(candidate, highlighted: highlighted)
+        button.attributedTitle = candidateTitle(candidate,
+                                                highlighted: highlighted,
+                                                showsLabel: showsLabel)
         button.layer?.backgroundColor = NSColor.clear.cgColor
         button.layer?.borderWidth = 0
         button.toolTip = candidate.comment.isEmpty
             ? candidate.text
             : "\(candidate.text)  \(candidate.comment)"
 
-        let naturalWidth = ceil(measuredCandidateWidth(candidate, highlighted: highlighted, compact: compact))
+        let naturalWidth = ceil(measuredCandidateWidth(candidate,
+                                                       highlighted: highlighted,
+                                                       compact: compact,
+                                                       showsLabel: showsLabel))
         let cappedWidth = maxWidth.map { min(naturalWidth, $0) } ?? naturalWidth
         NSLayoutConstraint.activate([
             button.widthAnchor.constraint(equalToConstant: width ?? cappedWidth),
@@ -817,14 +944,18 @@ final class CandidateWindow {
         return button
     }
 
-    private func candidateTitle(_ c: RimeCandidateModel, highlighted: Bool) -> NSAttributedString {
+    private func candidateTitle(
+        _ c: RimeCandidateModel,
+        highlighted: Bool,
+        showsLabel: Bool = true
+    ) -> NSAttributedString {
         let metrics = CandidateWindowMetrics.current
         let line = NSMutableAttributedString()
-        let labelColor = highlighted ? RimeUI.selectedCandidateColor.withAlphaComponent(0.85) : RimeUI.textMuted
+        let labelColor = highlighted ? RimeUI.selectedCandidateColor.withAlphaComponent(0.85) : RimeUI.textSecondary
         let textColor = highlighted ? RimeUI.selectedCandidateColor : RimeUI.textPrimary
         let baseline = (metrics.candidateFontSize - metrics.labelFontSize) / 2
 
-        if !c.label.isEmpty {
+        if showsLabel, !c.label.isEmpty {
             line.append(NSAttributedString(
                 string: "\(c.label) ",
                 attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: metrics.labelFontSize, weight: .semibold),
@@ -868,8 +999,13 @@ final class CandidateWindow {
         return label
     }
 
-    private func measuredCandidateWidth(_ c: RimeCandidateModel, highlighted: Bool, compact: Bool) -> CGFloat {
-        candidateTitle(c, highlighted: highlighted).size().width
+    private func measuredCandidateWidth(
+        _ c: RimeCandidateModel,
+        highlighted: Bool,
+        compact: Bool,
+        showsLabel: Bool = true
+    ) -> CGFloat {
+        candidateTitle(c, highlighted: highlighted, showsLabel: showsLabel).size().width
             + (compact ? Self.compactCandidateHorizontalPadding : 14)
     }
 
@@ -970,11 +1106,21 @@ final class CandidateWindow {
     private func resetCandidateScroll() {
         candidateScroll.layoutSubtreeIfNeeded()
         candidateStack.layoutSubtreeIfNeeded()
-        candidateScroll.contentView.scroll(to: .zero)
+        let maxX = max(0, candidateStack.frame.width - candidateScroll.contentSize.width)
+        let origin = NSPoint(x: BufferModel.shared.active ? maxX : 0, y: 0)
+        candidateScroll.contentView.scroll(to: origin)
         candidateScroll.reflectScrolledClipView(candidateScroll.contentView)
     }
 
+    private func candidateLeadingSpacer() -> NSView {
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return spacer
+    }
+
     private func applyAppearance() {
+        content.layer?.backgroundColor = RimeUI.candidateBackgroundColor.cgColor
         preeditLabel.textColor = RimeUI.textPrimary
         strip.layer?.backgroundColor = RimeUI.candidateBackgroundColor.cgColor
         strip.layer?.borderColor = RimeUI.borderStrong.cgColor

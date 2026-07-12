@@ -7,21 +7,13 @@ config_version: '2025-02-24'
 
 
 # 方案列表
-# ETInput（Enter输入法）自包含发行：默认部署串击(my_serial)+并击(my_combo)。
-# 其余雾凇方案文件仍随包提供，如需启用取消注释即可（default.custom.yaml 会
-# patch 此列表，两处保持一致，均以 my_serial 为默认首选）。
+# ETInput（Enter输入法）只向用户提供下面四个方案。melt_eng、radical_pinyin
+# 等文件继续作为词典/反查依赖随包提供，但不会出现在 F4 方案选单。
 schema_list:
-  - schema: my_serial              # 串击（默认）
   - schema: my_combo               # 并击
-  # - schema: rime_ice             # 雾凇拼音（全拼）
-  # - schema: t9                   # 九宫格（仓输入法，依赖 rime_ice）
-  # - schema: double_pinyin        # 自然码双拼
-  # - schema: double_pinyin_abc    # 智能 ABC 双拼
-  # - schema: double_pinyin_mspy   # 微软双拼
-  # - schema: double_pinyin_sogou  # 搜狗双拼
-  # - schema: double_pinyin_flypy  # 小鹤双拼
-  # - schema: double_pinyin_ziguang # 紫光双拼
-  # - schema: double_pinyin_jiajia # 拼音加加双拼
+  - schema: double_pinyin          # 自然码双拼
+  - schema: rime_ice               # 雾凇拼音（全拼）
+  - schema: english                # 英文
 
 
 # 菜单

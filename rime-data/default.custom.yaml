@@ -1,6 +1,8 @@
 patch:
   schema_list:
-    - schema: my_serial         # 串击（默认）
     - schema: my_combo          # 并击
+    - schema: double_pinyin     # 自然码双拼
+    - schema: rime_ice          # 雾凇拼音
+    - schema: english           # 英文
   menu:
     page_size: 9                # 候选词个数

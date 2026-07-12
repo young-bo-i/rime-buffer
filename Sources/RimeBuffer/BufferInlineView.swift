@@ -20,7 +20,7 @@ final class BufferInlineView: NSView {
         super.init(frame: frameRect)
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
-        layer?.cornerRadius = 10
+        layer?.cornerRadius = 6
         layer?.borderWidth = 1
         layer?.masksToBounds = true
 
@@ -148,7 +148,7 @@ final class BufferInlineView: NSView {
     private func chip(for block: BufferModel.Block) -> NSView {
         let label = NSTextField(labelWithString: block.text)
         label.font = .systemFont(ofSize: 12)
-        label.textColor = .labelColor
+        label.textColor = RimeUI.textPrimary
         label.lineBreakMode = .byTruncatingTail
         label.maximumNumberOfLines = 1
         label.toolTip = block.text
@@ -266,7 +266,7 @@ final class BufferInlineView: NSView {
         layer?.backgroundColor = RimeUI.candidateBackgroundColor.cgColor
         layer?.borderColor = RimeUI.borderStrong.cgColor
         caretView.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
-        emptyLabel.textColor = RimeUI.textMuted
+        emptyLabel.textColor = RimeUI.isNight ? RimeUI.textSecondary : RimeUI.textMuted
         flushButton.contentTintColor = flushButton.isEnabled ? RimeUI.textSecondary : RimeUI.textMuted
         clearButton.contentTintColor = clearButton.isEnabled ? RimeUI.textSecondary : RimeUI.textMuted
     }

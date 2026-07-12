@@ -38,16 +38,17 @@ librime 是**静态链接**的（依赖只有系统 libSystem/libc++），所以
 ## 三、持续集成（CI）
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) 在每次 push / PR 到 `main` 时：
-`swift build` + 运行 `buffer-smoke`、`stats-smoke` 两个纯 Swift 自检（不依赖 librime）。
+`swift build` + 运行 `schema-smoke`、`buffer-smoke`、`stats-smoke` 等纯 Swift 自检（不依赖 librime）。
 
 ## 四、新用户安装器（[`scripts/make-pkg.sh`](scripts/make-pkg.sh)）
 
 `.pkg` 会把 `ETInput.app` 安装到 `/Library/Input Methods`，清理同 id 的旧用户级副本，并在当前
 登录用户的 Aqua 会话中运行 `ETInput --install`：注册、启用、选择输入源，然后启动 ETInput。
 
-输入源 id 刻意保留 `com.isaac.inputmethod.RimeBuffer`，即使对外产品名已经是 ETInput /
-Enter输入法。macOS 会把输入源 id 写入受保护的 TIS 偏好；随意改 id 会让老用户留下难以清除的
-残留行，甚至看不到新安装的输入法。
+输入法 bundle id 刻意保留 `com.isaac.inputmethod.RimeBuffer`，即使对外产品名已经是 ETInput /
+Enter输入法；可选择的输入模式使用独立 id `com.isaac.inputmethod.RimeBuffer.Hans`。父输入法与
+子 mode 不能共用同一个 TIS id，否则父项无法启用、`TISSelectInputSource` 会返回 `paramErr`。
+macOS 会把这些 id 写入受保护的 TIS 偏好，因此后续不要随意改动。
 
 ## 五、应用内自动更新（[`UpdateManager.swift`](Sources/RimeBuffer/UpdateManager.swift)）
 

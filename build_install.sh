@@ -26,15 +26,32 @@ APP_PATH="$STAGE/$APP"
 DEST="$HOME/Library/Input Methods/$APP"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
+# A system-wide release copy and this per-user dev copy would advertise the
+# same bundle/input-source IDs. Stop before creating that poisoned duplicate;
+# remove the pkg-installed copy explicitly before returning to dev installs.
+for system_copy in "/Library/Input Methods/ETInput.app" \
+                   "/Library/Input Methods/RimeBuffer.app" \
+                   "/Library/Input Methods/Enter输入法.app" \
+                   "/Library/Input Methods/恩特输入法.app"; do
+    [ -e "$system_copy" ] || continue
+    system_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$system_copy/Contents/Info.plist" 2>/dev/null || true)"
+    case "$system_id" in
+        com.isaac.inputmethod.RimeBuffer|com.isaac.inputmethod.ETInput)
+            echo "!! found system-wide duplicate: $system_copy"
+            echo "   remove it first: sudo rm -rf '$system_copy'"
+            exit 1
+            ;;
+    esac
+done
+
 # Fetch the bundled librime runtime (cached in Vendor/, not committed to git).
 ./scripts/fetch-rime.sh
 
 # Its OWN Rime user dir (never fights Squirrel over the userdb LevelDB lock).
 # IMPORT: if you have a live ~/Library/Rime (Squirrel), carry your real config
 # in — your schemes, learned userdb, custom_phrase, lua, dicts — so ETInput uses
-# your actual setup. We then force ETInput's own default.custom.yaml on top so
-# 串击(my_serial) stays the default (your ~/Library/Rime has 并击 first) + 9
-# candidates; everything else you have is preserved. With no ~/Library/Rime, the
+# your actual setup. We then force ETInput's product schema list (并击、自然码双拼、
+# 雾凇拼音、英文) + 9 candidates; everything else you have is preserved. With no ~/Library/Rime, the
 # app deploys from the bundled schemas instead. RB_KEEP_USERDB=1 skips reseeding.
 RB_USER="$HOME/Library/RimeBuffer"
 if [ "${RB_KEEP_USERDB:-0}" != "1" ]; then
@@ -47,8 +64,8 @@ if [ "${RB_KEEP_USERDB:-0}" != "1" ]; then
         echo "==> no ~/Library/Rime; deploying from the bundled schemas"
         rm -rf "$RB_USER"; mkdir -p "$RB_USER"
     fi
-    # Enforce ETInput's default: 串击(my_serial) first + 9 candidates, regardless
-    # of the imported config's own schema order. Your learning/tweaks are kept.
+    # Enforce ETInput's four product schemas + 9 candidates. Your learned
+    # userdb and unrelated tweaks are kept.
     cp rime-data/default.custom.yaml "$RB_USER/default.custom.yaml"
 fi
 
@@ -74,10 +91,14 @@ printf 'APPL????' > "$APP_PATH/Contents/PkgInfo"
 cp -R Vendor/rime/Frameworks/* "$APP_PATH/Contents/Frameworks/"
 cp -R Vendor/rime/SharedSupport/* "$APP_PATH/Contents/SharedSupport/"
 
-# Overlay OUR Rime schemas (雾凇 rime_ice base + 串击 my_serial 默认 + 并击 my_combo,
-# 及 cn_dicts/en_dicts/lua/opencc/custom_phrase) onto the stock SharedSupport so a
-# fresh install deploys the real schemas — not just default luna_pinyin. This is
-# what makes 串击/并击 work WITHOUT a separate Squirrel/~/Library/Rime. The secret
+# Ship no unrelated stock input schemes. The two non-product schemas copied
+# below (melt_eng/radical_pinyin) are required hidden dependencies and are not
+# present in schema_list/F4.
+find "$APP_PATH/Contents/SharedSupport" -maxdepth 1 -type f -name '*.schema.yaml' -delete
+
+# Overlay OUR Rime schemas (并击、自然码双拼、雾凇拼音、英文，以及它们的隐藏依赖)
+# onto the stock SharedSupport so a fresh install deploys the real schemas — not
+# just default luna_pinyin. This works WITHOUT a separate Squirrel/~/Library/Rime. The secret
 # rime_ai.local.json is intentionally NOT bundled (only rime_ai.example.json).
 cp -R rime-data/* "$APP_PATH/Contents/SharedSupport/"
 
@@ -98,6 +119,13 @@ cp Resources/menubar-template.png "$APP_PATH/Contents/Resources/" 2>/dev/null ||
 echo "==> ad-hoc signing (deep)"
 codesign --force --deep --sign - "$APP_PATH"
 
+echo "==> handing active clients to a safe fallback input source"
+if ! /bin/launchctl asuser "$(id -u)" "$APP_PATH/Contents/MacOS/$EXE" --prepare-update; then
+    echo "!! could not leave the active ETInput source safely; refusing a hot replacement"
+    exit 1
+fi
+sleep 0.5
+
 echo "==> purging stray/duplicate registrations (same id at other paths poisons the picker)"
 pkill -x "$EXE" 2>/dev/null || true
 pkill -x RimeBuffer 2>/dev/null || true
@@ -106,7 +134,8 @@ sleep 0.5
 for stray in "Enter输入法.app" "恩特输入法.app" "ETInput.app" "RimeBuffer.app" \
              "$HOME/Library/Input Methods/Enter输入法.app" \
              "$HOME/Library/Input Methods/恩特输入法.app" \
-             "$HOME/Library/Input Methods/RimeBuffer.app"; do
+             "$HOME/Library/Input Methods/RimeBuffer.app" \
+             "$HOME/Documents/05-dev/apps/rime-buffer/RimeBuffer.app"; do
     if [ -e "$stray" ]; then
         "$LSREGISTER" -u "$stray" 2>/dev/null || true
         rm -rf "$stray"
@@ -114,20 +143,63 @@ for stray in "Enter输入法.app" "恩特输入法.app" "ETInput.app" "RimeBuffe
     fi
 done
 
-echo "==> installing to $DEST"
-rm -rf "$DEST"
-"$LSREGISTER" -u "$DEST" 2>/dev/null || true
+echo "==> staging the new install beside $DEST"
 mkdir -p "$HOME/Library/Input Methods"
-cp -R "$APP_PATH" "$DEST"
+DEST_NEW="$DEST.new"
+DEST_BACKUP="$DEST.bak"
+rm -rf "$DEST_NEW" "$DEST_BACKUP"
+if ! cp -R "$APP_PATH" "$DEST_NEW"; then
+    echo "!! failed to stage the new bundle; keeping the current install"
+    exit 1
+fi
 rm -rf "$STAGE/$APP"                 # don't leave a staging copy lying around
+
+restore_previous_install() {
+    echo "!! restoring the previous ETInput installation"
+    pkill -x "$EXE" 2>/dev/null || true
+    "$LSREGISTER" -u "$DEST" 2>/dev/null || true
+    rm -rf "$DEST"
+    if [ -e "$DEST_BACKUP" ]; then
+        mv "$DEST_BACKUP" "$DEST"
+        "$LSREGISTER" -f "$DEST" 2>/dev/null || true
+        killall imklaunchagent 2>/dev/null || true
+        killall TextInputMenuAgent 2>/dev/null || true
+        /bin/launchctl asuser "$(id -u)" "$DEST/Contents/MacOS/$EXE" --install >> "$HOME/rimebuffer-install.log" 2>&1 || true
+        open "$DEST" 2>/dev/null || true
+    fi
+    rm -rf "$DEST_NEW"
+}
+
+echo "==> atomically swapping the installed bundle"
+"$LSREGISTER" -u "$DEST" 2>/dev/null || true
+if [ -e "$DEST" ] && ! mv "$DEST" "$DEST_BACKUP"; then
+    echo "!! could not move the current bundle aside"
+    rm -rf "$DEST_NEW"
+    exit 1
+fi
+if ! mv "$DEST_NEW" "$DEST"; then
+    echo "!! could not activate the staged bundle"
+    restore_previous_install
+    exit 1
+fi
 
 echo "==> registering the single installed copy with Launch Services"
 "$LSREGISTER" -f "$DEST" || true
 
+echo "==> refreshing InputMethodKit / input-menu caches"
+killall imklaunchagent 2>/dev/null || true
+killall TextInputMenuAgent 2>/dev/null || true
+sleep 0.5
+
 echo "==> self-install: register + enable + select inside the login session"
-open -n "$DEST" --args --install    # short-lived instance does the TIS calls, then exits
-sleep 2
-open "$DEST" || true                 # start the IMK server (status menu / ready)
+INSTALL_LOG="$HOME/rimebuffer-install.log"
+if ! /bin/launchctl asuser "$(id -u)" "$DEST/Contents/MacOS/$EXE" --install 2>&1 | tee "$INSTALL_LOG"; then
+    restore_previous_install
+    exit 1
+fi
+killall TextInputMenuAgent 2>/dev/null || true
+open "$DEST" || true                 # start the IMK server (candidate/settings UI ready)
+rm -rf "$DEST_BACKUP"
 
 cat <<EOF
 
@@ -135,7 +207,7 @@ cat <<EOF
 
 If Enter输入法 doesn't appear in the input menu (⌃Space) immediately, run:
   killall TextInputMenuAgent SystemUIServer
-(or log out / back in once). Then switch to it and type 'nihao' -> 你好.
+(or log out / back in once). Then switch to it and press F4 to choose an input scheme.
 
 Watch behaviour:  tail -f ~/rimebuffer.log
 Self-contained: librime + Rime data are bundled, no Squirrel needed.

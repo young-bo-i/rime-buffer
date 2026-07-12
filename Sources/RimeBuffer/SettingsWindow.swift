@@ -1,6 +1,5 @@
 import Cocoa
 import CRimeBridge
-import UniformTypeIdentifiers
 
 /// Central settings surface for input schemas, candidate UI, buffer mode,
 /// remote typing, and local diagnostics.
@@ -32,7 +31,9 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     private var selectedPage: Page = .input
     private var statsObserver: NSObjectProtocol?
 
-    private let schemaPopUp = NSPopUpButton()
+    private var schemaChecks: [String: NSButton] = [:]
+    private let currentSchemaLabel = NSTextField(labelWithString: "")
+    private let schemaApplyStatus = NSTextField(labelWithString: "")
     private let appearancePopUp = NSPopUpButton()
     private let bufferCheck = NSButton(checkboxWithTitle: "启用缓冲模式（提交先暂存，手动确认上屏）", target: nil, action: nil)
     private var candidateMetricFields: [CandidateWindowMetric: NSTextField] = [:]
@@ -135,8 +136,21 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     }
 
     private func configureControls() {
-        schemaPopUp.target = self
-        schemaPopUp.action = #selector(schemaChosen)
+        for (index, option) in InputSchemaCatalog.options.enumerated() {
+            let button = NSButton(checkboxWithTitle: option.name,
+                                  target: self,
+                                  action: #selector(schemaToggled(_:)))
+            button.tag = index
+            button.font = .systemFont(ofSize: 13, weight: .medium)
+            button.toolTip = option.detail
+            button.translatesAutoresizingMaskIntoConstraints = false
+            button.widthAnchor.constraint(equalToConstant: 150).isActive = true
+            schemaChecks[option.id] = button
+        }
+        currentSchemaLabel.font = .systemFont(ofSize: 12)
+        currentSchemaLabel.textColor = .secondaryLabelColor
+        schemaApplyStatus.font = .systemFont(ofSize: 11)
+        schemaApplyStatus.textColor = .tertiaryLabelColor
 
         bufferCheck.target = self
         bufferCheck.action = #selector(bufferToggled)
@@ -238,31 +252,51 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     }
 
     private func inputPage() -> NSView {
-        let importBtn = NSButton(title: "导入方案…", target: self, action: #selector(importSchema))
-        let exportBtn = NSButton(title: "导出选中方案…", target: self, action: #selector(exportSchema))
-        let deployBtn = NSButton(title: "重新部署并重启", target: self, action: #selector(deployAndRestart))
+        let deployBtn = NSButton(title: "应用方案并重启", target: self, action: #selector(deployAndRestart))
         deployBtn.bezelColor = .controlAccentColor
-        let schemaButtons = NSStackView(views: [importBtn, exportBtn, deployBtn])
-        schemaButtons.orientation = .horizontal
-        schemaButtons.spacing = 8
 
         let openDirBtn = NSButton(title: "打开配置目录", target: self, action: #selector(openDir))
         let note = NSTextField(wrappingLabelWithString:
-            "配置目录是 ~/Library/RimeBuffer。导入的方案会自动加入 schema_list；改动配置后点「重新部署并重启」生效。")
+            "配置目录是 ~/Library/RimeBuffer。未显示的方案文件仅作为词典或反查依赖保留，不会出现在 F4。")
         note.font = .systemFont(ofSize: 11)
         note.textColor = .tertiaryLabelColor
         return contentColumn([
             title("输入"),
-            caption("管理当前 Rime 方案、配置目录和部署。"),
+            caption("勾选允许使用的方案；实际切换统一使用 F4。"),
             spacer(8),
-            sectionLabel("当前方案"),
-            schemaPopUp,
-            schemaButtons,
+            sectionLabel("F4 输入方案"),
+            currentSchemaLabel,
+            schemaChecklistView(),
+            schemaApplyStatus,
+            deployBtn,
             spacer(16),
             sectionLabel("配置目录"),
             openDirBtn,
             note,
         ])
+    }
+
+    private func schemaChecklistView() -> NSView {
+        let rows = InputSchemaCatalog.options.compactMap { option -> NSView? in
+            guard let check = schemaChecks[option.id] else { return nil }
+            check.removeFromSuperview()
+
+            let detail = NSTextField(labelWithString: option.detail)
+            detail.font = .systemFont(ofSize: 11)
+            detail.textColor = .tertiaryLabelColor
+            detail.lineBreakMode = .byTruncatingTail
+
+            let row = NSStackView(views: [check, detail])
+            row.orientation = .horizontal
+            row.alignment = .centerY
+            row.spacing = 8
+            return row
+        }
+        let stack = NSStackView(views: rows)
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        return stack
     }
 
     private func candidateWindowPage() -> NSView {
@@ -472,17 +506,21 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     // MARK: State
 
     private func reload() {
-        schemaPopUp.removeAllItems()
-        for schema in installedSchemas() {
-            schemaPopUp.addItem(withTitle: "\(schema.name)（\(schema.id)）")
-            schemaPopUp.lastItem?.representedObject = schema.id
+        var enabled = SchemaListStore.enabledIDs(at: userDir.appendingPathComponent("default.custom.yaml"))
+        if enabled.isEmpty {
+            enabled = InputSchemaCatalog.normalized(rimeEngine.schemaList().map(\.id))
         }
-        let preferred = UserDefaults.standard.string(forKey: "preferredSchema")
-            ?? StatusMenu.shared.schemaId
-        if let idx = (0..<schemaPopUp.numberOfItems).first(where: {
-            schemaPopUp.item(at: $0)?.representedObject as? String == preferred
-        }) {
-            schemaPopUp.selectItem(at: idx)
+        if enabled.isEmpty { enabled = InputSchemaCatalog.defaultEnabledIDs }
+        let enabledSet = Set(enabled)
+        for option in InputSchemaCatalog.options {
+            schemaChecks[option.id]?.state = enabledSet.contains(option.id) ? .on : .off
+        }
+        let currentName = StatusMenu.shared.schemaName.isEmpty
+            ? (UserDefaults.standard.string(forKey: "preferredSchema") ?? "尚未载入")
+            : StatusMenu.shared.schemaName
+        currentSchemaLabel.stringValue = "当前：\(currentName) · 按 F4 切换"
+        if schemaApplyStatus.stringValue.isEmpty {
+            schemaApplyStatus.stringValue = "勾选项都会出现在 F4；至少保留一个。"
         }
         bufferCheck.state = BufferModel.shared.enabled ? .on : .off
         if let idx = (0..<appearancePopUp.numberOfItems).first(where: {
@@ -569,29 +607,6 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         }
     }
 
-    /// (id, display name) for every *.schema.yaml in the user dir.
-    private func installedSchemas() -> [(id: String, name: String)] {
-        guard let files = try? FileManager.default.contentsOfDirectory(
-            at: userDir, includingPropertiesForKeys: nil) else { return [] }
-        return files
-            .filter { $0.lastPathComponent.hasSuffix(".schema.yaml") }
-            .compactMap { url in
-                guard let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
-                let id = firstMatch(#"schema_id:\s*(\S+)"#, in: text)
-                    ?? url.lastPathComponent.replacingOccurrences(of: ".schema.yaml", with: "")
-                let name = firstMatch(#"(?m)^\s{2}name:\s*\"?([^\"\n]+)\"?"#, in: text) ?? id
-                return (id, name)
-            }
-            .sorted { $0.id < $1.id }
-    }
-
-    private func firstMatch(_ pattern: String, in text: String) -> String? {
-        guard let re = try? NSRegularExpression(pattern: pattern),
-              let m = re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
-              let r = Range(m.range(at: 1), in: text) else { return nil }
-        return String(text[r]).trimmingCharacters(in: .whitespaces)
-    }
-
     // MARK: Actions
 
     @objc private func pageChosen(_ sender: NSButton) {
@@ -600,82 +615,59 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         showPage(page)
     }
 
-    @objc private func schemaChosen() {
-        guard let id = schemaPopUp.selectedItem?.representedObject as? String else { return }
-        RimeBufferController.applyPreferredSchema(id)
-    }
-
-    @objc private func importSchema() {
-        let panel = NSOpenPanel()
-        if let yaml = UTType(filenameExtension: "yaml") {
-            panel.allowedContentTypes = [yaml]
-        }
-        panel.message = "选择一个 .schema.yaml 方案文件（并击方案同样适用）"
-        guard panel.runModal() == .OK, let src = panel.url else { return }
-        do {
-            let dest = userDir.appendingPathComponent(src.lastPathComponent)
-            if FileManager.default.fileExists(atPath: dest.path) {
-                try FileManager.default.removeItem(at: dest)
-            }
-            try FileManager.default.copyItem(at: src, to: dest)
-            let text = try String(contentsOf: dest, encoding: .utf8)
-            let id = firstMatch(#"schema_id:\s*(\S+)"#, in: text)
-                ?? src.lastPathComponent.replacingOccurrences(of: ".schema.yaml", with: "")
-            try addToSchemaList(id)
-            IMELog.write("settings: imported schema \(id)")
-            reload()
-            info("已导入「\(id)」并加入方案列表。点「重新部署并重启」生效。")
-        } catch {
-            info("导入失败：\(error.localizedDescription)")
-        }
-    }
-
-    @objc private func exportSchema() {
-        guard let id = schemaPopUp.selectedItem?.representedObject as? String else { return }
-        let src = userDir.appendingPathComponent("\(id).schema.yaml")
-        guard FileManager.default.fileExists(atPath: src.path) else {
-            info("找不到 \(id).schema.yaml")
+    @objc private func schemaToggled(_ sender: NSButton) {
+        let enabled = selectedSchemaIDs()
+        guard !enabled.isEmpty else {
+            sender.state = .on
+            NSSound.beep()
+            schemaApplyStatus.stringValue = "至少保留一个输入方案。"
             return
         }
-        let panel = NSSavePanel()
-        panel.nameFieldStringValue = "\(id).schema.yaml"
-        guard panel.runModal() == .OK, let dest = panel.url else { return }
-        try? FileManager.default.removeItem(at: dest)
         do {
-            try FileManager.default.copyItem(at: src, to: dest)
-            info("已导出到 \(dest.path)")
+            try persistSchemaSelection(enabled)
+            schemaApplyStatus.stringValue = "已保存；点击「应用方案并重启」后更新 F4。"
         } catch {
-            info("导出失败：\(error.localizedDescription)")
+            reload()
+            info("保存方案失败：\(error.localizedDescription)")
         }
     }
 
-    /// Append `- schema: <id>` to patch.schema_list in default.custom.yaml
-    /// (with a .bak of the previous version). Naive line surgery, logged.
-    private func addToSchemaList(_ id: String) throws {
-        let file = userDir.appendingPathComponent("default.custom.yaml")
-        var text = (try? String(contentsOf: file, encoding: .utf8))
-            ?? "patch:\n  schema_list:\n"
-        guard !text.contains("schema: \(id)") else { return }
-        try? text.write(to: userDir.appendingPathComponent("default.custom.yaml.bak"),
-                        atomically: true, encoding: .utf8)
-        if let range = text.range(of: "schema_list:") {
-            let insertAt = text.index(range.upperBound, offsetBy: 0)
-            let lineEnd = text[insertAt...].firstIndex(of: "\n").map { text.index(after: $0) } ?? text.endIndex
-            text.insert(contentsOf: "    - schema: \(id)\n", at: lineEnd)
-        } else {
-            text += "\npatch:\n  schema_list:\n    - schema: \(id)\n"
+    private func selectedSchemaIDs() -> [String] {
+        InputSchemaCatalog.options.compactMap { option in
+            schemaChecks[option.id]?.state == .on ? option.id : nil
         }
-        try text.write(to: file, atomically: true, encoding: .utf8)
+    }
+
+    private func persistSchemaSelection(_ ids: [String]? = nil) throws {
+        let enabled = ids ?? selectedSchemaIDs()
+        try SchemaListStore.writeEnabledIDs(enabled,
+                                            to: userDir.appendingPathComponent("default.custom.yaml"))
+        let preferred = UserDefaults.standard.string(forKey: "preferredSchema") ?? ""
+        if !enabled.contains(preferred), let fallback = enabled.first {
+            UserDefaults.standard.set(fallback, forKey: "preferredSchema")
+            IMELog.write("settings: disabled preferred schema \(preferred); fallback -> \(fallback)")
+        }
+        IMELog.write("settings: F4 schemas -> \(enabled.joined(separator: ","))")
     }
 
     @objc private func deployAndRestart() {
+        do {
+            try persistSchemaSelection()
+        } catch {
+            info("无法应用方案：\(error.localizedDescription)")
+            return
+        }
         RimeBufferController.active?.forceCommit()
         info("开始部署…完成后输入法会自动重启。")
         DispatchQueue.global(qos: .userInitiated).async {
             _ = rimeEngine.start()
             let ok = BBRimeDeploy()
-            IMELog.write("settings: deploy=\(ok), restarting")
+            IMELog.write("settings: deploy=\(ok)")
             DispatchQueue.main.async {
+                guard ok else {
+                    self.info("部署失败，输入法没有重启。请查看运行日志。")
+                    return
+                }
                 KeyFrequencyStore.shared.saveNow()
                 exit(0)   // text-input system relaunches us
             }

@@ -23,6 +23,9 @@ final class ChordController {
 
     /// Buffer a chord key Rime just handled; (re)arm the release timer.
     func noteHandledChordKey(_ keycode: Int32, mask: Int32, client: any IMKTextInput) {
+        // Match Squirrel's rollover buffer: one physical key participates at
+        // most once in a chord, even if macOS emits key-repeat before release.
+        guard !pending.contains(where: { $0.keycode == keycode }) else { return }
         if pending.count < 50 { pending.append((keycode, mask)) }
         self.client = client
         timer?.invalidate()

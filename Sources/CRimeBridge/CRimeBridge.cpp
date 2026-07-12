@@ -334,7 +334,17 @@ bool BBRimeStart(const char* sharedDataDir,
     // build dir yet) so subsequent launches stay fast.
     if (gApi->start_maintenance) {
         bool needFullCheck = !fileExists(gUserDataDir + "/build");
-        if (gApi->start_maintenance(needFullCheck ? 1 : 0) && gApi->join_maintenance_thread) {
+        bool maintenanceStarted = gApi->start_maintenance(needFullCheck ? 1 : 0) != 0;
+        // squirrel.yaml is a frontend config, so librime's ordinary schema
+        // maintenance does not build it by itself. Deploy it explicitly (the
+        // same step Squirrel performs) so squirrel.custom.yaml is merged and
+        // chord_duration can be read from the authoritative deployed config.
+        // Calling this on every start is intentional and idempotent: existing
+        // RimeBuffer user dirs may predate this frontend-config deployment.
+        if (gApi->deploy_config_file) {
+            gApi->deploy_config_file("squirrel.yaml", "config_version");
+        }
+        if (maintenanceStarted && gApi->join_maintenance_thread) {
             gApi->join_maintenance_thread();
         }
     }

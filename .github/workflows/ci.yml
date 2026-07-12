@@ -27,7 +27,23 @@ jobs:
       - name: Validate installer metadata
         run: |
           plutil -lint Info.plist
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' Info.plist)
+          PARENT_ID=$(/usr/libexec/PlistBuddy -c 'Print :TISInputSourceID' Info.plist)
+          MODE_ID=$(/usr/libexec/PlistBuddy -c 'Print :ComponentInputModeDict:tsVisibleInputModeOrderedArrayKey:0' Info.plist)
+          DECLARED_MODE_ID=$(/usr/libexec/PlistBuddy -c "Print :ComponentInputModeDict:tsInputModeListKey:${MODE_ID}:TISInputSourceID" Info.plist)
+          CONNECTION=$(/usr/libexec/PlistBuddy -c 'Print :InputMethodConnectionName' Info.plist)
+          CHILD_REPERTOIRE=$(/usr/libexec/PlistBuddy -c "Print :ComponentInputModeDict:tsInputModeListKey:${MODE_ID}:tsInputModeCharacterRepertoireKey" Info.plist | tr -d '[:space:]')
+          test "$PARENT_ID" = "$BUNDLE_ID"
+          test "$PARENT_ID" != "$MODE_ID"
+          test "$MODE_ID" = "$DECLARED_MODE_ID"
+          test "$CONNECTION" = 'RimeBuffer_1_Connection'
+          test "$CHILD_REPERTOIRE" = 'Array{HansHant}'
+          if /usr/libexec/PlistBuddy -c 'Print :tsInputMethodCharacterRepertoireKey' Info.plist >/dev/null 2>&1; then
+            echo 'Parent input method must not declare a repertoire; only the Hans child mode does.'
+            exit 1
+          fi
           xmllint --noout scripts/pkg/distribution.xml
+          bash -n build_install.sh
           bash -n scripts/make-pkg.sh
           bash -n scripts/pkg/scripts/postinstall
 
@@ -36,11 +52,12 @@ jobs:
       - name: Build (debug)
         run: swift build
 
-      # These smoke harnesses exercise BufferModel + KeyFrequencyStore only and
+      # These smoke harnesses exercise local models/config stores only and
       # exit before the IMK/librime bootstrap, so they run without Squirrel.
       - name: Smoke tests
         run: |
           BIN="$(swift build --show-bin-path)/RimeBuffer"
+          "$BIN" schema-smoke
           "$BIN" buffer-smoke
           "$BIN" stats-smoke
           "$BIN" remote-smoke   # ECDH + framing + loopback socket (no Squirrel/network perms)

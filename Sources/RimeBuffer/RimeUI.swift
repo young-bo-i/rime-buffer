@@ -55,8 +55,7 @@ enum RimeUI {
     }
 
     static var candidateBackgroundColor: NSColor {
-        isNight ? NSColor.black.withAlphaComponent(0.78)
-                : NSColor.windowBackgroundColor.withAlphaComponent(0.96)
+        isNight ? color(0x101318) : .windowBackgroundColor
     }
 
     static func color(_ hex: UInt32, alpha: CGFloat = 1) -> NSColor {

@@ -11,6 +11,9 @@ if CommandLine.arguments.contains("stats-smoke") {
 if CommandLine.arguments.contains("buffer-smoke") {
     exit(runBufferSmokeTest() ? 0 : 1)
 }
+if CommandLine.arguments.contains("schema-smoke") {
+    exit(runSchemaListStoreSmokeTest() ? 0 : 1)
+}
 if CommandLine.arguments.contains("marine-bridge-smoke") {
     exit(runMarineBridgeSmokeTest() ? 0 : 1)
 }
@@ -18,8 +21,7 @@ if CommandLine.arguments.contains("remote-smoke") {
     exit(runRemoteSmokeTest() ? 0 : 1)
 }
 if CommandLine.arguments.contains("smoke") {
-    runEngineSmokeTest()
-    exit(0)
+    exit(runEngineSmokeTest() ? 0 : 1)
 }
 
 // Self-install into the input-source list. TIS enable/select only persist when
@@ -29,15 +31,17 @@ if CommandLine.arguments.contains("smoke") {
 // select itself, exactly like Squirrel's --install. Runs before the IMK server
 // so this short-lived instance never contends for the connection.
 if CommandLine.arguments.contains("--install") {
-    installInputSource()
-    exit(0)
+    exit(installInputSource() ? 0 : 1)
+}
+if CommandLine.arguments.contains("--prepare-update") {
+    exit(selectFallbackInputSourceForUpdate() ? 0 : 1)
 }
 
 // IMK bootstrap. The connection name MUST match Info.plist; IMK finds our
 // controller via InputMethodServerControllerClass = RimeBufferController.
 IMELog.reset("=== Enter输入法 (ETInput) IME launch ===")
 let connectionName = (Bundle.main.infoDictionary?["InputMethodConnectionName"] as? String)
-    ?? "ETInput_1_Connection"
+    ?? "RimeBuffer_1_Connection"
 
 NSApplication.shared.setActivationPolicy(.accessory)   // background app; panels can float above others
 
@@ -71,13 +75,12 @@ BufferModel.shared.onChange = {
 }
 candidateWindow.refreshBuffer()
 
-// Always-visible product control. The macOS input-source menu is left for
-// switching input methods; ETInput features live under this single icon.
-StatusMenu.shared.install()
+// No standalone NSStatusItem: ETInput's commands are supplied by
+// RimeBufferController.menu() under the system input-source icon.
 StatusMenu.shared.setHealthy(rimeEngine.isHealthy)
 
 // Auto-update: silently check GitHub Releases on launch + hourly, download in the
-// background, and surface a one-click install in the status menu when ready.
+// background, and surface it through the input method's controls when ready.
 UpdateManager.shared.startPeriodicUpdateCheck()
 
 // Remote typing ("隔空传字"): text committed here mirrors to a paired Mac; text
@@ -121,6 +124,30 @@ RemoteTypingService.shared.onStatusChange = {
     SettingsWindowController.shared.remoteStatusDidChange()
 }
 RemoteTypingService.shared.restart()   // starts only if enabled
+
+// macOS 26 can omit deactivateServer when another process switches input
+// sources through TISSelectInputSource. The distributed TIS notification still
+// arrives, so finish the live controller before its client becomes stranded.
+let inputSourceChangedObserver = DistributedNotificationCenter.default().addObserver(
+    forName: Notification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String),
+    object: nil,
+    queue: .main
+) { _ in
+    guard let current = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
+          let currentID = tisStringProperty(current, kTISPropertyInputSourceID) else {
+        IMELog.write("TIS source changed: current source unavailable")
+        return
+    }
+    let frontmostID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "unknown"
+    IMELog.write("TIS source changed: current=\(currentID) frontmost=\(frontmostID)")
+    let ownID = Bundle.main.bundleIdentifier ?? "com.isaac.inputmethod.RimeBuffer"
+    guard currentID != ownID, !currentID.hasPrefix(ownID + "."),
+          let controller = RimeBufferController.active else { return }
+    IMELog.write("input source changed away programmatically -> \(currentID); finalizing active controller")
+    controller.deactivateServer(controller.client())
+    candidateWindow.hide()
+}
+
 NSWorkspace.shared.notificationCenter.addObserver(
     forName: NSWorkspace.didActivateApplicationNotification,
     object: nil, queue: .main) { _ in
@@ -142,61 +169,234 @@ IMELog.write("bootstrap done: server=\(imkServer != nil) engineHealthy=\(rimeEng
 
 NSApplication.shared.run()
 
-// MARK: - Input-source self-install (register + enable + select)
+// MARK: - Input-source lifecycle
+
+private func tisStringProperty(_ source: TISInputSource, _ key: CFString) -> String? {
+    guard let pointer = TISGetInputSourceProperty(source, key) else { return nil }
+    return Unmanaged<CFString>.fromOpaque(pointer).takeUnretainedValue() as String
+}
+
+private func tisBoolProperty(_ source: TISInputSource, _ key: CFString) -> Bool {
+    guard let pointer = TISGetInputSourceProperty(source, key) else { return false }
+    return Unmanaged<NSNumber>.fromOpaque(pointer).takeUnretainedValue().boolValue
+}
+
+/// Move the login session off ETInput before replacing its bundle or killing
+/// its process. Long-lived clients (notably WeChat/Electron) otherwise retain a
+/// dead IMK document connection and can immediately undo later source changes.
+/// The legacy ETInput identity is included so an upgrade from older builds is
+/// also handed off cleanly.
+func selectFallbackInputSourceForUpdate() -> Bool {
+    let ownBundleIDs = Set([
+        Bundle.main.bundleIdentifier ?? "",
+        "com.isaac.inputmethod.RimeBuffer",
+        "com.isaac.inputmethod.ETInput",
+    ].filter { !$0.isEmpty })
+
+    func belongsToETInput(_ source: TISInputSource) -> Bool {
+        if let bundleID = tisStringProperty(source, kTISPropertyBundleID),
+           ownBundleIDs.contains(bundleID) {
+            return true
+        }
+        guard let sourceID = tisStringProperty(source, kTISPropertyInputSourceID) else {
+            return false
+        }
+        return ownBundleIDs.contains { sourceID == $0 || sourceID.hasPrefix($0 + ".") }
+    }
+
+    guard let current = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue() else {
+        print("prepare-update: no current keyboard input source")
+        return false
+    }
+    let currentID = tisStringProperty(current, kTISPropertyInputSourceID) ?? "(unknown)"
+    guard belongsToETInput(current) else {
+        print("prepare-update: current source is already safe: \(currentID)")
+        return true
+    }
+
+    var candidates: [TISInputSource] = []
+    if let layout = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue() {
+        candidates.append(layout)
+    }
+    if let ascii = TISCopyCurrentASCIICapableKeyboardInputSource()?.takeRetainedValue() {
+        candidates.append(ascii)
+    }
+    if let all = TISCreateInputSourceList(nil, false)?.takeRetainedValue() as? [TISInputSource] {
+        candidates.append(contentsOf: all.filter {
+            tisBoolProperty($0, kTISPropertyInputSourceIsASCIICapable)
+        })
+    }
+
+    for fallback in candidates {
+        guard !belongsToETInput(fallback),
+              tisBoolProperty(fallback, kTISPropertyInputSourceIsEnabled),
+              tisBoolProperty(fallback, kTISPropertyInputSourceIsSelectCapable) else {
+            continue
+        }
+        let fallbackID = tisStringProperty(fallback, kTISPropertyInputSourceID) ?? "(unknown)"
+        let status = TISSelectInputSource(fallback)
+        print("prepare-update: select fallback=\(status) \(fallbackID)")
+        guard status == noErr else { continue }
+
+        for _ in 0..<20 {
+            if let selected = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
+               !belongsToETInput(selected) {
+                let selectedID = tisStringProperty(selected, kTISPropertyInputSourceID) ?? fallbackID
+                print("prepare-update: fallback verified: \(selectedID)")
+                return true
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+    }
+
+    print("prepare-update: could not select a non-ETInput ASCII fallback")
+    return false
+}
 
 /// Registers this bundle's path with TIS, then enables + selects our input mode.
 /// Must run inside the login session (see call site). Mirrors Squirrel's
 /// RegisterInputSource + ActivateInputSource.
-func installInputSource() {
-    // Product name is ETInput / Enter输入法, but the input-source id intentionally
-    // stays on the legacy RimeBuffer id. macOS stores this id in protected TIS
-    // preferences, so changing it leaves existing users with stale, hard-to-edit
-    // rows and can hide the newly installed input method.
-    let modeID = "com.isaac.inputmethod.RimeBuffer"
+func installInputSource() -> Bool {
+    guard let component = Bundle.main.infoDictionary?["ComponentInputModeDict"] as? [String: Any],
+          let visibleModes = component["tsVisibleInputModeOrderedArrayKey"] as? [String],
+          let modeID = visibleModes.first,
+          let bundleID = Bundle.main.bundleIdentifier else {
+        print("install: missing bundle/input-mode metadata")
+        return false
+    }
+
     // Register THIS bundle's URL so the input-source id resolves to this exact
     // copy (kills the "duplicate id at multiple paths → blank row" problem).
     let status = TISRegisterInputSource(Bundle.main.bundleURL as CFURL)
     print("install: register \(Bundle.main.bundleURL.path) -> \(status)")
+    guard status == noErr else { return false }
+
     guard let cf = TISCreateInputSourceList(nil, true)?.takeRetainedValue() else {
-        print("install: no input source list"); return
+        print("install: no input source list")
+        return false
     }
     let list = cf as! [TISInputSource]
-    var done = false
+    var parentSource: TISInputSource?
+    var selectableMode: TISInputSource?
+
+    // TIS exposes a non-selectable parent input method plus one or more
+    // selectable modes. Both must be enabled, but only the child mode may be
+    // passed to TISSelectInputSource. Discover both first because TIS does not
+    // promise list order; enabling the child before its parent can fail.
     for src in list {
-        guard let p = TISGetInputSourceProperty(src, kTISPropertyInputSourceID) else { continue }
-        let id = Unmanaged<CFString>.fromOpaque(p).takeUnretainedValue() as String
-        if id == modeID {
-            let e = TISEnableInputSource(src)
-            let s = TISSelectInputSource(src)
-            print("install: enable=\(e) select=\(s) \(id)")
-            done = true
+        guard tisStringProperty(src, kTISPropertyBundleID) == bundleID else { continue }
+        let id = tisStringProperty(src, kTISPropertyInputSourceID) ?? "(unknown)"
+        if id == bundleID, !tisBoolProperty(src, kTISPropertyInputSourceIsSelectCapable) {
+            parentSource = src
+        }
+        if id == modeID, tisBoolProperty(src, kTISPropertyInputSourceIsSelectCapable) {
+            selectableMode = src
         }
     }
-    if !done { print("install: mode \(modeID) not found in TIS list") }
+
+    guard let parentSource, let selectableMode else {
+        print("install: parent or selectable mode \(modeID) not found in TIS list")
+        return false
+    }
+
+    let parentIsASCIICapable = tisBoolProperty(parentSource, kTISPropertyInputSourceIsASCIICapable)
+    let parentType = tisStringProperty(parentSource, kTISPropertyInputSourceType) ?? "(unknown)"
+    let parentCategory = tisStringProperty(parentSource, kTISPropertyInputSourceCategory) ?? "(unknown)"
+    print("install: parent metadata id=\(bundleID) type=\(parentType) category=\(parentCategory) ascii=\(parentIsASCIICapable)")
+
+    let isASCIICapable = tisBoolProperty(selectableMode, kTISPropertyInputSourceIsASCIICapable)
+    let sourceType = tisStringProperty(selectableMode, kTISPropertyInputSourceType) ?? "(unknown)"
+    let category = tisStringProperty(selectableMode, kTISPropertyInputSourceCategory) ?? "(unknown)"
+    print("install: mode metadata id=\(modeID) type=\(sourceType) category=\(category) ascii=\(isASCIICapable)")
+    guard !isASCIICapable else {
+        print("install: refusing ASCII-capable Chinese mode; TIS is serving stale metadata")
+        return false
+    }
+
+    let parentEnableStatus = tisBoolProperty(parentSource, kTISPropertyInputSourceIsEnabled)
+        ? noErr : TISEnableInputSource(parentSource)
+    print("install: enable parent=\(parentEnableStatus) \(bundleID)")
+    guard parentEnableStatus == noErr else { return false }
+
+    let modeEnableStatus = tisBoolProperty(selectableMode, kTISPropertyInputSourceIsEnabled)
+        ? noErr : TISEnableInputSource(selectableMode)
+    print("install: enable mode=\(modeEnableStatus) \(modeID)")
+    guard modeEnableStatus == noErr else { return false }
+
+    guard tisBoolProperty(parentSource, kTISPropertyInputSourceIsEnabled),
+          tisBoolProperty(selectableMode, kTISPropertyInputSourceIsEnabled) else {
+        print("install: parent/mode did not remain enabled")
+        return false
+    }
+
+    // The historical WeChat crash is in Apple's input-source HUD before our
+    // controller runs. Never trigger that path automatically while WeChat is
+    // frontmost; registration/enabling still succeeds and ABC remains active.
+    if NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.tencent.xinWeChat" {
+        print("install: WeChat is frontmost; skipping automatic selection")
+        return true
+    }
+
+    let selectStatus = TISSelectInputSource(selectableMode)
+    print("install: select=\(selectStatus) \(modeID)")
+
+    // On macOS 26 the first selection after changing input-mode metadata can
+    // return paramErr even though TextInputMenuAgent applies it asynchronously.
+    // Trust the observable TIS state, not only the immediate OSStatus.
+    for _ in 0..<20 {
+        if let current = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
+           tisStringProperty(current, kTISPropertyInputSourceID) == modeID {
+            print("install: selected mode verified")
+            return true
+        }
+        Thread.sleep(forTimeInterval: 0.1)
+    }
+    print("install: selection verification timed out")
+    return false
 }
 
 // MARK: - Engine smoke harness (bring-up only)
 
-func runEngineSmokeTest() {
+func runEngineSmokeTest() -> Bool {
     let engine = RimeEngine()
     print("== RimeBuffer engine smoke test ==")
     let ok = engine.start()
     print("start:", ok, "healthy:", engine.isHealthy)
-    guard ok, engine.isHealthy else { print("lastError:", engine.lastError()); return }
+    guard ok, engine.isHealthy else {
+        print("FAILED: engine start:", engine.lastError())
+        return false
+    }
 
     let session = engine.createSession()
     print("session:", session)
-    guard session != 0 else { print("no session"); return }
+    guard session != 0 else {
+        print("FAILED: no session")
+        return false
+    }
+    defer { engine.destroySession(session) }
+
+    let expectedSchemas = InputSchemaCatalog.defaultEnabledIDs
+    let deployedSchemas = engine.schemaList()
+    let deployedIDs = deployedSchemas.map(\.id)
+    print("deployed schemas:", deployedSchemas.map { "\($0.id)=\($0.name)" }.joined(separator: ", "))
+    guard deployedIDs == expectedSchemas else {
+        print("FAILED: schema_list expected=\(expectedSchemas) actual=\(deployedIDs)")
+        return false
+    }
 
     let defaultStatus = engine.getStatus(session: session)
     print("default schema: \(defaultStatus.schemaId) (\(defaultStatus.schemaName))")
 
-    // Candidate test on the DEFAULT deployed schema — this is the one a
-    // self-contained (default-only) build always ships, so it proves the
-    // bundled librime + SharedSupport actually produce input end-to-end.
+    // Use a sequential Chinese schema for deterministic CLI key replay. The
+    // default my_combo schema expects physical chord press/release timing.
+    guard engine.selectSchema("rime_ice", session: session),
+          engine.getStatus(session: session).schemaId == "rime_ice" else {
+        print("FAILED: cannot select rime_ice")
+        return false
+    }
     engine.setOption("ascii_mode", false, session: session)
     engine.clearComposition(session: session)
-    print("typing 'nihao' on \(defaultStatus.schemaId) ...")
+    print("typing 'nihao' on rime_ice ...")
     for scalar in "nihao".unicodeScalars {
         _ = engine.processKey(Int32(scalar.value), session: session)
     }
@@ -205,15 +405,124 @@ func runEngineSmokeTest() {
     for c in ctx.candidates {
         print("  [\(c.label)] \(c.text)\(c.comment.isEmpty ? "" : "  · \(c.comment)")")
     }
+    guard ctx.candidates.contains(where: { $0.text == "你好" }) else {
+        print("FAILED: rime_ice did not produce 你好")
+        return false
+    }
     _ = engine.processKey(0x20, session: session)
-    print("committed:", engine.takeCommit(session: session) ?? "(none)")
+    let chineseCommit = engine.takeCommit(session: session) ?? ""
+    print("committed:", chineseCommit)
+    guard chineseCommit == "你好" else {
+        print("FAILED: unexpected Chinese commit '\(chineseCommit)'")
+        return false
+    }
 
-    // Informational: schema switch only does something if that schema is
-    // installed (the custom 并击 schemas aren't part of a default-only build).
-    let picked = engine.selectSchema("my_serial", session: session)
-    print("select my_serial:", picked, "-> schema now:", engine.getStatus(session: session).schemaId)
-    engine.destroySession(session)
-    print("== done ==")
+    guard engine.selectSchema("english", session: session),
+          engine.getStatus(session: session).schemaId == "english" else {
+        print("FAILED: cannot select english")
+        return false
+    }
+    engine.setOption("ascii_mode", false, session: session)
+
+    engine.clearComposition(session: session)
+    for scalar in "hel".unicodeScalars {
+        _ = engine.processKey(Int32(scalar.value), session: session)
+    }
+    let completionContext = engine.getContext(session: session)
+    let completionSamples = completionContext.candidates.prefix(8).map(\.text)
+    print("english 'hel' candidates:", completionSamples)
+    guard completionSamples.contains(where: { $0.lowercased().hasPrefix("hel") && $0.count > 3 }) else {
+        print("FAILED: English prefix completion is unavailable")
+        return false
+    }
+
+    func typeAndCommitEnglish(_ text: String) -> String {
+        engine.clearComposition(session: session)
+        for scalar in text.unicodeScalars {
+            _ = engine.processKey(Int32(scalar.value), session: session)
+        }
+        _ = engine.processKey(0x20, session: session)
+        return engine.takeCommit(session: session) ?? ""
+    }
+
+    let helloCommit = typeAndCommitEnglish("hello")
+    let worldCommit = typeAndCommitEnglish("world")
+    let rawCommit = typeAndCommitEnglish("codexzzq")
+    print("english commits:", [helloCommit, worldCommit, rawCommit])
+    guard helloCommit == "hello",
+          worldCommit == " world",
+          rawCommit.trimmingCharacters(in: .whitespaces) == "codexzzq" else {
+        print("FAILED: English commit/spacing/raw fallback")
+        return false
+    }
+
+    guard engine.selectSchema("my_combo", session: session) else {
+        print("FAILED: cannot return to my_combo")
+        return false
+    }
+
+    // F4 owns schema switching. The configured members/order were asserted
+    // above; this additionally proves the switcher key enters Rime's menu.
+    engine.clearComposition(session: session)
+    let f4Handled = engine.processKey(RimeKey.f1 + 3, session: session)
+    let switcherContext = engine.getContext(session: session)
+    print("F4 handled=\(f4Handled) candidates=\(switcherContext.candidates.map(\.text))")
+    let switcherNames = Set(switcherContext.candidates.map(\.text))
+    let expectedNames = Set(InputSchemaCatalog.options.map(\.name))
+    guard f4Handled, expectedNames.isSubset(of: switcherNames) else {
+        print("FAILED: F4 schema switcher is incomplete")
+        return false
+    }
+    print("engine smoke: OK")
+    return true
+}
+
+func runSchemaListStoreSmokeTest() -> Bool {
+    print("== RimeBuffer schema-list store smoke test ==")
+    let root = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("rimebuffer-schema-list-\(UUID().uuidString)")
+    let config = root.appendingPathComponent("default.custom.yaml")
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    do {
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let initial = """
+        patch:
+          schema_list:
+            - schema: my_serial
+            - schema: melt_eng
+          menu:
+            page_size: 9
+          custom_flag: keep-me
+        """
+        try initial.write(to: config, atomically: true, encoding: .utf8)
+        try SchemaListStore.writeEnabledIDs(["english", "my_combo", "rime_ice", "double_pinyin"],
+                                            to: config)
+        let ids = SchemaListStore.enabledIDs(at: config)
+        let rewritten = try String(contentsOf: config, encoding: .utf8)
+        guard ids == InputSchemaCatalog.defaultEnabledIDs,
+              rewritten.contains("page_size: 9"),
+              rewritten.contains("custom_flag: keep-me"),
+              !rewritten.contains("my_serial"),
+              !rewritten.contains("melt_eng") else {
+            print("FAILED: schema-list rewrite", ids, rewritten)
+            return false
+        }
+
+        do {
+            try SchemaListStore.writeEnabledIDs([], to: config)
+            print("FAILED: empty schema selection was accepted")
+            return false
+        } catch SchemaListStore.StoreError.emptySelection {
+            // Expected.
+        }
+    } catch {
+        print("FAILED: schema-list store error:", error)
+        return false
+    }
+
+    print("schema-list store smoke: OK")
+    return true
 }
 
 func runStatsSmokeTest() -> Bool {
@@ -272,6 +581,23 @@ func runStatsSmokeTest() -> Bool {
 
 func runBufferSmokeTest() -> Bool {
     print("== RimeBuffer buffer smoke test ==")
+    guard RimeKey.fromVirtualKeyCode(22) == 0x36,
+          RimeKey.fromVirtualKeyCode(27) == 0x2d,
+          RimeBufferController.shouldConsumeCodexBufferControlText(
+              [0x1e, 0x1f], bundleId: "com.openai.codex", bufferActive: true
+          ),
+          !RimeBufferController.shouldConsumeCodexBufferControlText(
+              [0x1e], bundleId: "com.apple.Terminal", bufferActive: true
+          ),
+          !RimeBufferController.shouldConsumeCodexBufferControlText(
+              [0x1f], bundleId: "com.openai.codex", bufferActive: false
+          ),
+          !RimeBufferController.shouldConsumeCodexBufferControlText(
+              [0x01], bundleId: "com.openai.codex", bufferActive: true
+          ) else {
+        print("FAILED: buffer control-key escape gate")
+        return false
+    }
     let model = BufferModel.shared
     let oldEnabled = model.enabled
     let oldDeliver = model.deliver

@@ -10,8 +10,8 @@ let candidateWindow = CandidateWindow()
 @objc(RimeBufferController)
 final class RimeBufferController: IMKInputController {
 
-    /// The controller currently owning focus — StatusMenu routes schema
-    /// switches here so they apply to the live session immediately.
+    /// The controller currently owning focus — menu commands and F4 preference
+    /// persistence route through the live session here.
     private(set) static weak var active: RimeBufferController?
     private static weak var recent: RimeBufferController?
     private static var chordDurationCache: TimeInterval?
@@ -35,6 +35,10 @@ final class RimeBufferController: IMKInputController {
     private var lastBufferArrowCommandDirection = 0
     private var bufferEnterPending = false
     private var bufferEnterSuppressUntilPhysicalUp = false
+    /// Physical polling can observe the release before IMK delivers `.keyUp`.
+    /// Keep a separate latch so that late keyUp/command events never escape to
+    /// the host field after the tap/hold action has already completed.
+    private var bufferEnterAwaitingKeyUp = false
     private var bufferEnterClient: IMKTextInput?
     private var bufferEnterHardwareKeyCode: CGKeyCode = 36
     private var bufferEnterStartedAt: CFAbsoluteTime = 0
@@ -76,7 +80,15 @@ final class RimeBufferController: IMKInputController {
         Self.recent = self
         let activeClient: IMKTextInput? = (sender as? IMKTextInput) ?? self.client()
         if let activeClient {
+            // Match Squirrel's keyboard-layout policy. `last` deliberately
+            // leaves the client's physical layout untouched; forcing ABC here
+            // perturbs TextInputUI's per-document state (notably in WeChat).
+            let keyboard = Self.resolveKeyboardLayoutOverride()
+            if let layout = keyboard.layout {
+                activeClient.overrideKeyboard(withKeyboardNamed: layout)
+            }
             lastClient = activeClient
+            IMELog.write("activate: client=\(bundleId(of: activeClient)) keyboard=\(keyboard.layout ?? "last") source=\(keyboard.source)")
         }
         guard rimeEngine.start() else {
             StatusMenu.shared.setHealthy(false)
@@ -105,16 +117,133 @@ final class RimeBufferController: IMKInputController {
         }
         guard session != 0 else { return false }
 
-        if Self.chordDurationCache == nil,
-           let d = rimeEngine.configDouble("squirrel", "chord_duration") {
-            Self.chordDurationCache = d       // cache only a SUCCESSFUL read
-            IMELog.write("chord_duration=\(d)")
+        if Self.chordDurationCache == nil {
+            let resolved = Self.resolveChordDuration()
+            Self.chordDurationCache = resolved.duration
+            IMELog.write("chord_duration=\(resolved.duration) source=\(resolved.source)")
         }
         chord.duration = Self.chordDurationCache ?? 0.10
 
-        if applyPreference || fresh { applyStoredPreferenceIfNeeded() }
-        if currentSchemaId.isEmpty { refreshSchema() }
+        if applyPreference || fresh {
+            applyStoredPreferenceIfNeeded()
+            // A reused controller may still cache my_combo after another
+            // controller changed the global preference to melt_eng. Refresh
+            // before the first key so chord gating follows the actual schema.
+            refreshSchema()
+        } else if currentSchemaId.isEmpty {
+            refreshSchema()
+        }
         return true
+    }
+
+    /// Squirrel deploys its frontend config into ~/Library/Rime/build, but a
+    /// standalone librime deployment does not build squirrel.yaml. Read our
+    /// copied frontend config directly before falling back to the bridge so a
+    /// missing build file does not silently double the user's chord window.
+    private static func resolveChordDuration() -> (duration: TimeInterval, source: String) {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let environment = ProcessInfo.processInfo.environment
+        let userDirectory = environment["RIMEBUFFER_USER_DIR"].map {
+            URL(fileURLWithPath: $0, isDirectory: true)
+        } ?? home.appendingPathComponent("Library/RimeBuffer", isDirectory: true)
+        let squirrelDirectory = home.appendingPathComponent("Library/Rime", isDirectory: true)
+        let candidates = [
+            userDirectory.appendingPathComponent("build/squirrel.yaml"),
+            userDirectory.appendingPathComponent("squirrel.custom.yaml"),
+            userDirectory.appendingPathComponent("squirrel.yaml"),
+            squirrelDirectory.appendingPathComponent("build/squirrel.yaml"),
+            squirrelDirectory.appendingPathComponent("squirrel.custom.yaml"),
+            squirrelDirectory.appendingPathComponent("squirrel.yaml"),
+        ]
+
+        var visited: Set<String> = []
+        for url in candidates {
+            let path = url.standardizedFileURL.path
+            guard visited.insert(path).inserted,
+                  let duration = chordDuration(in: url) else { continue }
+            return (duration, path)
+        }
+
+        if let duration = rimeEngine.configDouble("squirrel", "chord_duration"),
+           duration > 0 {
+            return (duration, "librime:squirrel")
+        }
+        return (0.10, "fallback")
+    }
+
+    private static func chordDuration(in url: URL) -> TimeInterval? {
+        guard let contents = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        for rawLine in contents.components(separatedBy: .newlines) {
+            let uncommented = rawLine.split(separator: "#", maxSplits: 1,
+                                            omittingEmptySubsequences: false).first ?? ""
+            let parts = uncommented.split(separator: ":", maxSplits: 1,
+                                          omittingEmptySubsequences: false)
+            guard parts.count == 2,
+                  parts[0].trimmingCharacters(in: .whitespaces) == "chord_duration",
+                  let duration = Double(parts[1].trimmingCharacters(in: .whitespaces)),
+                  duration > 0 else { continue }
+            return duration
+        }
+        return nil
+    }
+
+    /// Resolve Squirrel's `keyboard_layout` setting without requiring a
+    /// deployed `build/squirrel.yaml`. `last`/missing means no override;
+    /// `default` is ABC; an explicit TIS layout id is passed through.
+    private static func resolveKeyboardLayoutOverride() -> (layout: String?, source: String) {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let environment = ProcessInfo.processInfo.environment
+        let userDirectory = environment["RIMEBUFFER_USER_DIR"].map {
+            URL(fileURLWithPath: $0, isDirectory: true)
+        } ?? home.appendingPathComponent("Library/RimeBuffer", isDirectory: true)
+        let squirrelDirectory = home.appendingPathComponent("Library/Rime", isDirectory: true)
+        let candidates = [
+            userDirectory.appendingPathComponent("build/squirrel.yaml"),
+            userDirectory.appendingPathComponent("squirrel.custom.yaml"),
+            userDirectory.appendingPathComponent("squirrel.yaml"),
+            squirrelDirectory.appendingPathComponent("build/squirrel.yaml"),
+            squirrelDirectory.appendingPathComponent("squirrel.custom.yaml"),
+            squirrelDirectory.appendingPathComponent("squirrel.yaml"),
+        ]
+
+        var visited: Set<String> = []
+        for url in candidates {
+            let path = url.standardizedFileURL.path
+            guard visited.insert(path).inserted,
+                  let configured = keyboardLayout(in: url) else { continue }
+            switch configured {
+            case "", "last":
+                return (nil, path)
+            case "default":
+                return ("com.apple.keylayout.ABC", path)
+            default:
+                return (configured, path)
+            }
+        }
+        return (nil, "fallback:last")
+    }
+
+    private static func keyboardLayout(in url: URL) -> String? {
+        guard let contents = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        for rawLine in contents.components(separatedBy: .newlines) {
+            let uncommented = rawLine.split(separator: "#", maxSplits: 1,
+                                            omittingEmptySubsequences: false).first ?? ""
+            let parts = uncommented.split(separator: ":", maxSplits: 1,
+                                          omittingEmptySubsequences: false)
+            guard parts.count == 2,
+                  parts[0].trimmingCharacters(in: .whitespaces) == "keyboard_layout" else {
+                continue
+            }
+            var value = parts[1].trimmingCharacters(in: .whitespaces)
+            if value.count >= 2,
+               (value.hasPrefix("\"") && value.hasSuffix("\"")
+                || value.hasPrefix("'") && value.hasSuffix("'")) {
+                value.removeFirst()
+                value.removeLast()
+            }
+            return value
+        }
+        return nil
     }
 
     override func deactivateServer(_ sender: Any!) {
@@ -197,15 +326,43 @@ final class RimeBufferController: IMKInputController {
             }
             return insertDirectText(shiftedText, client: client, source: "shift fallback")
         }
+
+        let routedKeycode = keysym(for: event)
+        let routedMask = RimeKey.modifierMask(from: event.modifierFlags)
+        // Buffer mode owns the complete Return gesture. Intercept it before the
+        // engine-health fallback, otherwise a transient engine failure inserts
+        // a raw newline into the host field. Preserve the existing behavior
+        // where Return first commits any live raw composition into the buffer.
+        if routedKeycode == RimeKey.return,
+           BufferModel.shared.active
+                || bufferEnterPending
+                || bufferEnterSuppressUntilPhysicalUp
+                || bufferEnterAwaitingKeyUp {
+            if BufferModel.shared.active,
+               routedMask & (RimeKey.controlMask | RimeKey.altMask | RimeKey.superMask) == 0,
+               rimeEngine.start(), ensureSessionReady(),
+               commitRawInput(client: client) {
+                return true
+            }
+            return handleBufferEnter(RimeKey.return,
+                                     client: client,
+                                     hardwareKeyCode: event.keyCode)
+        }
         // Engine down → raw fallback so the user can still type latin.
         guard rimeEngine.start(), ensureSessionReady() else {
+            if consumeLeakedCodexBufferControlText(event, client: client, path: "engine down") {
+                return true
+            }
             return rawFallback(event, client: client)
         }
-        guard let keycode = keysym(for: event) else {
+        guard let keycode = routedKeycode else {
             chord.flush()   // the app will insert this key NOW; a pending chord must land first
+            if consumeLeakedCodexBufferControlText(event, client: client, path: "unmapped key") {
+                return true
+            }
             return false
         }
-        let mask = RimeKey.modifierMask(from: event.modifierFlags)
+        let mask = routedMask
         if handleBufferBackspace(keycode, mask: mask, client: client) {
             return true
         }
@@ -215,9 +372,6 @@ final class RimeBufferController: IMKInputController {
         if keycode == RimeKey.return,
            mask & (RimeKey.controlMask | RimeKey.altMask | RimeKey.superMask) == 0,
            commitRawInput(client: client) {
-            return true
-        }
-        if handleBufferEnter(keycode, mask: mask, client: client, hardwareKeyCode: event.keyCode) {
             return true
         }
         if candidateOptionSelecting {
@@ -239,7 +393,12 @@ final class RimeBufferController: IMKInputController {
         if handleBufferHorizontalArrow(keycode, mask: mask, client: client, source: "key") {
             return true
         }
-        return processRimeKey(keycode, mask: mask, client: client)
+        let handled = processRimeKey(keycode, mask: mask, client: client)
+        if !handled,
+           consumeLeakedCodexBufferControlText(event, client: client, path: "Rime unhandled") {
+            return true
+        }
+        return handled
     }
 
     private func handleBufferEscape(_ keycode: Int32, mask: Int32, client: IMKTextInput) -> Bool {
@@ -253,11 +412,9 @@ final class RimeBufferController: IMKInputController {
     }
 
     private func handleBufferEnter(_ keycode: Int32,
-                                   mask: Int32,
                                    client: IMKTextInput,
                                    hardwareKeyCode: UInt16) -> Bool {
-        guard keycode == RimeKey.return,
-              mask & (RimeKey.controlMask | RimeKey.altMask | RimeKey.superMask) == 0 else {
+        guard keycode == RimeKey.return else {
             return false
         }
 
@@ -266,6 +423,16 @@ final class RimeBufferController: IMKInputController {
             IMELog.write("buffer enter key consumed after command")
             lastBufferEnterKeyHandledAt = now
             return true
+        }
+
+        if bufferEnterAwaitingKeyUp,
+           !bufferEnterPending,
+           !bufferEnterSuppressUntilPhysicalUp {
+            // Some IMK clients never deliver keyUp after our physical-release
+            // poll. A subsequent keyDown is therefore a fresh press, not a
+            // repeat of the completed gesture.
+            IMELog.write("buffer enter new keyDown replaced missing late keyUp")
+            bufferEnterAwaitingKeyUp = false
         }
 
         if bufferEnterPending || bufferEnterSuppressUntilPhysicalUp {
@@ -282,7 +449,10 @@ final class RimeBufferController: IMKInputController {
 
     private func handleBufferEnterKeyUp(_ keycode: Int32, client: IMKTextInput) -> Bool {
         guard keycode == RimeKey.return else { return false }
-        guard bufferEnterPending || bufferEnterSuppressUntilPhysicalUp else { return false }
+        guard bufferEnterPending
+                || bufferEnterSuppressUntilPhysicalUp
+                || bufferEnterAwaitingKeyUp
+                || BufferModel.shared.active else { return false }
 
         lastBufferEnterKeyHandledAt = CFAbsoluteTimeGetCurrent()
         if bufferEnterPending {
@@ -297,6 +467,13 @@ final class RimeBufferController: IMKInputController {
             resetBufferEnterGesture()
             return true
         }
+
+        if bufferEnterAwaitingKeyUp {
+            IMELog.write("buffer enter late keyUp consumed after physical release poll")
+            resetBufferEnterGesture()
+            return true
+        }
+        IMELog.write("buffer enter keyUp consumed while buffer active")
         return true
     }
 
@@ -366,6 +543,7 @@ final class RimeBufferController: IMKInputController {
             let now = CFAbsoluteTimeGetCurrent()
             if bufferEnterPending
                 || bufferEnterSuppressUntilPhysicalUp
+                || bufferEnterAwaitingKeyUp
                 || now - lastBufferEnterKeyHandledAt < Self.duplicateEnterCommandWindow {
                 IMELog.write("buffer enter command consumed after key selector=\(NSStringFromSelector(selector))")
                 lastBufferEnterCommandHandledAt = now
@@ -520,9 +698,12 @@ final class RimeBufferController: IMKInputController {
         return true
     }
 
-    private func resetBufferEnterGesture() {
+    private func resetBufferEnterGesture(preserveKeyUpSuppression: Bool = false) {
         bufferEnterPending = false
         bufferEnterSuppressUntilPhysicalUp = false
+        if !preserveKeyUpSuppression {
+            bufferEnterAwaitingKeyUp = false
+        }
         bufferEnterClient = nil
         bufferEnterPollTimer?.invalidate()
         bufferEnterPollTimer = nil
@@ -532,6 +713,7 @@ final class RimeBufferController: IMKInputController {
     private func beginBufferEnterGesture(client: IMKTextInput, hardwareKeyCode: UInt16) {
         bufferEnterPending = true
         bufferEnterSuppressUntilPhysicalUp = false
+        bufferEnterAwaitingKeyUp = true
         bufferEnterClient = client
         bufferEnterHardwareKeyCode = CGKeyCode(hardwareKeyCode)
         bufferEnterStartedAt = CFAbsoluteTimeGetCurrent()
@@ -555,7 +737,7 @@ final class RimeBufferController: IMKInputController {
                 scheduleBufferEnterPoll()
             } else {
                 IMELog.write("buffer enter physical key released after hold")
-                resetBufferEnterGesture()
+                resetBufferEnterGesture(preserveKeyUpSuppression: true)
             }
             return
         }
@@ -570,7 +752,7 @@ final class RimeBufferController: IMKInputController {
             IMELog.write("buffer enter physical release detected; tap")
             lastBufferEnterKeyHandledAt = CFAbsoluteTimeGetCurrent()
             _ = performBufferEnter(client: bufferEnterClient, source: "key tap")
-            resetBufferEnterGesture()
+            resetBufferEnterGesture(preserveKeyUpSuppression: true)
             return
         }
 
@@ -598,6 +780,10 @@ final class RimeBufferController: IMKInputController {
     @discardableResult
     private func beginCandidateOptionSelection(client: IMKTextInput) -> Bool {
         if candidateOptionSelecting { return true }
+        if chord.hasPending {
+            IMELog.write("candidate option resolving pending chord before local action")
+            chord.flush()
+        }
         guard candidateWindow.hasCandidates,
               let candidateText = candidateWindow.selectedCandidateText,
               candidateWindow.beginSingleCharacterSelection(candidateText: candidateText) else {
@@ -997,20 +1183,67 @@ final class RimeBufferController: IMKInputController {
         return false
     }
 
+    /// Codex currently inserts U+001E/U+001F when their Control-key events are
+    /// returned unhandled. In buffer mode those bytes are never buffer content
+    /// and must not leak into the editor. Keep this host-specific so terminal
+    /// Control+^ / Control+_ semantics remain untouched.
+    private func consumeLeakedCodexBufferControlText(
+        _ event: NSEvent,
+        client: IMKTextInput,
+        path: String
+    ) -> Bool {
+        guard let characters = event.characters,
+              !characters.isEmpty else { return false }
+        let scalars = characters.unicodeScalars.map(\.value)
+        guard Self.shouldConsumeCodexBufferControlText(
+            scalars,
+            bundleId: bundleId(of: client),
+            bufferActive: BufferModel.shared.active
+        ) else { return false }
+
+        let renderedScalars = scalars
+            .map { String(format: "U+%04X", $0) }
+            .joined(separator: ",")
+        let ignoringModifiers = event.charactersIgnoringModifiers?.unicodeScalars
+            .map { String(format: "U+%04X", $0.value) }
+            .joined(separator: ",") ?? ""
+        IMELog.write("buffer swallowed Codex control text path=\(path) keyCode=\(event.keyCode) scalars=\(renderedScalars) ignoring=\(ignoringModifiers) flags=\(event.modifierFlags.rawValue)")
+        return true
+    }
+
+    static func shouldConsumeCodexBufferControlText(
+        _ scalars: [UInt32],
+        bundleId: String,
+        bufferActive: Bool
+    ) -> Bool {
+        bufferActive
+            && bundleId == "com.openai.codex"
+            && !scalars.isEmpty
+            && scalars.allSatisfy { $0 == 0x1e || $0 == 0x1f }
+    }
+
     // MARK: Chord replay
 
     private func replayChordReleases(_ keys: [(keycode: Int32, mask: Int32)],
                                      client: (any IMKTextInput)?) {
         guard session != 0 else { return }
+        var handledCount = 0
         for key in keys {
-            _ = rimeEngine.processKey(key.keycode,
-                                      mask: key.mask | RimeKey.releaseMask,
-                                      session: session)
-            // Chord commits go through the SAME routing as ordinary commits —
-            // buffer mode must intercept these too.
-            if let client { drainCommit(client) }
+            if rimeEngine.processKey(key.keycode,
+                                     mask: key.mask | RimeKey.releaseMask,
+                                     session: session) {
+                handledCount += 1
+            }
         }
-        if let client { updateUI(client: client) }
+        // Match Squirrel's batch boundary: all synthesized releases must reach
+        // chord_composer before the resulting commit is observed by the buffer.
+        if let client {
+            drainCommit(client)
+            updateUI(client: client)
+        }
+        if keys.count > 1 {
+            IMELog.write("chord replay keys=\(keys.count) handled=\(handledCount) duration=\(chord.duration)")
+        }
     }
 
     // MARK: Candidate selection (mouse; routed here via `active` from main.swift)
@@ -1019,6 +1252,21 @@ final class RimeBufferController: IMKInputController {
         guard candidateWindow.hasCandidates else { return false }
         if candidateOptionSelecting || candidateWindow.isSingleCharacterSelectionActive {
             return handleCandidateOptionSelectionKey(keycode, client: client)
+        }
+        let isLocalCandidateAction: Bool
+        switch keycode {
+        case RimeKey.left, RimeKey.right, RimeKey.down, RimeKey.up,
+             RimeKey.return, RimeKey.space, 0x30:
+            isLocalCandidateAction = true
+        case 0x31...0x39:
+            isLocalCandidateAction = candidateWindow.isExpanded
+        default:
+            isLocalCandidateAction = false
+        }
+        if isLocalCandidateAction, chord.hasPending {
+            IMELog.write("candidate key \(keycode) resolving pending chord before local action")
+            chord.flush()
+            guard candidateWindow.hasCandidates else { return false }
         }
         switch keycode {
         case RimeKey.left:
@@ -1048,7 +1296,32 @@ final class RimeBufferController: IMKInputController {
             return true
         case 0x30:
             guard !BufferModel.shared.active else { return true }
+            let selection = candidateWindow.selectedCandidateSelection
+            let candidateText = candidateWindow.selectedCandidateText ?? ""
+            let originalBlockCount = BufferModel.shared.blocks.count
+            IMELog.write("buffer zero begin text='\(candidateText)' pageOffset=\(selection?.pageOffset ?? -1) index=\(selection?.index ?? -1)")
             candidateWindow.performBufferAction()
+            guard let selection else {
+                IMELog.write("buffer zero enabled without candidate selection")
+                return true
+            }
+            let selected = selectCandidate(selection)
+            let finalBlockCount = BufferModel.shared.blocks.count
+            if selected, finalBlockCount > originalBlockCount {
+                IMELog.write("buffer zero committed text='\(candidateText)' blocks=\(originalBlockCount)->\(finalBlockCount)")
+            } else if selected {
+                IMELog.write("buffer zero selected but no commit text='\(candidateText)'")
+            } else {
+                IMELog.write("buffer zero failed text='\(candidateText)' buffer remains enabled")
+            }
+            return true
+        case 0x31...0x39 where candidateWindow.isExpanded:
+            let visibleIndex = Int(keycode - 0x31)
+            guard let selection = candidateWindow.expandedSelection(atVisibleIndex: visibleIndex) else {
+                IMELog.write("candidate matrix digit \(visibleIndex + 1) ignored; candidate is hidden")
+                return true
+            }
+            selectCandidate(selection)
             return true
         default:
             return false
@@ -1069,22 +1342,31 @@ final class RimeBufferController: IMKInputController {
         return true
     }
 
-    func selectCandidate(_ selection: CandidateSelection) {
+    @discardableResult
+    func selectCandidate(_ selection: CandidateSelection) -> Bool {
         guard session != 0,
-              let client = (self.client() as IMKTextInput?) ?? lastClient else { return }
+              let client = (self.client() as IMKTextInput?) ?? lastClient else {
+            IMELog.write("candidate select failed stage=session-or-client pageOffset=\(selection.pageOffset) index=\(selection.index)")
+            return false
+        }
         let moved = moveRimeCandidatePage(delta: selection.pageOffset)
         guard moved == selection.pageOffset else {
             _ = moveRimeCandidatePage(delta: -moved)
             updateUI(client: client)
-            return
+            IMELog.write("candidate select failed stage=page-move requested=\(selection.pageOffset) moved=\(moved)")
+            return false
         }
         guard rimeEngine.selectCandidate(onPage: selection.index, session: session) else {
             _ = moveRimeCandidatePage(delta: -moved)
             updateUI(client: client)
-            return
+            IMELog.write("candidate select failed stage=select pageOffset=\(selection.pageOffset) index=\(selection.index)")
+            return false
         }
-        drainCommit(client)
+        if drainCommit(client) == nil {
+            IMELog.write("candidate selected without commit pageOffset=\(selection.pageOffset) index=\(selection.index)")
+        }
         updateUI(client: client)
+        return true
     }
 
     private func previewCandidatePages(maxCount: Int) -> [RimeContextModel] {
@@ -1174,8 +1456,9 @@ final class RimeBufferController: IMKInputController {
     /// The single routing point (§5.9): buffer-OFF → straight to the field;
     /// buffer-ON → the commit becomes a staged block and the inline preedit is
     /// cleared from the field (nothing lands until the buffer flushes).
-    private func drainCommit(_ client: IMKTextInput) {
-        guard let commit = rimeEngine.takeCommit(session: session) else { return }
+    @discardableResult
+    private func drainCommit(_ client: IMKTextInput) -> String? {
+        guard let commit = rimeEngine.takeCommit(session: session) else { return nil }
         if BufferModel.shared.active {
             BufferModel.shared.append(commit)
             composition.clear(client: client)
@@ -1186,6 +1469,7 @@ final class RimeBufferController: IMKInputController {
             RemoteTypingService.shared.send(commit)   // mirror to paired Mac (no-op if off)
             IMELog.write("commit '\(commit)' -> \(bundleId(of: client))")
         }
+        return commit
     }
 
     /// Buffer-flush destination: insert into whatever field currently has
@@ -1316,28 +1600,37 @@ final class RimeBufferController: IMKInputController {
         }
     }
 
-    // MARK: Schema switching (StatusMenu)
+    // MARK: System input-source menu / stored F4 schema preference
 
     override func menu() -> NSMenu! {
-        // Keep the system input-source menu clean. Product controls live in the
-        // dedicated ETInput status item because IMK menu actions are unreliable
-        // across macOS versions and duplicate the status item.
-        nil
+        StatusMenu.shared.makeInputSourceMenu(target: self)
     }
 
-    /// Set the preferred schema globally: persist it, apply to the live
-    /// session now, and let every other controller apply it on next focus.
-    static func applyPreferredSchema(_ id: String) {
-        UserDefaults.standard.set(id, forKey: "preferredSchema")
-        IMELog.write("preferredSchema -> \(id)")
-        active?.switchSchema(id)
+    // InputMethodKit routes commands from the system text-input menu back to
+    // the active controller. Keep these selectors on the controller (as the
+    // framework expects) and forward the work to the shared menu coordinator.
+    @objc func openSettingsFromInputMenu(_ sender: Any?) {
+        StatusMenu.shared.openSettings()
     }
 
-    private func switchSchema(_ id: String) {
-        guard session != 0 else { return }
-        forceCommit()   // resolve any composition before the engine resets it
-        _ = rimeEngine.selectSchema(id, session: session)
-        refreshSchema()
+    @objc func checkUpdateFromInputMenu(_ sender: Any?) {
+        StatusMenu.shared.checkUpdate()
+    }
+
+    @objc func openLogFromInputMenu(_ sender: Any?) {
+        StatusMenu.shared.openLog()
+    }
+
+    @objc func deployAndRestartFromInputMenu(_ sender: Any?) {
+        StatusMenu.shared.deployAndRestart()
+    }
+
+    @objc func reinstallFromInputMenu(_ sender: Any?) {
+        StatusMenu.shared.reinstallInputMethod()
+    }
+
+    @objc func restartFromInputMenu(_ sender: Any?) {
+        StatusMenu.shared.restart()
     }
 
     private func applyStoredPreferenceIfNeeded() {

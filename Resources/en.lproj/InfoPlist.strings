@@ -2,3 +2,4 @@
 "CFBundleDisplayName" = "Enter输入法";
 "CFBundleName" = "Enter输入法";
 "com.isaac.inputmethod.RimeBuffer" = "Enter输入法";
+"com.isaac.inputmethod.RimeBuffer.Hans" = "Enter输入法";
