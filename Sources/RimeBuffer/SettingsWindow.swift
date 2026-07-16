@@ -49,10 +49,14 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     private let bufferCheck = NSButton(checkboxWithTitle: "启用缓冲模式（提交先暂存，手动确认上屏）", target: nil, action: nil)
     private let resetOnAppSwitchCheck = NSButton(checkboxWithTitle: "切换到其他应用时清空缓冲区", target: nil, action: nil)
     private let gatewayEnableCheck = NSButton(checkboxWithTitle: "启用本地网关（127.0.0.1，仅回环，Token 鉴权）", target: nil, action: nil)
+    private let gatewayConfigField = NSTextField(string: "")
+    private let gatewayCopyConfigButton = NSButton(title: "复制配置 (JSON)", target: nil, action: nil)
     private let gatewayCommandField = NSTextField(string: "")
-    private let gatewayCopyButton = NSButton(title: "复制接入命令", target: nil, action: nil)
+    private let gatewayCopyButton = NSButton(title: "复制 Claude Code 命令", target: nil, action: nil)
     private var candidateMetricFields: [CandidateWindowMetric: NSTextField] = [:]
-    private var candidateMetricSteppers: [CandidateWindowMetric: NSStepper] = [:]
+    private var candidateMetricSliders: [CandidateWindowMetric: NSSlider] = [:]
+    private var candidateMetricHints: [CandidateWindowMetric: NSTextField] = [:]
+    private var candidatePreview: CandidatePreviewView?
     private let chordDurationField = NSTextField(string: "")
     private let chordDurationStepper = NSStepper()
     private let statsDatePicker = NSDatePicker()
@@ -196,6 +200,15 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         resetOnAppSwitchCheck.action = #selector(resetOnAppSwitchToggled)
         gatewayEnableCheck.target = self
         gatewayEnableCheck.action = #selector(gatewayToggled)
+        gatewayConfigField.isEditable = false
+        gatewayConfigField.isSelectable = true
+        gatewayConfigField.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        gatewayConfigField.lineBreakMode = .byCharWrapping
+        gatewayConfigField.maximumNumberOfLines = 12
+        gatewayConfigField.translatesAutoresizingMaskIntoConstraints = false
+        gatewayConfigField.widthAnchor.constraint(equalToConstant: 560).isActive = true
+        gatewayCopyConfigButton.target = self
+        gatewayCopyConfigButton.action = #selector(copyGatewayConfig)
         gatewayCommandField.isEditable = false
         gatewayCommandField.isSelectable = true
         gatewayCommandField.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
@@ -260,18 +273,26 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
             field.delegate = self
             field.tag = metric.tag
             field.translatesAutoresizingMaskIntoConstraints = false
-            field.widthAnchor.constraint(equalToConstant: 64).isActive = true
+            field.widthAnchor.constraint(equalToConstant: 52).isActive = true
 
-            let stepper = NSStepper()
-            stepper.minValue = metric.range.lowerBound
-            stepper.maxValue = metric.range.upperBound
-            stepper.increment = 1
-            stepper.target = self
-            stepper.action = #selector(candidateMetricStepperChanged(_:))
-            stepper.tag = metric.tag
+            let slider = NSSlider(value: metric.defaultValue,
+                                  minValue: metric.range.lowerBound,
+                                  maxValue: metric.range.upperBound,
+                                  target: self,
+                                  action: #selector(candidateMetricSliderChanged(_:)))
+            slider.isContinuous = true
+            slider.tag = metric.tag
+            slider.translatesAutoresizingMaskIntoConstraints = false
+            slider.widthAnchor.constraint(equalToConstant: 190).isActive = true
+
+            let hint = NSTextField(labelWithString: "")
+            hint.font = .systemFont(ofSize: 10)
+            hint.textColor = .tertiaryLabelColor
+            hint.isHidden = true
 
             candidateMetricFields[metric] = field
-            candidateMetricSteppers[metric] = stepper
+            candidateMetricSliders[metric] = slider
+            candidateMetricHints[metric] = hint
         }
     }
 
@@ -327,6 +348,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         ])
         if page == .maintenance { refreshStats() }
         if page == .connections { refreshRemoteStatus() }
+        if page == .candidateWindow { refreshCandidateMetricControls() }
     }
 
     private func sidebarGroupHeader(_ title: String, first: Bool) -> NSView {
@@ -424,10 +446,15 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     }
 
     private func candidateWindowPage() -> NSView {
+        let preview = CandidatePreviewView(maxWidth: 620)
+        candidatePreview = preview
         return contentColumn([
             title("候选窗"),
-            caption("调整候选窗主题、尺寸和候选文字密度。"),
+            caption("拖动滑块即时预览效果；滑块灰色区间表示当前不支持（受关联项限制），无法调整。"),
             spacer(8),
+            sectionLabel("实时预览"),
+            preview,
+            spacer(16),
             sectionLabel("主题"),
             appearancePopUp,
             spacer(16),
@@ -476,9 +503,15 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         nameRow.spacing = 8
 
         let sourcesNote = NSTextField(wrappingLabelWithString:
-            "本地智能体（MCP）和脚本（HTTP）把文字送进缓冲区收件箱，需你逐条确认后才成为可发送的块。")
+            "标准 MCP（Streamable HTTP，2025-06-18）端点，任何 MCP 客户端／智能体都能接入——"
+            + "把文字送进缓冲区收件箱，需你逐条确认后才成为可发送的块。")
         sourcesNote.font = .systemFont(ofSize: 11)
         sourcesNote.textColor = .tertiaryLabelColor
+
+        let cliNote = NSTextField(wrappingLabelWithString:
+            "或用 Claude Code 命令行一键注册（等价于上面的配置）：")
+        cliNote.font = .systemFont(ofSize: 11)
+        cliNote.textColor = .tertiaryLabelColor
 
         let laterSources = NSStackView(views: [
             comingSoonRow("SSE 订阅", "订阅外部事件流，流式进缓冲区", "M6"),
@@ -506,13 +539,36 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
             gatewayEnableCheck,
             sourcesNote,
             spacer(6),
-            secondaryLabel("接入命令（贴进终端，让本地智能体接上）"),
+            secondaryLabel("接入配置（标准 MCP，任意客户端通用）"),
+            gatewayConfigField,
+            gatewayCopyConfigButton,
+            spacer(10),
+            cliNote,
             gatewayCommandField,
             gatewayCopyButton,
             spacer(16),
             sectionLabel("更多来源"),
             laterSources,
         ])
+    }
+
+    /// Client-agnostic MCP server config — the `mcpServers` shape Claude Desktop,
+    /// Cursor, Cline, VS Code and most agents read. Any client that speaks
+    /// Streamable HTTP can drop this in.
+    private func gatewayConfigJSON() -> String {
+        """
+        {
+          "mcpServers": {
+            "etinput": {
+              "type": "http",
+              "url": "http://127.0.0.1:\(LocalGateway.shared.port)/mcp",
+              "headers": {
+                "Authorization": "Bearer \(GatewayToken.current())"
+              }
+            }
+          }
+        }
+        """
     }
 
     private func gatewayCommand() -> String {
@@ -522,6 +578,11 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
 
     @objc private func gatewayToggled() {
         LocalGateway.shared.enabled = gatewayEnableCheck.state == .on
+    }
+
+    @objc private func copyGatewayConfig() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(gatewayConfigJSON(), forType: .string)
     }
 
     @objc private func copyGatewayCommand() {
@@ -723,20 +784,22 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         label.font = .systemFont(ofSize: 12)
         label.textColor = .secondaryLabelColor
         label.translatesAutoresizingMaskIntoConstraints = false
-        label.widthAnchor.constraint(equalToConstant: 96).isActive = true
+        label.widthAnchor.constraint(equalToConstant: 84).isActive = true
 
         let unit = NSTextField(labelWithString: metric.unit)
         unit.font = .systemFont(ofSize: 11)
         unit.textColor = .tertiaryLabelColor
         unit.translatesAutoresizingMaskIntoConstraints = false
-        unit.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        unit.widthAnchor.constraint(equalToConstant: 20).isActive = true
 
+        let slider = candidateMetricSliders[metric] ?? NSSlider()
         let field = candidateMetricFields[metric] ?? NSTextField(string: "")
-        let stepper = candidateMetricSteppers[metric] ?? NSStepper()
+        let hint = candidateMetricHints[metric] ?? NSTextField(labelWithString: "")
+        slider.removeFromSuperview()
         field.removeFromSuperview()
-        stepper.removeFromSuperview()
+        hint.removeFromSuperview()
 
-        let row = NSStackView(views: [label, field, stepper, unit])
+        let row = NSStackView(views: [label, slider, field, unit, hint])
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 8
@@ -765,6 +828,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         bufferCheck.state = BufferModel.shared.enabled ? .on : .off
         resetOnAppSwitchCheck.state = BufferModel.shared.resetOnAppSwitch ? .on : .off
         gatewayEnableCheck.state = LocalGateway.shared.enabled ? .on : .off
+        gatewayConfigField.stringValue = gatewayConfigJSON()
         gatewayCommandField.stringValue = gatewayCommand()
         if let idx = (0..<appearancePopUp.numberOfItems).first(where: {
             appearancePopUp.item(at: $0)?.representedObject as? String == RimeUI.appearance.rawValue
@@ -783,11 +847,81 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     }
 
     private func refreshCandidateMetricControls() {
+        var stored: [CandidateWindowMetric: Double] = [:]
         for metric in CandidateWindowMetric.allCases {
-            let value = CandidateWindowMetrics.value(for: metric)
-            candidateMetricFields[metric]?.stringValue = formatMetricValue(value)
-            candidateMetricSteppers[metric]?.doubleValue = Double(value)
+            stored[metric] = Double(CandidateWindowMetrics.value(for: metric))
         }
+        updateCandidateControls(resolveMetricValues(stored))
+    }
+
+    /// Current (possibly unsaved) values straight off the live controls.
+    private func liveMetricValues() -> [CandidateWindowMetric: Double] {
+        var values: [CandidateWindowMetric: Double] = [:]
+        for metric in CandidateWindowMetric.allCases {
+            values[metric] = candidateMetricSliders[metric]?.doubleValue
+                ?? Double(CandidateWindowMetrics.value(for: metric))
+        }
+        return values
+    }
+
+    /// Resolve raw control values into the supported set: a "container" metric
+    /// (strip height, candidate glyph) is free within its own range; a "child"
+    /// (button height, index label) is clamped to what its container currently
+    /// allows, so an unsupported interval can never be committed.
+    private func resolveMetricValues(_ raw: [CandidateWindowMetric: Double]) -> [CandidateWindowMetric: Double] {
+        var out: [CandidateWindowMetric: Double] = [:]
+        for metric in CandidateWindowMetric.allCases where metric.containerMetric == nil {
+            out[metric] = clamp((raw[metric] ?? metric.defaultValue).rounded(), to: metric.range)
+        }
+        for metric in CandidateWindowMetric.allCases where metric.containerMetric != nil {
+            let supported = metric.supportedRange(given: out)
+            out[metric] = clamp((raw[metric] ?? metric.defaultValue).rounded(), to: supported)
+        }
+        return out
+    }
+
+    /// Push a resolved value set into every control (value + supported bounds +
+    /// constraint hint) and refresh the live preview. Does NOT persist.
+    private func updateCandidateControls(_ values: [CandidateWindowMetric: Double]) {
+        for metric in CandidateWindowMetric.allCases {
+            let supported = metric.supportedRange(given: values)
+            let value = values[metric] ?? metric.defaultValue
+
+            if let slider = candidateMetricSliders[metric] {
+                slider.minValue = supported.lowerBound
+                slider.maxValue = supported.upperBound
+                slider.doubleValue = value
+            }
+            candidateMetricFields[metric]?.stringValue = formatMetricValue(CGFloat(value))
+            (candidateMetricFields[metric]?.formatter as? NumberFormatter)?
+                .maximum = NSNumber(value: supported.upperBound)
+
+            if let hint = candidateMetricHints[metric] {
+                let capped = supported.upperBound < metric.range.upperBound - 0.5
+                if capped, let dep = metric.containerMetric {
+                    hint.stringValue = "≤ \(Int(supported.upperBound))（受\(dep.metric.title)限制）"
+                    hint.isHidden = false
+                } else {
+                    hint.stringValue = ""
+                    hint.isHidden = true
+                }
+            }
+        }
+        candidatePreview?.metrics = candidateMetrics(from: values)
+    }
+
+    private func candidateMetrics(from values: [CandidateWindowMetric: Double]) -> CandidateWindowMetrics {
+        func get(_ metric: CandidateWindowMetric) -> CGFloat {
+            CGFloat(values[metric] ?? metric.defaultValue)
+        }
+        return CandidateWindowMetrics(
+            baseWidth: get(.baseWidth),
+            compactStripHeight: get(.compactStripHeight),
+            compactCandidateHeight: get(.compactCandidateHeight),
+            preeditHeight: get(.preeditHeight),
+            candidateFontSize: get(.candidateFontSize),
+            labelFontSize: get(.labelFontSize)
+        )
     }
 
     private func refreshChordDurationControl() {
@@ -1014,6 +1148,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         guard let raw = appearancePopUp.selectedItem?.representedObject as? String,
               let mode = RimeAppearanceMode(rawValue: raw) else { return }
         RimeUI.appearance = mode
+        candidatePreview?.reload()
         IMELog.write("appearance -> \(mode.rawValue)")
     }
 
@@ -1038,12 +1173,12 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         refreshChordDurationControl()
     }
 
-    @objc private func candidateMetricFieldChanged(_ sender: NSTextField) {
-        syncCandidateMetricControl(tag: sender.tag, value: sender.doubleValue)
+    @objc private func candidateMetricSliderChanged(_ sender: NSSlider) {
+        handleCandidateMetricEdit(tag: sender.tag, value: sender.doubleValue)
     }
 
-    @objc private func candidateMetricStepperChanged(_ sender: NSStepper) {
-        syncCandidateMetricControl(tag: sender.tag, value: sender.doubleValue)
+    @objc private func candidateMetricFieldChanged(_ sender: NSTextField) {
+        handleCandidateMetricEdit(tag: sender.tag, value: sender.doubleValue)
     }
 
     func controlTextDidEndEditing(_ obj: Notification) {
@@ -1053,27 +1188,24 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
             return
         }
         guard candidateMetricFields.values.contains(where: { $0 === field }) else { return }
-        syncCandidateMetricControl(tag: field.tag, value: field.doubleValue)
+        handleCandidateMetricEdit(tag: field.tag, value: field.doubleValue)
     }
 
-    private func syncCandidateMetricControl(tag: Int, value: Double) {
+    /// Live edit of one metric: fold it into the current control values, re-resolve
+    /// the supported set (so dependents follow), and push everything back — the
+    /// preview updates immediately, nothing is persisted until "应用修改".
+    private func handleCandidateMetricEdit(tag: Int, value: Double) {
         guard let metric = CandidateWindowMetric.fromTag(tag) else { return }
-        let clamped = clamp(value, to: metric.range)
-        candidateMetricFields[metric]?.stringValue = formatMetricValue(CGFloat(clamped))
-        candidateMetricSteppers[metric]?.doubleValue = clamped
+        var raw = liveMetricValues()
+        raw[metric] = value
+        updateCandidateControls(resolveMetricValues(raw))
     }
 
     @objc private func applyCandidateMetrics() {
         window?.makeFirstResponder(nil)
-        var values: [CandidateWindowMetric: Double] = [:]
-        for metric in CandidateWindowMetric.allCases {
-            let raw = candidateMetricFields[metric]?.doubleValue
-                ?? candidateMetricSteppers[metric]?.doubleValue
-                ?? metric.defaultValue
-            values[metric] = clamp(raw, to: metric.range)
-        }
-        CandidateWindowMetrics.apply(values)
-        refreshCandidateMetricControls()
+        let resolved = resolveMetricValues(liveMetricValues())
+        CandidateWindowMetrics.apply(resolved)
+        updateCandidateControls(resolved)
     }
 
     @objc private func resetCandidateMetrics() {

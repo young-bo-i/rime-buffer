@@ -72,10 +72,13 @@ final class InboundTrayWindow: NSObject {
         field.translatesAutoresizingMaskIntoConstraints = false
         field.widthAnchor.constraint(equalToConstant: 528).isActive = true
 
-        let copyBtn = NSButton(title: "复制接入命令", target: self, action: #selector(copyCommand))
-        let hint = NSTextField(labelWithString: "把上面这行贴进终端，Claude Code 就能用 buffer_push 往这里推文字。")
+        let copyBtn = NSButton(title: "复制 Claude Code 命令", target: self, action: #selector(copyCommand))
+        let hint = NSTextField(wrappingLabelWithString:
+            "标准 MCP 端点，任何 MCP 客户端／智能体都能接入用 buffer_push 往这里推文字。"
+            + "上面这行是 Claude Code 的便捷写法；通用 JSON 配置见「设置 › 连接」。")
         hint.font = .systemFont(ofSize: 11)
         hint.textColor = .secondaryLabelColor
+        hint.preferredMaxLayoutWidth = 528
 
         let box = NSStackView(views: [status, field, copyBtn, hint])
         box.orientation = .vertical

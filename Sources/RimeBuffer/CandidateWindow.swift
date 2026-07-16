@@ -142,6 +142,68 @@ struct CandidateWindowMetrics {
     }
 }
 
+// MARK: - Pure compact-strip geometry
+
+/// The layout math shared by the live candidate window and the settings preview.
+/// Both must compute identical geometry, so it lives here as pure functions of a
+/// `CandidateWindowMetrics` value — no window state, no side effects.
+enum CandidateLayout {
+    static let actionButtonSize: CGFloat = 28
+    static let candidateSpacing: CGFloat = 3
+    static let candidateSeparatorWidth: CGFloat = 8
+    static let barSpacing: CGFloat = 4
+    static let barHorizontalPadding: CGFloat = 5
+    static let compactCandidateHorizontalPadding: CGFloat = 6
+    static let rootSpacing: CGFloat = 5
+
+    /// Vertical inset between the strip edge and its tallest child.
+    static func barVerticalPadding(_ m: CandidateWindowMetrics) -> CGFloat {
+        let tallestChild = max(actionButtonSize, min(m.compactCandidateHeight, m.compactStripHeight - 2))
+        return max(1, floor((m.compactStripHeight - tallestChild) / 2))
+    }
+
+    /// The height a candidate button actually renders at — never taller than the
+    /// space the strip leaves for it. This clamp is exactly why the button-height
+    /// control must forbid values above `stripHeight - 2` (see `supportedRange`):
+    /// anything larger is silently absorbed here and never shows.
+    static func candidateButtonHeight(_ m: CandidateWindowMetrics) -> CGFloat {
+        let available = m.compactStripHeight - 2 * barVerticalPadding(m)
+        return min(m.compactCandidateHeight, max(22, available))
+    }
+
+    /// The compact strip's rendered height (grows to fit the button if needed).
+    static func compactStripHeight(_ m: CandidateWindowMetrics) -> CGFloat {
+        max(m.compactStripHeight, candidateButtonHeight(m) + 2 * barVerticalPadding(m))
+    }
+
+    static func dividerHeight(_ m: CandidateWindowMetrics) -> CGFloat {
+        min(compactStripHeight(m) - 8, max(20, m.compactStripHeight - 10))
+    }
+}
+
+extension CandidateWindowMetric {
+    /// A metric whose current value caps this metric's usable upper bound. A
+    /// "child" (candidate button, index label) can never render larger than the
+    /// "container" that holds it (the strip, the candidate glyph); past that
+    /// point the window silently clamps, so the size control must not allow it.
+    var containerMetric: (metric: CandidateWindowMetric, slack: Double)? {
+        switch self {
+        case .compactCandidateHeight: return (.compactStripHeight, 2)   // button ≤ strip − 2px
+        case .labelFontSize:          return (.candidateFontSize, 0)     // index label ≤ candidate glyph
+        default:                      return nil
+        }
+    }
+
+    /// The sub-interval of `range` that actually renders as set, given the
+    /// current values of the other metrics. Outside it the layout absorbs the
+    /// change, so the UI hard-limits controls to this range.
+    func supportedRange(given values: [CandidateWindowMetric: Double]) -> ClosedRange<Double> {
+        guard let dep = containerMetric, let cap = values[dep.metric] else { return range }
+        let upper = max(range.lowerBound, min(range.upperBound, cap - dep.slack))
+        return range.lowerBound...upper
+    }
+}
+
 struct CandidateSelection {
     let pageOffset: Int
     let index: Int
@@ -1288,17 +1350,17 @@ final class CandidateWindow {
     }
 
     private func dividerHeight(for metrics: CandidateWindowMetrics) -> CGFloat {
+        // Expanded matrices grow the strip beyond the compact height; keep the
+        // divider bounded to whichever is taller.
         min(effectiveStripHeight(for: metrics) - 8, max(20, metrics.compactStripHeight - 10))
     }
 
     private func barVerticalPadding(for metrics: CandidateWindowMetrics) -> CGFloat {
-        let tallestChild = max(Self.actionButtonSize, min(metrics.compactCandidateHeight, metrics.compactStripHeight - 2))
-        return max(1, floor((metrics.compactStripHeight - tallestChild) / 2))
+        CandidateLayout.barVerticalPadding(metrics)
     }
 
     private func compactCandidateButtonHeight(for metrics: CandidateWindowMetrics) -> CGFloat {
-        let available = metrics.compactStripHeight - 2 * barVerticalPadding(for: metrics)
-        return min(metrics.compactCandidateHeight, max(22, available))
+        CandidateLayout.candidateButtonHeight(metrics)
     }
 
     private func candidateAreaHeight(for metrics: CandidateWindowMetrics) -> CGFloat {
@@ -1429,4 +1491,205 @@ private final class CandidateActionButton: NSButton {
     required init?(coder: NSCoder) { fatalError() }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
+// MARK: - Settings live preview
+
+/// A non-interactive mock of the candidate window for the settings page. It
+/// renders a sample composition using the SAME geometry (`CandidateLayout`) and
+/// theme (`RimeUI`) as the real window, so dragging a size control shows the
+/// exact effect before "应用修改" ever touches the live window. Rebuilds whenever
+/// `metrics` changes; call `reload()` after a theme switch.
+final class CandidatePreviewView: NSView {
+    /// Metrics to render — set live from the (unsaved) settings controls.
+    var metrics: CandidateWindowMetrics = .current {
+        didSet { rebuild() }
+    }
+
+    private let canvasPadding: CGFloat = 18
+    private let maxWidth: CGFloat
+    private let backdrop = NSView()
+    private let windowMock = NSView()
+    private let preeditLabel = NSTextField(labelWithString: "")
+    private let strip = NSView()
+    private let candidateRow = NSStackView()
+    private let divider = NSView()
+    private let gear = NSButton()
+    private var heightConstraint: NSLayoutConstraint!
+
+    private var preeditHeightConstraint: NSLayoutConstraint!
+    private var stripTopConstraint: NSLayoutConstraint!
+    private var stripHeightConstraint: NSLayoutConstraint!
+    private var windowWidthConstraint: NSLayoutConstraint!
+    private var candidateRowHeightConstraint: NSLayoutConstraint!
+    private var dividerHeightConstraint: NSLayoutConstraint!
+
+    private let sampleCandidates: [(label: String, text: String)] = [
+        ("1", "你好"), ("2", "拟好"), ("3", "你"), ("4", "尼"),
+        ("5", "泥"), ("6", "逆"), ("7", "拟"), ("8", "腻"), ("9", "妮"),
+    ]
+    private let samplePreedit = "ni hao"
+
+    init(maxWidth: CGFloat) {
+        self.maxWidth = maxWidth
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+
+        backdrop.wantsLayer = true
+        backdrop.layer?.cornerRadius = 10
+        backdrop.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(backdrop)
+
+        windowMock.wantsLayer = true
+        windowMock.translatesAutoresizingMaskIntoConstraints = false
+        backdrop.addSubview(windowMock)
+
+        preeditLabel.lineBreakMode = .byTruncatingTail
+        preeditLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        strip.wantsLayer = true
+        strip.layer?.cornerRadius = 6
+        strip.layer?.borderWidth = 1
+        strip.layer?.masksToBounds = true
+        strip.translatesAutoresizingMaskIntoConstraints = false
+
+        candidateRow.orientation = .horizontal
+        candidateRow.alignment = .centerY
+        candidateRow.spacing = CandidateLayout.candidateSpacing
+        candidateRow.translatesAutoresizingMaskIntoConstraints = false
+        candidateRow.setContentHuggingPriority(.required, for: .horizontal)
+
+        divider.wantsLayer = true
+        divider.translatesAutoresizingMaskIntoConstraints = false
+
+        gear.isBordered = false
+        gear.image = RimeUI.symbol("gearshape", pointSize: 15, weight: .semibold)
+        gear.image?.isTemplate = true
+        gear.imagePosition = .imageOnly
+        gear.isEnabled = false
+        gear.translatesAutoresizingMaskIntoConstraints = false
+
+        let bar = NSStackView(views: [candidateRow, divider, gear])
+        bar.orientation = .horizontal
+        bar.alignment = .centerY
+        bar.spacing = CandidateLayout.barSpacing
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        strip.addSubview(bar)
+
+        windowMock.addSubview(preeditLabel)
+        windowMock.addSubview(strip)
+
+        heightConstraint = heightAnchor.constraint(equalToConstant: 120)
+        preeditHeightConstraint = preeditLabel.heightAnchor.constraint(equalToConstant: metrics.preeditHeight)
+        stripTopConstraint = strip.topAnchor.constraint(equalTo: preeditLabel.bottomAnchor, constant: CandidateLayout.rootSpacing)
+        stripHeightConstraint = strip.heightAnchor.constraint(equalToConstant: CandidateLayout.compactStripHeight(metrics))
+        windowWidthConstraint = windowMock.widthAnchor.constraint(equalToConstant: metrics.baseWidth)
+        candidateRowHeightConstraint = candidateRow.heightAnchor.constraint(equalToConstant: CandidateLayout.candidateButtonHeight(metrics))
+        dividerHeightConstraint = divider.heightAnchor.constraint(equalToConstant: CandidateLayout.dividerHeight(metrics))
+
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: maxWidth),
+            heightConstraint,
+
+            backdrop.leadingAnchor.constraint(equalTo: leadingAnchor),
+            backdrop.trailingAnchor.constraint(equalTo: trailingAnchor),
+            backdrop.topAnchor.constraint(equalTo: topAnchor),
+            backdrop.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+            windowMock.leadingAnchor.constraint(equalTo: backdrop.leadingAnchor, constant: canvasPadding),
+            windowMock.topAnchor.constraint(equalTo: backdrop.topAnchor, constant: canvasPadding),
+
+            preeditLabel.leadingAnchor.constraint(equalTo: windowMock.leadingAnchor, constant: 2),
+            preeditLabel.topAnchor.constraint(equalTo: windowMock.topAnchor),
+            preeditLabel.trailingAnchor.constraint(lessThanOrEqualTo: windowMock.trailingAnchor),
+
+            strip.leadingAnchor.constraint(equalTo: windowMock.leadingAnchor),
+            strip.trailingAnchor.constraint(equalTo: windowMock.trailingAnchor),
+            strip.bottomAnchor.constraint(equalTo: windowMock.bottomAnchor),
+
+            bar.leadingAnchor.constraint(equalTo: strip.leadingAnchor, constant: CandidateLayout.barHorizontalPadding),
+            bar.trailingAnchor.constraint(equalTo: strip.trailingAnchor, constant: -CandidateLayout.barHorizontalPadding),
+            bar.centerYAnchor.constraint(equalTo: strip.centerYAnchor),
+
+            divider.widthAnchor.constraint(equalToConstant: 1),
+            gear.widthAnchor.constraint(equalToConstant: CandidateLayout.actionButtonSize),
+            gear.heightAnchor.constraint(equalToConstant: CandidateLayout.actionButtonSize),
+
+            preeditHeightConstraint, stripTopConstraint, stripHeightConstraint,
+            windowWidthConstraint, candidateRowHeightConstraint, dividerHeightConstraint,
+        ])
+
+        rebuild()
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    /// Re-apply theme + geometry (call after a night/day switch).
+    func reload() { rebuild() }
+
+    private func rebuild() {
+        let m = metrics
+
+        // Theme.
+        backdrop.layer?.backgroundColor = RimeUI.surface3.cgColor
+        windowMock.layer?.backgroundColor = NSColor.clear.cgColor
+        strip.layer?.backgroundColor = RimeUI.candidateBackgroundColor.cgColor
+        strip.layer?.borderColor = RimeUI.borderStrong.cgColor
+        divider.layer?.backgroundColor = RimeUI.borderStrong.cgColor
+        gear.contentTintColor = RimeUI.textSecondary
+
+        // Preedit.
+        preeditLabel.font = .monospacedSystemFont(ofSize: max(12, m.preeditHeight - 5), weight: .regular)
+        preeditLabel.textColor = RimeUI.textSecondary
+        preeditLabel.stringValue = samplePreedit
+
+        // Geometry (identical to the live window).
+        let stripHeight = CandidateLayout.compactStripHeight(m)
+        let buttonHeight = CandidateLayout.candidateButtonHeight(m)
+        let windowWidth = min(m.baseWidth, maxWidth - 2 * canvasPadding)
+
+        preeditHeightConstraint.constant = m.preeditHeight
+        stripHeightConstraint.constant = stripHeight
+        candidateRowHeightConstraint.constant = buttonHeight
+        dividerHeightConstraint.constant = CandidateLayout.dividerHeight(m)
+        windowWidthConstraint.constant = windowWidth
+
+        // Fill candidates until the strip is full (mirrors real paging).
+        candidateRow.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        let gearArea = CandidateLayout.actionButtonSize + CandidateLayout.barSpacing * 2 + 1
+        let available = windowWidth - 2 * CandidateLayout.barHorizontalPadding - gearArea
+        var used: CGFloat = 0
+        for (i, item) in sampleCandidates.enumerated() {
+            let attr = candidateAttr(label: item.label, text: item.text, highlighted: i == 0, m: m)
+            let w = ceil(attr.size().width) + CandidateLayout.compactCandidateHorizontalPadding
+            let next = candidateRow.arrangedSubviews.isEmpty ? w : used + CandidateLayout.candidateSpacing + w
+            if !candidateRow.arrangedSubviews.isEmpty, next > available { break }
+            used = next
+            let label = NSTextField(labelWithAttributedString: attr)
+            label.setContentHuggingPriority(.required, for: .horizontal)
+            candidateRow.addArrangedSubview(label)
+        }
+
+        heightConstraint.constant = canvasPadding * 2 + m.preeditHeight + CandidateLayout.rootSpacing + stripHeight
+        needsLayout = true
+    }
+
+    private func candidateAttr(label: String, text: String, highlighted: Bool, m: CandidateWindowMetrics) -> NSAttributedString {
+        let line = NSMutableAttributedString()
+        let labelColor = highlighted ? RimeUI.selectedCandidateColor.withAlphaComponent(0.85) : RimeUI.textSecondary
+        let textColor = highlighted ? RimeUI.selectedCandidateColor : RimeUI.textPrimary
+        let baseline = (m.candidateFontSize - m.labelFontSize) / 2
+        if !label.isEmpty {
+            line.append(NSAttributedString(string: "\(label) ", attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: m.labelFontSize, weight: .semibold),
+                .foregroundColor: labelColor,
+                .baselineOffset: baseline,
+            ]))
+        }
+        line.append(NSAttributedString(string: text, attributes: [
+            .font: NSFont.systemFont(ofSize: m.candidateFontSize, weight: highlighted ? .semibold : .regular),
+            .foregroundColor: textColor,
+        ]))
+        return line
+    }
 }

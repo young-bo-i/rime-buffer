@@ -29,6 +29,9 @@ if CommandLine.arguments.contains("origin-smoke") {
 if CommandLine.arguments.contains("inbound-smoke") {
     exit(runInboundBusSmokeTest() ? 0 : 1)
 }
+if CommandLine.arguments.contains("candidate-metrics-smoke") {
+    exit(runCandidateMetricsSmokeTest() ? 0 : 1)
+}
 if CommandLine.arguments.contains("smoke") {
     exit(runEngineSmokeTest() ? 0 : 1)
 }
@@ -45,10 +48,23 @@ if CommandLine.arguments.contains("--install") {
 if CommandLine.arguments.contains("--prepare-update") {
     exit(selectFallbackInputSourceForUpdate() ? 0 : 1)
 }
+// A standalone SettingsWindowController spins up its OWN RimeEngine. If that
+// engine opened the live ~/Library/RimeBuffer userdb while the installed IME is
+// running, the two librime instances would fight over the LevelDB lock and break
+// the user's live typing. So the dev GUI tools redirect to an isolated userdb
+// (unless the caller already pinned RIMEBUFFER_USER_DIR).
+func isolatePreviewUserDir() {
+    guard ProcessInfo.processInfo.environment["RIMEBUFFER_USER_DIR"] == nil else { return }
+    let dir = NSTemporaryDirectory() + "rimebuffer-preview"
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    setenv("RIMEBUFFER_USER_DIR", dir, 1)
+}
+
 // Dev-only: show the Settings window standalone (no IMK) so it can be reviewed
 // or screenshotted without a live input session. Not wired into the shipped
 // menus; invoked manually as `ETInput settings-preview`.
 if CommandLine.arguments.contains("settings-preview") {
+    isolatePreviewUserDir()
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)
     SettingsWindowController.shared.show()
@@ -58,6 +74,7 @@ if CommandLine.arguments.contains("settings-preview") {
 // Dev-only: `ETInput settings-render <dir>` writes page-N.png for every page.
 if let i = CommandLine.arguments.firstIndex(of: "settings-render"),
    i + 1 < CommandLine.arguments.count {
+    isolatePreviewUserDir()
     let dir = CommandLine.arguments[i + 1]
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
@@ -1236,4 +1253,58 @@ func runRemoteSmokeTest() -> Bool {
 
     print("remote smoke: OK")
     return true
+}
+
+/// Pins the "unsupported interval" rule behind the candidate-window size controls:
+/// a child metric (button height, index label) can only be set as high as its
+/// container (strip height, candidate glyph) currently allows, because anything
+/// taller is silently absorbed by the layout and never renders. A wrong verdict
+/// here means the settings sliders would let you dial in sizes that do nothing.
+func runCandidateMetricsSmokeTest() -> Bool {
+    print("== RimeBuffer candidate metrics smoke test ==")
+    var ok = true
+    func check(_ cond: Bool, _ msg: String) {
+        if !cond { print("FAILED: \(msg)"); ok = false }
+    }
+
+    // Only the two children are container-bounded; the rest are free.
+    check(CandidateWindowMetric.compactCandidateHeight.containerMetric?.metric == .compactStripHeight,
+          "button height should be bounded by strip height")
+    check(CandidateWindowMetric.labelFontSize.containerMetric?.metric == .candidateFontSize,
+          "index label should be bounded by candidate glyph")
+    for m in [CandidateWindowMetric.baseWidth, .compactStripHeight, .preeditHeight, .candidateFontSize] {
+        check(m.containerMetric == nil, "\(m.rawValue) should be a free container metric")
+    }
+
+    func vals(strip: Double, button: Double, glyph: Double, label: Double) -> [CandidateWindowMetric: Double] {
+        [.baseWidth: 460, .preeditHeight: 20,
+         .compactStripHeight: strip, .compactCandidateHeight: button,
+         .candidateFontSize: glyph, .labelFontSize: label]
+    }
+
+    // Button ceiling tracks the strip (strip − 2), capped at its own max 44.
+    check(CandidateWindowMetric.compactCandidateHeight
+        .supportedRange(given: vals(strip: 32, button: 24, glyph: 16, label: 10)).upperBound == 30,
+          "strip=32 should cap button height at 30")
+    check(CandidateWindowMetric.compactCandidateHeight
+        .supportedRange(given: vals(strip: 64, button: 24, glyph: 16, label: 10)).upperBound == 44,
+          "strip=64 should allow the full 44 button")
+
+    // Index-label ceiling tracks the candidate glyph.
+    check(CandidateWindowMetric.labelFontSize
+        .supportedRange(given: vals(strip: 34, button: 24, glyph: 12, label: 10)).upperBound == 12,
+          "candidate font=12 should cap the index label at 12")
+    check(CandidateWindowMetric.labelFontSize
+        .supportedRange(given: vals(strip: 34, button: 24, glyph: 24, label: 10)).upperBound == 18,
+          "candidate font=24 should allow the index label up to 18")
+
+    // The layout absorbs an over-tall button — the very reason the control forbids it.
+    let over = CandidateWindowMetrics(baseWidth: 460, compactStripHeight: 32,
+                                      compactCandidateHeight: 44, preeditHeight: 20,
+                                      candidateFontSize: 16, labelFontSize: 10)
+    check(CandidateLayout.candidateButtonHeight(over) <= 30,
+          "an over-tall button must be clamped by the strip during layout")
+
+    if ok { print("candidate metrics smoke: OK") }
+    return ok
 }
