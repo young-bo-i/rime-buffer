@@ -145,6 +145,29 @@ final class BufferInlineView: NSView {
         flushButton.setExternalProgress(progress)
     }
 
+    /// Colored provenance dot for a non-local block. Rime commits (local typing)
+    /// stay unbadged so ordinary use looks exactly as before; external origins
+    /// get a 6pt dot whose color matches the source family.
+    private func originBadge(for origin: Origin) -> NSView? {
+        let color: NSColor
+        switch origin {
+        case .rime: return nil
+        case .remotePeer: color = RimeUI.color(0x9B8CFF)        // paired Mac — violet
+        case .marine, .mcp: color = RimeUI.color(0xF59E0B)      // local agent — amber
+        case .http, .sse, .ssh: color = RimeUI.color(0x4A9FD8)  // network feed — blue
+        }
+        let dot = NSView()
+        dot.wantsLayer = true
+        dot.layer?.backgroundColor = color.cgColor
+        dot.layer?.cornerRadius = 3
+        dot.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            dot.widthAnchor.constraint(equalToConstant: 6),
+            dot.heightAnchor.constraint(equalToConstant: 6),
+        ])
+        return dot
+    }
+
     private func chip(for block: BufferModel.Block) -> NSView {
         let label = NSTextField(labelWithString: block.text)
         label.font = .systemFont(ofSize: 12)
@@ -154,6 +177,10 @@ final class BufferInlineView: NSView {
         label.toolTip = block.text
 
         let row = NSStackView(views: [label])
+        if let badge = originBadge(for: block.origin) {
+            row.insertArrangedSubview(badge, at: 0)
+            row.setCustomSpacing(5, after: badge)
+        }
         row.orientation = .horizontal
         row.alignment = .centerY
 

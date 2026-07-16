@@ -1448,7 +1448,7 @@ final class RimeBufferController: IMKInputController {
 
     /// Buffer-flush destination: insert into whatever field currently has
     /// focus. Called via the sink wired in main.swift.
-    func deliverText(_ text: String) -> Bool {
+    func deliverText(_ text: String, origin: Origin = .rime) -> Bool {
         let liveClient: IMKTextInput? = self.client()
         guard let client = liveClient ?? lastClient else {
             IMELog.write("buffer send blocked; no active IMK client")
@@ -1459,7 +1459,11 @@ final class RimeBufferController: IMKInputController {
             return false
         }
         composition.commitDidInsert()
-        RemoteTypingService.shared.send(text)   // mirror buffer flush to paired Mac (no-op if off)
+        // Echo guard: a block that arrived FROM a paired Mac is never mirrored
+        // back, or the two Macs bounce it forever. Everything else mirrors.
+        if origin.allowsRemoteMirror {
+            RemoteTypingService.shared.send(text)   // no-op if remote typing off
+        }
         lastClient = client
         return true
     }
@@ -1476,12 +1480,12 @@ final class RimeBufferController: IMKInputController {
         return true
     }
 
-    static func deliverBufferedText(_ text: String) -> Bool {
+    static func deliverBufferedText(_ text: String, origin: Origin) -> Bool {
         guard let controller = active ?? recent else {
             IMELog.write("buffer send blocked; no active/recent controller")
             return false
         }
-        return controller.deliverText(text)
+        return controller.deliverText(text, origin: origin)
     }
 
     static func refreshBufferDisplayForCurrentOrRecent() {

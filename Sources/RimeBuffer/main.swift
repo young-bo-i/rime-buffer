@@ -23,6 +23,9 @@ if CommandLine.arguments.contains("remote-smoke") {
 if CommandLine.arguments.contains("matrix-smoke") {
     exit(runCandidateMatrixSmokeTest() ? 0 : 1)
 }
+if CommandLine.arguments.contains("origin-smoke") {
+    exit(runOriginSmokeTest() ? 0 : 1)
+}
 if CommandLine.arguments.contains("smoke") {
     exit(runEngineSmokeTest() ? 0 : 1)
 }
@@ -70,8 +73,8 @@ candidateWindow.onSettings = {
 
 // Buffer wiring: flushes deliver to the focused field; every model change
 // re-renders the inline buffer that lives inside the candidate window.
-BufferModel.shared.deliver = { text in
-    RimeBufferController.deliverBufferedText(text)
+BufferModel.shared.deliver = { text, origin in
+    RimeBufferController.deliverBufferedText(text, origin: origin)
 }
 BufferModel.shared.onChange = {
     RimeBufferController.refreshBufferDisplayForCurrentOrRecent()
@@ -734,6 +737,56 @@ func runCandidateMatrixSmokeTest() -> Bool {
     return true
 }
 
+/// Pins the echo guard — the workbench's rule that a peer's text is never
+/// mirrored back. A wrong verdict here means two paired Macs bounce text
+/// forever (or, the other way, that a legitimately-typed block silently fails
+/// to reach the other Mac). Also checks the block-origin plumbing: appended
+/// text carries its origin, and the send path can read it back.
+func runOriginSmokeTest() -> Bool {
+    print("== RimeBuffer origin/echo smoke test ==")
+
+    // Only remote-peer origins are barred from mirroring; every other source
+    // (local typing, agent drafts, network inbound) mirrors as before.
+    let mirrors: [Origin] = [.rime, .marine, .mcp(client: "x"),
+                             .http(source: "s"), .sse(feed: "f"), .ssh(host: "h")]
+    for o in mirrors where !o.allowsRemoteMirror {
+        print("FAILED: \(o.tag) should mirror to remote")
+        return false
+    }
+    guard !Origin.remotePeer(deviceID: "mac-b").allowsRemoteMirror else {
+        print("FAILED: remotePeer must NOT mirror back (echo loop)")
+        return false
+    }
+
+    // Origin identity is by-case AND by-payload, so two peers stay distinct.
+    guard Origin.remotePeer(deviceID: "a") != Origin.remotePeer(deviceID: "b"),
+          Origin.mcp(client: "a") != Origin.rime else {
+        print("FAILED: origin equality is wrong")
+        return false
+    }
+
+    // Block plumbing: default origin is rime; explicit origin is preserved and
+    // readable where the send path reads it.
+    let model = BufferModel.shared
+    let oldEnabled = model.enabled
+    let oldDeliver = model.deliver
+    defer { model.clear(); model.enabled = oldEnabled; model.deliver = oldDeliver }
+    model.deliver = { _, _ in true }
+    model.enabled = true
+    model.clear()
+    model.append("你")
+    model.append("hi", origin: .mcp(client: "codex"))
+    guard model.blocks.count == 2,
+          model.blocks[0].origin == .rime,
+          model.blocks[1].origin == .mcp(client: "codex") else {
+        print("FAILED: append did not carry origin: \(model.blocks.map(\.origin.tag))")
+        return false
+    }
+
+    print("origin/echo smoke OK")
+    return true
+}
+
 func runBufferSmokeTest() -> Bool {
     print("== RimeBuffer buffer smoke test ==")
     guard RimeKey.fromVirtualKeyCode(22) == 0x36,
@@ -770,7 +823,7 @@ func runBufferSmokeTest() -> Bool {
     model.clear()
 
     var delivered: [String] = []
-    model.deliver = { text in
+    model.deliver = { text, _ in
         delivered.append(text)
         return true
     }
@@ -787,7 +840,7 @@ func runBufferSmokeTest() -> Bool {
 
     model.enabled = true
     model.append("保留")
-    model.deliver = { _ in false }
+    model.deliver = { _, _ in false }
     model.sendAll()
     guard model.blocks.count == 1, model.enabled == true else {
         print("FAILED: send failure should preserve state",
@@ -847,7 +900,7 @@ func runBufferSmokeTest() -> Bool {
     }
 
     delivered.removeAll()
-    model.deliver = { text in
+    model.deliver = { text, _ in
         delivered.append(text)
         return true
     }

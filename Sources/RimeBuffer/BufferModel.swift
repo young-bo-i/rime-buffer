@@ -13,7 +13,13 @@ final class BufferModel {
     struct Block {
         let id = UUID()
         let text: String
+        let origin: Origin
         let createdAt = Date()
+
+        init(text: String, origin: Origin = .rime) {
+            self.text = text
+            self.origin = origin
+        }
     }
 
     private(set) var blocks: [Block] = []
@@ -38,9 +44,11 @@ final class BufferModel {
         enabled || transientEnabled
     }
 
-    /// Wired in main.swift → active controller's client. Returns false when no
-    /// client is available (block stays queued and retries).
-    var deliver: ((String) -> Bool)?
+    /// Wired in main.swift → active controller's client. Carries the block's
+    /// origin so delivery can apply the echo guard (a peer's text is never
+    /// mirrored back). Returns false when no client is available (block stays
+    /// queued and retries).
+    var deliver: ((_ text: String, _ origin: Origin) -> Bool)?
     /// Wired to the candidate-window buffer UI.
     var onChange: (() -> Void)?
     /// Set by the controller around composition state. Future automatic flush or
@@ -67,12 +75,12 @@ final class BufferModel {
         set { UserDefaults.standard.set(!newValue, forKey: "bufferKeepOnAppSwitch") }
     }
 
-    func append(_ text: String) {
+    func append(_ text: String, origin: Origin = .rime) {
         guard !text.isEmpty else { return }
         let index = clampedInsertionIndex()
-        blocks.insert(Block(text: text), at: index)
+        blocks.insert(Block(text: text, origin: origin), at: index)
         insertionIndex = index + 1
-        IMELog.write("buffer insert block at \(index) count=\(blocks.count)")
+        IMELog.write("buffer insert block at \(index) origin=\(origin.tag) count=\(blocks.count)")
         onChange?()
     }
 
@@ -91,7 +99,7 @@ final class BufferModel {
             loadingRequestId = nil
             loadingMessage = nil
         }
-        append(text)
+        append(text, origin: .marine)
         IMELog.write("buffer marine draft loaded request=\(requestId) chars=\(text.count)")
     }
 
@@ -145,7 +153,7 @@ final class BufferModel {
         guard !blocks.isEmpty else { return }
         IMELog.write("buffer send start blocks=\(blocks.count) chars=\(stagedCharacterCount)")
         for block in blocks {
-            guard deliver?(block.text) == true else {
+            guard deliver?(block.text, block.origin) == true else {
                 IMELog.write("buffer send blocked; keeping \(blocks.count) blocks")
                 onChange?()
                 return
@@ -166,7 +174,7 @@ final class BufferModel {
     func sendNextBlock() -> Bool {
         guard let block = blocks.first else { return false }
         IMELog.write("buffer send next start block=\(IMELog.redact(block.text)) remaining=\(blocks.count)")
-        guard deliver?(block.text) == true else {
+        guard deliver?(block.text, block.origin) == true else {
             IMELog.write("buffer send next blocked; keeping \(blocks.count) blocks")
             onChange?()
             return false

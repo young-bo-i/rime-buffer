@@ -428,3 +428,26 @@ func deliver(chunks: [Chunk], to targets: [DeliveryTarget]) -> DeliveryRecord
 - 三层面板高度：传入轨常驻会推高面板 ~36pt，低分屏上贴近 caret 时可能遮挡——传入轨空时隐藏（§1.1）是主要缓解，需真机验证。
 - MCP 规范演进快，streamable HTTP transport 细节可能随客户端版本变动——spike 3 锁版本，README 注明测试过的客户端版本。
 - 协议 v2 不兼容旧版：两台 Mac 必须同步升级，发版说明需醒目。
+
+---
+
+## 12. 实施进度与决策更新
+
+### 12.1 产品负责人已拍板的决策（覆盖 §10 的对应条目）
+
+- **隔空传字 = 「直通上屏」档**（覆盖 §10 #1 的待定）：配对设备收到的文字**直接上屏**，保留现状的无人值守实时传字。它**不进传入轨、不进缓冲区**。因此原 §6.5「远端收字改道缓冲区」与「协议 v2」在 v1 **作废/推迟**——没有改道就不存在 echo 死循环，也不需要 ack 账本。§1.3 的「外部文字先待确认」不变量只对**非配对来源**（MCP/HTTP/SSE）生效。
+- **起步 = M0 安全底线**（已完成，见下）。
+
+### 12.2 里程碑实际状态
+
+- **M0 安全底线** — ✅ 已发 v0.4.4：secure-input 护栏（Delivery.insert 唯一咽喉）、切换应用重置（过滤自身 bundle）、日志脱敏（IMELog.redact + 0600 + CI 断言）。
+- **M1 领域改造** — 部分完成：
+  - ✅ **M1-A 来源溯源 + echo 规则**：`Origin.swift` 枚举、`Block.origin`、`deliver` 链路带 origin、`Origin.allowsRemoteMirror` echo 守卫（远端来源不回镜）、`origin-smoke`（已入 CI）。Marine 草稿标记 `.marine`。
+  - ✅ **来源徽标**：BufferInlineView 给非 rime 块画彩色点（远端紫/agent 琥珀/网络蓝），rime 块保持无徽标。
+  - ⏸ **传入轨 UI**：**依赖 M2** —— 唯一的真实外部来源（MCP/HTTP/SSE）要等网关才存在；配对设备走直通档不入轨；Marine 现状直接进 buffer。空壳无数据，故推迟到 M2 与 provider 一起建。
+  - ⏹ **远端改道 + 协议 v2**：按 §12.1 决策**作废**。
+- **M2 网关+MCP** — 未开始。**动工前置：三个 spike（§9.1）必须先跑**——NWListener 手写 HTTP/1.1+SSE 稳定性与安全、MCP streamable HTTP 与 Claude Code/Codex 握手、端口占用退避。这是整套设计里第一个真正引入网络出站面的部分，不做 spike 直接写有返工风险。
+
+### 12.3 下一步真实工作量
+
+传入轨要有内容，必须先有 M2 网关喂数据。所以「三层面板」的上层（传入轨）与 M2（网关/MCP）是**同一块工作**，应合并推进：先 spike → InboundBus（数据模型，可 smoke）→ LocalGateway+MCP → InboundRailView（此时才有真实数据可渲染与验证）。

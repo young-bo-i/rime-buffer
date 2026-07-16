@@ -90,4 +90,5 @@ jobs:
           "$BIN" buffer-smoke
           "$BIN" stats-smoke
           "$BIN" matrix-smoke   # candidate-matrix viewport math (pure, no window server)
+          "$BIN" origin-smoke   # block-origin plumbing + echo guard (pure)
           "$BIN" remote-smoke   # ECDH + framing + loopback socket (no Squirrel/network perms)
