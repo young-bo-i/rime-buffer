@@ -54,11 +54,26 @@ final class StatusMenu {
         menu.addItem(inbox)
 
         let workbench = NSMenuItem(
-            title: "工作台预览（开发）…",
-            action: #selector(RimeBufferController.openWorkbenchPreviewFromInputMenu(_:)),
+            title: BufferWindowController.shared.isVisible ? "关闭缓冲工作台（保留内容）" : "显示缓冲工作台",
+            action: #selector(RimeBufferController.toggleBufferWindowFromInputMenu(_:)),
             keyEquivalent: "")
         workbench.target = target
         menu.addItem(workbench)
+
+        let pin = NSMenuItem(
+            title: "常显于所有桌面与全屏空间",
+            action: #selector(RimeBufferController.toggleBufferPinnedFromInputMenu(_:)),
+            keyEquivalent: "")
+        pin.target = target
+        pin.state = BufferWindowController.shared.pinned ? .on : .off
+        menu.addItem(pin)
+
+        let move = NSMenuItem(
+            title: "把缓冲工作台移到当前屏幕",
+            action: #selector(RimeBufferController.moveBufferWindowFromInputMenu(_:)),
+            keyEquivalent: "")
+        move.target = target
+        menu.addItem(move)
         menu.addItem(.separator())
 
         let checkUpdate = NSMenuItem(
@@ -103,8 +118,17 @@ final class StatusMenu {
         SettingsWindowController.shared.show()
     }
 
-    func openWorkbenchPreview() {
-        WorkbenchBarView.showPreviewWindow()
+    func toggleBufferWindow() {
+        BufferWindowController.shared.toggleVisibility()
+    }
+
+    func toggleBufferPinned() {
+        BufferWindowController.shared.pinned.toggle()
+    }
+
+    func moveBufferWindowToCurrentScreen() {
+        BufferWindowController.shared.show()
+        BufferWindowController.shared.moveToCurrentScreen()
     }
 
     func openInboundTray() {

@@ -40,6 +40,22 @@ enum ChordSettings {
     }
 }
 
+/// Synchronous routing barrier used while a focus lease is being revoked or
+/// suspended. `ChordController.flush()` still feeds every release into Rime so
+/// the composition can be recovered, but its callback must not touch the IMK
+/// client proxy whose destination is no longer trustworthy.
+final class ChordClientRoutingGate {
+    private var isolationDepth = 0
+
+    var allowsClientRouting: Bool { isolationDepth == 0 }
+
+    func withIsolatedClientRouting(_ action: () -> Void) {
+        isolationDepth += 1
+        defer { isolationDepth -= 1 }
+        action()
+    }
+}
+
 /// Chord (并击) release-replay, Squirrel-style: chord keys that Rime handled are
 /// buffered; when `duration` elapses with no new chord key, every buffered key
 /// is replayed with releaseMask so chord_composer resolves the chord.

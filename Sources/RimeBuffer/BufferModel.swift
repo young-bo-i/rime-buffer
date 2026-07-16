@@ -1,25 +1,111 @@
 import Foundation
 
-/// The staging buffer (P2): with buffer mode ON, every Rime commit becomes a
-/// block here instead of going to the field. Blocks stay queued until the user
-/// explicitly flushes them; automatic flushing is intentionally disabled until
-/// delivery can be acknowledged more strongly than "an IMK client object exists".
-///
-/// Rewritten from scratch (append-only, boundaries known at insert time) — the
-/// old buffer-bar's diff/reconcile machinery is deliberately absent.
+/// External foreground identity used only by the optional privacy purge. Our
+/// own settings/editor windows are deliberately represented as `nil`, so an
+/// A -> ETInput -> A round trip is not mistaken for an application switch.
+struct ForegroundApplicationIdentity: Equatable {
+    let bundleID: String?
+    let processIdentifier: pid_t
+}
+
+enum BufferPrivacyTransitionRules {
+    static func externalIdentity(bundleID: String?,
+                                 processIdentifier: pid_t,
+                                 ownBundleID: String,
+                                 ownProcessIdentifier: pid_t) -> ForegroundApplicationIdentity? {
+        if bundleID == ownBundleID || processIdentifier == ownProcessIdentifier {
+            return nil
+        }
+        guard let bundleID else {
+            guard processIdentifier > 0 else { return nil }
+            return ForegroundApplicationIdentity(bundleID: nil,
+                                                 processIdentifier: processIdentifier)
+        }
+        return ForegroundApplicationIdentity(bundleID: bundleID,
+                                             processIdentifier: processIdentifier)
+    }
+
+    /// Bundle identity is authoritative when both observations have it. PID is
+    /// only a bridge while one side is temporarily missing a bundle, so a
+    /// recycled PID can never equate two known, different applications.
+    static func sameApplication(_ lhs: ForegroundApplicationIdentity,
+                                _ rhs: ForegroundApplicationIdentity) -> Bool {
+        if let leftBundleID = lhs.bundleID,
+           let rightBundleID = rhs.bundleID {
+            return leftBundleID == rightBundleID
+        }
+        return lhs.processIdentifier > 0
+            && lhs.processIdentifier == rhs.processIdentifier
+    }
+
+    static func shouldDiscard(previousExternal: ForegroundApplicationIdentity?,
+                              activatedExternal: ForegroundApplicationIdentity?,
+                              resetOnSwitch: Bool,
+                              holdsExternalContent: Bool) -> Bool {
+        guard resetOnSwitch,
+              !holdsExternalContent,
+              let previousExternal,
+              let activatedExternal else { return false }
+        return !sameApplication(previousExternal, activatedExternal)
+    }
+
+    static func updatedPrevious(_ previousExternal: ForegroundApplicationIdentity?,
+                                activatedExternal: ForegroundApplicationIdentity?)
+        -> ForegroundApplicationIdentity? {
+        guard let activatedExternal else { return previousExternal }
+        guard let previousExternal,
+              sameApplication(previousExternal, activatedExternal) else {
+            return activatedExternal
+        }
+        // Do not let a transient PID-only observation erase a known bundle;
+        // retaining the strong identity lets a later PID reuse be detected.
+        if previousExternal.bundleID != nil,
+           activatedExternal.bundleID == nil {
+            return previousExternal
+        }
+        return activatedExternal
+    }
+}
+
+/// Append-only staging buffer. Rime commits establish block boundaries before
+/// they enter this model, so editing can preserve identity/provenance without
+/// reviving the old diff/reconcile machinery.
 final class BufferModel {
     static let shared = BufferModel()
 
     struct Block {
-        let id = UUID()
-        let text: String
+        let id: UUID
+        var text: String
         let origin: Origin
-        let createdAt = Date()
+        let createdAt: Date
+        var lastSentAt: Date?
+        var lastSentTargetBundleID: String?
 
-        init(text: String, origin: Origin = .rime) {
+        init(id: UUID = UUID(),
+             text: String,
+             origin: Origin = .rime,
+             createdAt: Date = Date(),
+             lastSentAt: Date? = nil,
+             lastSentTargetBundleID: String? = nil) {
+            self.id = id
             self.text = text
             self.origin = origin
+            self.createdAt = createdAt
+            self.lastSentAt = lastSentAt
+            self.lastSentTargetBundleID = lastSentTargetBundleID
         }
+    }
+
+    /// In-memory delivery ledger. A record means IMK accepted the insert call;
+    /// it is not an acknowledgement from the destination application.
+    struct DeliveryRecord {
+        let id = UUID()
+        let blocks: [Block]
+        let targetBundleID: String
+        let targetName: String
+        let sentAt = Date()
+
+        var characterCount: Int { blocks.reduce(0) { $0 + $1.text.count } }
     }
 
     private(set) var blocks: [Block] = []
@@ -27,42 +113,32 @@ final class BufferModel {
     private(set) var transientEnabled = false
     private(set) var loadingMessage: String?
     private(set) var loadingRequestId: String?
+    private(set) var sentHistory: [DeliveryRecord] = []
+    private(set) var lastClearedBlocks: [Block] = []
 
-    var stagedText: String {
-        blocks.map(\.text).joined()
-    }
+    var stagedText: String { blocks.map(\.text).joined() }
+    var stagedCharacterCount: Int { stagedText.count }
+    var pendingDeliveryBlocks: [Block] { blocks.filter { $0.lastSentAt == nil } }
+    var pendingDeliveryCount: Int { pendingDeliveryBlocks.count }
+    var canUndoClear: Bool { !lastClearedBlocks.isEmpty }
 
-    /// True when the buffer holds any block that came from outside (accepted
-    /// inbound / processor result), as opposed to the user's own typing. Such
-    /// content is deliberately staged to be delivered to ANOTHER app, so the
-    /// switch-app reset must not wipe it — that reset only guards against
-    /// locally-typed content lingering across app boundaries.
+    /// External content exists to be sent to another app, so an optional
+    /// app-switch cleanup must never erase it automatically.
     var holdsExternalContent: Bool {
         blocks.contains { $0.origin != .rime }
-    }
-
-    var stagedCharacterCount: Int {
-        stagedText.count
     }
 
     var shouldDisplay: Bool {
         active || !blocks.isEmpty || loadingMessage != nil
     }
 
-    var active: Bool {
-        enabled || transientEnabled
-    }
+    /// Interaction mode (Enter/backspace controls). Commit capture itself is
+    /// deliberately narrower and uses `enabled`; transient external content
+    /// must not silently begin capturing the user's local typing.
+    var active: Bool { enabled || transientEnabled }
 
-    /// Wired in main.swift → active controller's client. Carries the block's
-    /// origin so delivery can apply the echo guard (a peer's text is never
-    /// mirrored back). Returns false when no client is available (block stays
-    /// queued and retries).
-    var deliver: ((_ text: String, _ origin: Origin) -> Bool)?
-    /// Wired to the candidate-window buffer UI.
+    /// Wired to the independent workbench window in main.swift.
     var onChange: (() -> Void)?
-    /// Set by the controller around composition state. Future automatic flush or
-    /// edit-mode operations must still respect it.
-    var compositionActive = false
 
     var enabled: Bool {
         get { UserDefaults.standard.bool(forKey: "bufferEnabled") }
@@ -71,22 +147,31 @@ final class BufferModel {
             if !newValue, !blocks.isEmpty {
                 IMELog.write("buffer mode off; preserving \(blocks.count) queued blocks")
             }
-            onChange?()
+            notifyChange()
         }
     }
 
-    /// Clear staged blocks when focus leaves for another application, so buffer
-    /// content can't linger across app boundaries. Default on. Stored inverted
-    /// (`bufferKeepOnAppSwitch`) so the default-on behavior holds when the key
-    /// is unset — UserDefaults.bool defaults to false.
+    /// A persistent workbench preserves content across applications by default.
+    /// The old default-on reset remains available as an explicit privacy option.
     var resetOnAppSwitch: Bool {
-        get { !UserDefaults.standard.bool(forKey: "bufferKeepOnAppSwitch") }
-        set { UserDefaults.standard.set(!newValue, forKey: "bufferKeepOnAppSwitch") }
+        get {
+            let defaults = UserDefaults.standard
+            if defaults.object(forKey: "bufferResetOnAppSwitch.v2") != nil {
+                return defaults.bool(forKey: "bufferResetOnAppSwitch.v2")
+            }
+            // Migrate the former inverted preference when it was explicitly
+            // stored; a fresh install keeps the new workbench-safe default.
+            if defaults.object(forKey: "bufferKeepOnAppSwitch") != nil {
+                return !defaults.bool(forKey: "bufferKeepOnAppSwitch")
+            }
+            return false
+        }
+        set { UserDefaults.standard.set(newValue, forKey: "bufferResetOnAppSwitch.v2") }
     }
 
-    /// Stage text that came from outside (an accepted inbound item). Turns the
-    /// buffer transiently active so the block shows and Enter can commit it,
-    /// without flipping the user's persistent buffer-mode setting.
+    /// Stage accepted external text without changing the user's persistent
+    /// capture preference. It may expose buffer keyboard commands while visible,
+    /// but local Rime commits still use `enabled` to decide whether to capture.
     func stageExternal(_ text: String, origin: Origin) {
         transientEnabled = true
         append(text, origin: origin)
@@ -98,7 +183,7 @@ final class BufferModel {
         blocks.insert(Block(text: text, origin: origin), at: index)
         insertionIndex = index + 1
         IMELog.write("buffer insert block at \(index) origin=\(origin.tag) count=\(blocks.count)")
-        onChange?()
+        notifyChange()
     }
 
     func beginTransientLoading(requestId: String, message: String) {
@@ -106,7 +191,7 @@ final class BufferModel {
         loadingRequestId = requestId
         loadingMessage = message
         IMELog.write("buffer transient loading request=\(requestId) message=\(IMELog.redact(message))")
-        onChange?()
+        notifyChange()
     }
 
     func appendMarineDraft(_ text: String, requestId: String) {
@@ -126,7 +211,7 @@ final class BufferModel {
         loadingRequestId = requestId
         loadingMessage = message
         IMELog.write("buffer transient failed request=\(requestId) message=\(IMELog.redact(message))")
-        onChange?()
+        notifyChange()
     }
 
     func cancelActiveMode() {
@@ -134,10 +219,19 @@ final class BufferModel {
         loadingMessage = nil
         if transientEnabled {
             transientEnabled = false
+            notifyChange()
         } else {
             enabled = false
         }
-        onChange?()
+    }
+
+    /// Safe close-window behavior: stop invisible capture/interaction while
+    /// preserving every staged block and any loading message.
+    func pauseCapturePreservingContent() {
+        UserDefaults.standard.set(false, forKey: "bufferEnabled")
+        transientEnabled = false
+        IMELog.write("buffer capture paused; preserved blocks=\(blocks.count)")
+        notifyChange()
     }
 
     @discardableResult
@@ -145,7 +239,34 @@ final class BufferModel {
         guard let removed = blocks.popLast() else { return false }
         clampInsertionIndexInPlace()
         IMELog.write("buffer remove last block \(IMELog.redact(removed.text)) remaining=\(blocks.count)")
-        onChange?()
+        settleTransientIfIdle()
+        notifyChange()
+        return true
+    }
+
+    @discardableResult
+    func removeBlock(id: UUID) -> Bool {
+        guard let index = blocks.firstIndex(where: { $0.id == id }) else { return false }
+        let removed = blocks.remove(at: index)
+        if insertionIndex > index { insertionIndex -= 1 }
+        clampInsertionIndexInPlace()
+        settleTransientIfIdle()
+        IMELog.write("buffer remove block id=\(id) origin=\(removed.origin.tag)")
+        notifyChange()
+        return true
+    }
+
+    /// Explicit per-block editing preserves id, origin and createdAt. Edited
+    /// text becomes pending again even if the previous version was sent.
+    @discardableResult
+    func updateBlock(id: UUID, text: String) -> Bool {
+        guard let index = blocks.firstIndex(where: { $0.id == id }) else { return false }
+        guard !text.isEmpty else { return removeBlock(id: id) }
+        blocks[index].text = text
+        blocks[index].lastSentAt = nil
+        blocks[index].lastSentTargetBundleID = nil
+        IMELog.write("buffer edit block id=\(id) chars=\(text.count) origin=\(blocks[index].origin.tag)")
+        notifyChange()
         return true
     }
 
@@ -159,67 +280,116 @@ final class BufferModel {
             return false
         }
         IMELog.write("buffer insertion point \(old)->\(next) count=\(blocks.count)")
-        onChange?()
+        notifyChange()
         return true
     }
 
-    /// Send everything now, oldest first. If every delivery path accepts the
-    /// text, clear the queue but keep buffer mode active; otherwise preserve
-    /// the unsent blocks so the user can retry.
-    func sendAll() {
-        guard !blocks.isEmpty else { return }
-        IMELog.write("buffer send start blocks=\(blocks.count) chars=\(stagedCharacterCount)")
-        for block in blocks {
-            guard deliver?(block.text, block.origin) == true else {
-                IMELog.write("buffer send blocked; keeping \(blocks.count) blocks")
-                onChange?()
-                return
-            }
-            IMELog.write("buffer send attempted \(IMELog.redact(block.text))")
+    /// Retain successfully attempted blocks in the workbench but mark them so a
+    /// retry after a partial send skips the accepted prefix.
+    func recordDelivery(blockIDs: [UUID], targetBundleID: String, targetName: String) {
+        guard !blockIDs.isEmpty else { return }
+        let ids = Set(blockIDs)
+        let sentAt = Date()
+        var snapshots: [Block] = []
+        for index in blocks.indices where ids.contains(blocks[index].id) {
+            blocks[index].lastSentAt = sentAt
+            blocks[index].lastSentTargetBundleID = targetBundleID
+            snapshots.append(blocks[index])
         }
-        let count = blocks.count
-        blocks.removeAll()
-        insertionIndex = 0
-        settleTransientIfIdle()
-        IMELog.write("buffer send end; cleared \(count) blocks; buffer mode preserved")
-        onChange?()
+        guard !snapshots.isEmpty else { return }
+        sentHistory.append(DeliveryRecord(blocks: snapshots,
+                                          targetBundleID: targetBundleID,
+                                          targetName: targetName))
+        if sentHistory.count > 50 {
+            sentHistory.removeFirst(sentHistory.count - 50)
+        }
+        IMELog.write("buffer delivery recorded blocks=\(snapshots.count) target=\(targetBundleID)")
+        notifyChange()
     }
 
-    /// Send one block in FIFO order. A short Enter tap uses this, so releasing
-    /// staged text never exits buffer mode.
+    /// Restore a delivery record for deliberate re-send/edit. Existing blocks
+    /// are marked pending; explicitly cleared blocks are recovered from the
+    /// in-memory snapshot. This does not claim to remove text from the host app.
     @discardableResult
-    func sendNextBlock() -> Bool {
-        guard let block = blocks.first else { return false }
-        IMELog.write("buffer send next start block=\(IMELog.redact(block.text)) remaining=\(blocks.count)")
-        guard deliver?(block.text, block.origin) == true else {
-            IMELog.write("buffer send next blocked; keeping \(blocks.count) blocks")
-            onChange?()
-            return false
+    func restoreDelivery(recordID: UUID) -> Bool {
+        guard let record = sentHistory.first(where: { $0.id == recordID }) else { return false }
+        var changed = false
+        for (recordIndex, snapshot) in record.blocks.enumerated() {
+            if let index = blocks.firstIndex(where: { $0.id == snapshot.id }) {
+                blocks[index].lastSentAt = nil
+                blocks[index].lastSentTargetBundleID = nil
+            } else {
+                // Reinsert before the next surviving snapshot, or immediately
+                // after the nearest prior snapshot. This recovers [A, B] from
+                // [B] as [A, B] without reordering unrelated/current blocks.
+                let laterSnapshots = record.blocks.dropFirst(recordIndex + 1)
+                let nextIndex = laterSnapshots.compactMap { later in
+                    blocks.firstIndex(where: { $0.id == later.id })
+                }.first
+                let earlierSnapshots = record.blocks.prefix(recordIndex).reversed()
+                let previousIndex = earlierSnapshots.compactMap { earlier in
+                    blocks.firstIndex(where: { $0.id == earlier.id })
+                }.first
+                let insertionIndex = nextIndex
+                    ?? previousIndex.map { min($0 + 1, blocks.count) }
+                    ?? blocks.count
+                blocks.insert(Block(id: snapshot.id,
+                                    text: snapshot.text,
+                                    origin: snapshot.origin,
+                                    createdAt: snapshot.createdAt),
+                              at: insertionIndex)
+            }
+            changed = true
         }
-
-        blocks.removeFirst()
-        if insertionIndex > 0 {
-            insertionIndex -= 1
+        insertionIndex = blocks.count
+        if changed {
+            IMELog.write("buffer delivery restored record=\(recordID) blocks=\(record.blocks.count)")
+            notifyChange()
         }
-        clampInsertionIndexInPlace()
-        settleTransientIfIdle()
-        IMELog.write("buffer send next attempted \(IMELog.redact(block.text)) remaining=\(blocks.count)")
-        onChange?()
-        return true
+        return changed
     }
 
     func clear() {
         if !blocks.isEmpty {
             IMELog.write("buffer clear dropped \(blocks.count) blocks chars=\(stagedCharacterCount)")
+            lastClearedBlocks = blocks
         }
         blocks.removeAll()
         insertionIndex = 0
         loadingRequestId = nil
         loadingMessage = nil
-        if transientEnabled {
-            transientEnabled = false
-        }
-        onChange?()
+        transientEnabled = false
+        notifyChange()
+    }
+
+    /// Non-recoverable privacy cleanup. Unlike the user's Clear action, an
+    /// automatic app-switch purge must not leave the text recoverable through
+    /// undo or delivery-history snapshots in the destination application.
+    func discardForPrivacy() {
+        let blockCount = blocks.count
+        let historyCount = sentHistory.count
+        blocks.removeAll()
+        insertionIndex = 0
+        loadingRequestId = nil
+        loadingMessage = nil
+        transientEnabled = false
+        lastClearedBlocks.removeAll()
+        sentHistory.removeAll()
+        IMELog.write("buffer privacy discard blocks=\(blockCount) history=\(historyCount)")
+        notifyChange()
+    }
+
+    @discardableResult
+    func undoLastClear() -> Bool {
+        guard !lastClearedBlocks.isEmpty else { return false }
+        let restored = lastClearedBlocks
+        lastClearedBlocks = []
+        let existing = Set(blocks.map(\.id))
+        blocks.insert(contentsOf: restored.filter { !existing.contains($0.id) }, at: 0)
+        insertionIndex = blocks.count
+        IMELog.write("buffer undo clear restored=\(restored.count)")
+        notifyChange()
+        return true
     }
 
     private func clampedInsertionIndex() -> Int {
@@ -235,4 +405,13 @@ final class BufferModel {
             transientEnabled = false
         }
     }
+
+    private func notifyChange() {
+        onChange?()
+        NotificationCenter.default.post(name: .bufferModelDidChange, object: self)
+    }
+}
+
+extension Notification.Name {
+    static let bufferModelDidChange = Notification.Name("BufferModelDidChange")
 }

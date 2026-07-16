@@ -15,7 +15,7 @@ Fable's version turned the prototype into a real macOS input method instead of a
 
 ## Non-Negotiable Contracts
 
-1. **Single process:** keep `IMKInputController`, `CRimeBridge`, `CandidateWindow`, `BufferModel`, `BufferSurface`, `StatusMenu`, and settings inside `RimeBuffer.app`.
+1. **Single process:** keep `IMKInputController`, `CRimeBridge`, `CandidateWindow`, `BufferModel`, `BufferWindowController`, `StatusMenu`, and settings inside `RimeBuffer.app`.
 2. **Native delivery:** every commit, raw fallback, chord commit, and buffer flush enters the client through `Delivery.insert`.
 3. **Marked text while composing:** use `CompositionSession.update` for active preedit and `CompositionSession.clear` only when composition is resolved.
 4. **Per-client session:** each controller owns its Rime session; the librime process is global, but session state is not shared.

@@ -1,15 +1,17 @@
 # Enter输入法 · 缓冲工作台（Workbench）产品方案与架构设计
 
-版本：v0.1 草案 · 2026-07-16
-状态：待评审
+版本：v0.2 决策更新 · 2026-07-17
+状态：长期路线图；缓冲窗口部分已实现
 上游输入：`new-rime.pen` 七张探索稿（wBwdM/XKzFo/e9aJFL/FBS3A/rulod/BMbRV/S0d7w）+ 产品负责人 2026-07-16 口头需求收敛
-关系：本文档是新一版的**权威方案**；`new-rime.pen` 降级为视觉参考；`ARCHITECTURE.md` 仍是 P1 时代交接文档（已滞后），两者冲突时以本文档为准。
+关系：本文档记录工作台路线与历史裁决；`new-rime.pen` 是视觉参考；`ARCHITECTURE.md` 是 P1 时代交接文档。运行时事实与本文冲突时以 `SYSTEM-ARCHITECTURE.md` 为准。
+
+> 2026-07-17 决策覆盖：缓冲区不再内嵌于跟随 caret 的候选 panel，而是独立、可拖动/缩放/关闭/常显的被动窗口。候选与 preedit 默认固定投影进该窗口，仍复用 `CandidateWindow` 状态机；可在设置中切回跟随 caret。块级显式编辑、发送历史恢复与清空撤销纳入 v1。
 
 ---
 
 ## 0. 一句话定位
 
-把 Enter输入法从「Rime 提交的暂存队列」升级为**上屏前的文本工作台**：本地打字、外部数据源（MCP / HTTP / SSE / SSH / 配对设备）、内置加工（翻译 / AI），全部汇入同一个缓冲区，经人工确认后投递——**共用同一套三层面板 UI**。
+把 Enter输入法从「Rime 提交的暂存队列」升级为**上屏前的文本工作台**：当前本地打字、已接受的 MCP/HTTP 内容与 Marine 草稿可进入同一缓冲区，经人工确认后投递；SSE/SSH、翻译/AI 与工作台内传入轨是后续路线图。配对设备保留既有加密直通，是不进入工作台的明确例外。
 
 产品负责人拍定的六条需求（本方案的边界即由此划定）：
 
@@ -18,7 +20,7 @@
 3. 输入法**内置翻译**
 4. 输入法可通过 **SSE / SSH / HTTP** 从外部获取文字
 5. 输入法**内置 AI 能力**
-6. 设备间传字（隔空传字）保留，**交互统一进同一套 UI**
+6. 设备间传字（隔空传字）保留；后续产品决策将其定为**加密直通例外**，不统一进工作台（见 §12.1）
 
 ### 0.1 明确不做（v1 边界）
 
@@ -28,18 +30,18 @@
 | AirDrop 投递目标 | 不在需求清单里；延后 |
 | Turn/Artifact 完整版本模型（revision/derivedFrom/分叉） | 探索稿里最贵的部分；v1 用「结果块」轻量替代，版本化留给需求被验证之后 |
 | 投递撤回（revoke） | 依赖版本模型与协议大改；延后 |
-| 手动编辑缓冲块 | BufferModel 当初刻意砍掉 diff/reconcile（append-only），v1 不推翻；块级操作限于 删除/重排/发送 |
+| 无边界自由编辑面 / diff reconcile | 不恢复旧 TextView 的自动切块与差分；v1 只提供显式单块编辑，保留 id、来源和创建时间 |
 | 「实时镜像」预设 | 探索稿自己标注"高级预设；默认关闭"；v1 由投递目标开关覆盖此语义 |
 
 ---
 
 ## 1. 产品定义
 
-### 1.1 三层面板（唯一交互面）
+### 1.1 独立缓冲工作台（缓冲模式主交互面）
 
 ```
 ┌────────────────────────────────────────────────┐
-│ ① 传入轨  远端·MacBook Pro ⋯  AI消息  待接收 3   │  ← 外部数据源（新）
+│ ① 传入轨  MCP·Claude ⋯ HTTP脚本  待接收 3         │  ← 外部数据源（后续嵌入）
 ├────────────────────────────────────────────────┤
 │ ② 缓冲轨  [朋友][晚点][shij|] 翻译1.2s ⏹ ➤ ⤢    │  ← 缓冲区（升级）
 ├────────────────────────────────────────────────┤
@@ -47,28 +49,29 @@
 └────────────────────────────────────────────────┘
 ```
 
-实现载体：现有 `CandidateWindow` 的根竖排 stack。今天它已经是「BufferInlineView + preedit + 候选条」的组合，本方案在最上方加一条**传入轨**，并把 BufferInlineView 升级为带处理状态与来源徽标的**缓冲轨**。不新开窗口，不改 NSPanel 行为（nonactivating、跟随 caret 定位、lastGoodRect 兜底逻辑全部保留）。
+实现载体：`BufferWindowController` 拥有独立 `nonactivatingPanel`，其中组合候选投影、只读全文预览、`BufferInlineView` 与历史操作。面板可拖动、缩放、关闭、固定到所有桌面/全屏空间，frame 持久化并在多屏变化后校正。`CandidateWindow` 继续独占候选状态与翻页逻辑：普通模式显示 caret 面板；工作台模式发布带 `FocusToken` 的投影并隐藏 caret 面板。
 
 各层职责：
 
-- **① 传入轨（InboundRail，新增）**：每个活跃外部来源一个胶囊（图标 + 名称 + 活动状态动画），右端「待接收 N」计数。点胶囊/计数展开待决列表：逐条 接受→进缓冲区 / 拒绝→丢弃。无活跃来源且无待决条目时**整条隐藏**（普通打字场景与今天视觉零差异）。
-- **② 缓冲轨（ChunkRail，升级）**：现有 chips + preedit + 插入光标不变；新增（a）每个块的**来源徽标**（rime 块无徽标保持干净，外来/结果块带色点：翻译=蓝、AI=绿、远端=紫、MCP=橙）；（b）处理中胶囊（spinner + "翻译 1.2s"计时）；（c）**结果块**——处理器产出，样式区别于普通块，默认标记为「待发送」；（d）右端控制键从 2 键变 3 键：**停止**（中止在途任务，仅有任务时出现）、**发送**（保留按住 1.2s 全发的现有手势与进度动画）、**清空**（保留，语义与停止分开）。
-- **③ 候选区**：不动。本次范围外（矩阵翻页等已在 0.4.3 完成）。
+- **① 传入轨（后续）**：当前外部待决项仍在 `InboundTrayWindow` 接受/拒绝，异步来源不得自行拉起工作台。未来可作为工作台内固定高度区域加入。
+- **② 缓冲轨（已实现基础）**：块 chips、来源徽标、待发送/已尝试发送状态、插入点、长按 1.2 秒全发、清空。发送后不自动删除，因为 IMK 没有宿主 ACK；历史可恢复为待发送。
+- **③ 候选区（已实现投影）**：候选、preedit、矩阵/单字选择都从同一状态机投影；任何点击必须携带当前 `FocusToken`，过期动作无效。
+- **编辑与隐私（已实现）**：单块编辑使用独立 key window，输入法对自身编辑器绕过缓冲捕获；被动工作台不抢外部焦点。支持临时遮蔽、secure-input 遮蔽、会话锁定隐藏。
 
 ### 1.2 用户故事（验收场景）
 
-1. **打字暂存**（现状不回归）：缓冲模式下打字 → 块进缓冲轨 → Enter 短按逐块上屏 / 长按 1.2s 全发。传入轨不出现。
-2. **智能体推稿**：Claude Code / Codex 通过 MCP 调 `buffer_push` → 传入轨亮起「MCP · <来源名>」+ 待接收 +1 → 用户点接受 → 成为带橙色徽标的块 → Enter 上屏到微信输入框。
+1. **打字暂存**（现状不回归）：缓冲模式下打字 → 候选/preedit 固定显示在工作台 → commit 成块 → Enter 短按逐块上屏 / 长按 1.2s 全发。窗口与内容跨文本框保留，但发送目标只认当前实时焦点。
+2. **智能体推稿**：Claude Code / Codex 通过 MCP 调 `buffer_push` → 当前由专用 toast/`InboundTrayWindow` 显示「MCP · <来源名>」待决项 → 用户点接受 → 成为带来源徽标的块 → Enter 上屏到微信输入框。传入轨嵌入工作台是后续 UI 路线图。
 3. **翻译**：选中/框选缓冲区里的块 → 点「翻译」→ 处理胶囊转圈计时 → 结果块出现（原块保留）→ 用户按 Enter 发结果块。
 4. **AI 润色**：同上，处理器换成 AI；SSE 流式期间**只更新同一个结果块**的文字，不产生逐 token 的碎块。
-5. **隔空传字（收）**：配对 Mac 发来文字 → 不再直接上屏，进传入轨待决 → 接受后成为紫色徽标块 → 手动发送。（发送侧行为见 §6。）
-6. **安全底线**：焦点在密码框（系统 secure input 生效）时，发送/接受按钮禁用并显示锁标；缓冲区任何内容不会被投递。
+5. **隔空传字（收）**：配对 Mac 发来文字 → 沿既有加密直通路径上屏；若当前没有可用目标则累积到剪贴板。该产品例外不进入缓冲或传入轨（§12.1）。
+6. **安全底线**：焦点在密码框（系统 secure input 生效）时，工作台遮蔽且发送被 `Delivery.insert` 拒绝，缓冲区任何内容不会被投递。当前收件箱的「接受」只把条目放进缓冲，因此不禁用也不显示锁标。
 
 ### 1.3 交互不变量（安全叙事，恒真，不做成开关）
 
-- **一切外部文字先进传入轨待决，绝不自动进缓冲区**（可按来源信任等级降为自动进入缓冲区，但**永不**自动上屏）。
+- **非配对外部文字按当前固定门控进入收件箱或缓冲**：MCP/HTTP/SSE/SSH 为「询问」，Marine 为「信任」；无论哪一种都**永不**自动上屏。按来源自定义信任是后续能力；配对设备维持直通例外。
 - **一切处理器结果先回缓冲区成为结果块**，绝不直接上屏。
-- **上屏只由用户的 Enter/发送动作触发**。
+- **缓冲内容、非配对外部文字与未来处理器结果的上屏只由用户 Enter/发送触发**。缓冲关闭时的普通 Rime commit，以及配对设备的既有直通收字，是明确例外。
 - **secure input 激活时投递路径整体禁用**。
 
 ---
@@ -81,13 +84,13 @@
 /// 文字从哪来。既驱动 UI 徽标，也驱动 echo 防回环与门控。
 enum Origin: Equatable, Codable {
     case rime                          // 本地打字（无徽标）
-    case mcp(client: String)           // MCP 客户端名（智能体自报 + token 绑定）
+    case mcp(client: String)           // MCP 客户端自报名；不可验证，仅展示
     case http(source: String)
     case sse(feed: String)
     case ssh(host: String)
     case remotePeer(deviceID: String)  // 配对 Mac
     case marine                        // 兼容期；迁移完成后并入 .mcp
-    case processor(kind: ProcessorKind, jobID: UUID)  // 翻译/AI 结果块
+    case processor(kind: ProcessorKind, jobID: UUID)  // [M3 计划] 翻译/AI 结果块
 }
 
 /// 缓冲区的一个块。position 由数组顺序表达，内容与来源在块内。
@@ -126,17 +129,18 @@ struct TransformJob: Identifiable {
                  case cancelled }
 }
 
-/// 投递流水（轻量账本）。远端目标记录 ack。
+/// 当前实现：仅进程内的发送快照。记录表示 IMK 已接受 insertText 调用，
+/// 不表示宿主应用已经确认收到。
 struct DeliveryRecord {
-    let messageID: UUID
-    let target: DeliveryTarget
-    let chunkIDs: [UUID]
+    let id: UUID
+    let blocks: [Block]
+    let targetBundleID: String
+    let targetName: String
     let sentAt: Date
-    var status: Status
-    enum Status { case inserted        // 本地 insertText 已调用
-                  case acked           // 远端已确认（协议 v2）
-                  case failed(String) }
 }
+
+// [M5 路线图，当前不存在]
+// messageID / DeliveryTarget / inserted|acked|failed / 远端 ACK / 持久账本
 ```
 
 设计要点：
@@ -150,91 +154,89 @@ struct DeliveryRecord {
 ## 3. 总体架构
 
 ```
-                       ┌──────────────────────────────────────────────┐
- 外部世界               │              ETInput 进程                     │
-                       │                                              │
- Claude/Codex ──MCP──▶ ┌──────────────┐                               │
- curl/脚本 ──HTTP──▶   │ LocalGateway │─┐                             │
- 服务器推送 ──SSE──▶    │ (127.0.0.1)  │ │                             │
-                       └──────────────┘ │   ┌──────────┐  ┌─────────┐ │
- 远程主机 ◀──SSH命令── SSHProvider ──────┼──▶│InboundBus│─▶│传入轨 UI │ │
- 配对Mac ◀─AES-GCM──▶ RemotePeerProvider┘   │ (门控)    │  └────┬────┘ │
-                       ┌──────────────┐     └──────────┘   接受 │      │
- Marine(兼容期) ─轮询─▶ │MarineProvider│──────────▲              ▼      │
-                       └──────────────┘          │        ┌──────────┐ │
-                                                 │        │BufferCore│ │
- OpenAI兼容API ◀─SSE─┐ ┌───────────┐  结果块回写  │        │ (chunks) │ │
- Apple翻译(本地)◀────┼─│ JobRunner │─────────────┘        └────┬─────┘ │
-                     │ │ (actor)   │◀───选中块+处理器──────────┘ │      │
-                     │ └───────────┘        Enter/发送           ▼      │
-                     │                                    ┌───────────┐│
-                     │                                    │ Delivery  ││
-                     │                                    │ Router    ││
-                     │                                    └─┬───────┬─┘│
-                     │                    当前输入框(主,默认)│       │远端(次,opt-in)
-                     └──────────────────── insertText ◀────┘       └──▶ 配对Mac
+                       ┌────────────────────────────────────────────────┐
+ 外部世界               │                ETInput 进程                     │
+                       │                                                │
+ Claude/Codex ──MCP──▶ LocalGateway ─┐                                  │
+ curl/脚本 ──HTTP────▶ (127.0.0.1)   ├─▶ InboundBus ─▶ 收件箱 UI         │
+ [计划]服务器 ─SSE────▶ SSEProvider ──┤                    │ 接受         │
+ [计划]远程主机 ─SSH──▶ SSHProvider ──┘                    ▼              │
+ Marine(兼容期) ─轮询─▶ MarineBridge ───────────────▶ BufferModel         │
+                       │                                  │ Enter/发送    │
+                       │                                  ▼               │
+                       │                       BufferDeliveryCoordinator  │
+                       │                                  │               │
+                       │                           Delivery.insert         │
+                       │                                  ▼               │
+                       │                              当前输入框            │
+ 配对Mac ◀─AES-GCM───▶ RemoteTypingService ─▶ 直通 Delivery.insert        │
+                       │                     └─无目标→剪贴板累积            │
+ [计划] OpenAI/翻译────▶ JobRunner ──结果块回写──▶ BufferModel             │
+ [计划] 多目标/ACK─────▶ DeliveryRouter（M5；当前不存在）                   │
+                       └────────────────────────────────────────────────┘
 ```
 
 ### 3.1 模块与文件规划
 
 | 模块 | 新/改 | 文件 | 职责 |
 |---|---|---|---|
-| BufferCore | 改（自 BufferModel 演进） | `BufferModel.swift` → 渐进重构 | chunks 存储、插入点、结果块、状态广播 |
-| InboundBus | 新 | `Inbound/InboundBus.swift` | 汇聚所有 provider，执行门控，产出 InboundItem |
-| SourceProvider 协议 | 新 | `Inbound/SourceProvider.swift` | `start()/stop()`、事件回调、健康状态 |
-| LocalGateway | 新 | `Inbound/LocalGateway.swift` | 本地 HTTP 服务器：MCP + HTTP push + 管理端点 |
-| MCP 实现 | 新 | `Inbound/MCPServer.swift` | streamable HTTP transport 上的 MCP 会话与 tools |
-| SSEClientProvider | 新 | `Inbound/SSEClient.swift` | 订阅外部 SSE URL |
-| SSHProvider | 新 | `Inbound/SSHProvider.swift` | `/usr/bin/ssh` 子进程流式读取 |
-| RemotePeerProvider | 改 | `Remote/RemoteTypingService.swift` | 入站文字改道 InboundBus；协议 v2 加 ack |
-| MarineProvider | 改（包装） | `MarineBridge.swift` | 包成 SourceProvider，恢复 kind 字段；迁移期后删除 |
-| JobRunner | 新 | `Processors/JobRunner.swift` | actor；任务队列、进度、取消 |
-| Processor 协议 | 新 | `Processors/Processor.swift` | `run(input, onPartial) async throws -> String` |
-| TranslationProcessor | 新 | `Processors/TranslationProcessor.swift` | Apple Translation（macOS 15+，见 §5.2 风险） |
-| AIProcessor | 新 | `Processors/AIProcessor.swift` | OpenAI 兼容 chat/completions，SSE 流式 |
-| DeliveryRouter | 新（自 Delivery 演进） | `Delivery.swift` → `Delivery/DeliveryRouter.swift` | 多目标、echo 防回环、DeliveryRecord |
-| 三层面板 | 改 | `CandidateWindow.swift` + `BufferInlineView.swift` + 新 `InboundRailView.swift` | §1.1 |
-| 设置窗 | 改 | `SettingsWindow.swift` | §8 新 IA |
+| BufferModel | 已实现 | `BufferModel.swift` | blocks 存储、插入点、发送标记、内存历史、撤销清空 |
+| InboundBus | 已实现 | `Inbound/InboundBus.swift` | 汇聚当前 MCP/HTTP，执行固定门控，产出 InboundItem |
+| SourceProvider 协议 | [计划] | `Inbound/SourceProvider.swift` | 未来 provider 的 `start()/stop()`、事件回调、健康状态 |
+| LocalGateway + MCP | 已实现 | `Inbound/LocalGateway.swift` | 本地 HTTP 服务器；stateless MCP POST + HTTP push + health |
+| SSEClientProvider | [计划] | `Inbound/SSEClient.swift` | 订阅外部 SSE URL |
+| SSHProvider | [计划] | `Inbound/SSHProvider.swift` | `/usr/bin/ssh` 子进程流式读取 |
+| RemoteTypingService | 已实现、保持直通 | `Remote/RemoteTypingService.swift` | 配对设备加密直通；不进入 InboundBus |
+| MarineBridge | 已实现、兼容期 | `MarineBridge.swift` | 当前可信草稿直接进 BufferModel；未来迁 MCP 后删除 |
+| JobRunner | [计划 M3] | `Processors/JobRunner.swift` | actor；任务队列、进度、取消 |
+| Processor 协议 | [计划 M3] | `Processors/Processor.swift` | `run(input, onPartial) async throws -> String` |
+| TranslationProcessor | [计划 M3] | `Processors/TranslationProcessor.swift` | Apple Translation（macOS 15+，见 §5.2 风险） |
+| AIProcessor | [计划 M4] | `Processors/AIProcessor.swift` | OpenAI 兼容 chat/completions，SSE 流式 |
+| FocusCoordinator | 新（已实现） | `InputFocusCoordinator.swift` | FocusToken、client 租约、前台与对象身份校验 |
+| BufferDeliveryCoordinator | 新（已实现） | `BufferDeliveryCoordinator.swift` | 逐块复核目标、保留块、写内存发送历史 |
+| DeliveryRouter | 后续 | `Delivery.swift` → `Delivery/DeliveryRouter.swift` | 多目标、远端 ACK、持久账本 |
+| 独立工作台 | 新（已实现） | `BufferWindowController.swift` + `BufferInlineView.swift` | 被动窗口、候选投影、编辑/历史/多屏/隐私 |
+| 候选状态机 | 改（已实现） | `CandidateWindow.swift` | caret 呈现与 token 化工作台投影共用状态 |
+| 设置窗 | 六页已实现，后续再拆 | `SettingsWindow.swift` | 当前 IA 见 §8；来源信任/投递页仍属路线图 |
 
 ### 3.2 并发模型（现有代码最硬的墙，正面拆）
 
-现状：`BufferModel.deliver` 是**同步闭包** `((String) -> Bool)?`，`sendAll/sendNextBlock` 同步判定成败；`BufferModel.swift` 与 `Delivery.swift` 中 async/await/Task 出现 0 次。翻译和 LLM 必然异步，塞不进这个形状。
+现状：IMKit client 始终留在主线程；`BufferDeliveryCoordinator` 同步逐块投递，并在每块前复核 `FocusToken`、组字和 secure-input 状态。`BufferModel` 不再持有 deliver 闭包。
 
 拆法（三条规则，不引入第四条）：
 
 1. **UI 与 IMK 全部 `@MainActor`**。BufferCore、InboundBus 的对外表面是 main-actor 的——IMKit 回调、NSPanel 渲染本来就在主线程，维持现状最省事也最不容易错。
 2. **JobRunner 是 `actor`**，每个 TransformJob 一个 `Task`。运行中通过 `onPartial` 回调把流式片段 `await MainActor.run` 回写结果块；结束/失败/取消同理。取消 = `task.cancel()` + provider 侧关闭连接。
-3. **投递保持同步**。`insertText` 本来就是主线程同步调用；处理器在**入缓冲区侧**跑（结果块先落缓冲区），投递时不再有任何异步依赖——这就是探索稿「安全门控恒真」的架构化表达，也顺带绕开了同步 deliver 的死结。**处理器在缓冲区跑，不在投递路径上跑**，是本方案与探索稿管线图唯一的刻意偏差（稿子画的是 缓冲区→处理器→投递 串联）。
+3. **投递保持同步**。`insertText` 本来就是主线程同步调用；处理器在**入缓冲区侧**跑（结果块先落缓冲区），投递时不再有异步依赖。**处理器在缓冲区跑，不在投递路径上跑**；投递链只做实时目标校验和同步插入。
 
-Provider 侧：LocalGateway/SSE/SSH 各自持有独立 Task/连接，产出统一经 `InboundBus.submit(item)`（main-actor）进入。
+Provider 侧：当前 LocalGateway 持有独立 NW 队列并切回主线程调用 `InboundBus`；未来 SSE/SSH provider 也必须遵守同一边界。
 
 ---
 
 ## 4. 来源层（需求 2、4、6）
 
-### 4.1 LocalGateway：一个本地 HTTP 服务器养三个协议
+### 4.1 LocalGateway：当前 stateless MCP + HTTP push
 
-MCP（streamable HTTP transport）、HTTP push、SSE 管理流共用一个监听器：`127.0.0.1:47700`（可配置），基于 Network.framework `NWListener` 手写极简 HTTP/1.1（支持 keep-alive、chunked 响应）。**不引入 SwiftNIO**——本工程当前零 SPM 依赖（Package.swift 只有本地 target），Remote 模块已有在 NWConnection 上手写帧协议的先例；若后续端点膨胀再考虑换底座。
+当前一个监听器绑定 `127.0.0.1:47700`（可配置），基于 Network.framework `NWListener` 手写极简 HTTP/1.1。响应使用 `Content-Length` 并保持 keep-alive；**没有 chunked 响应、MCP SSE 下行流或可删除的 MCP session**。MCP 采用 stateless Streamable HTTP：每次 `POST /mcp` 返回一个 JSON 响应。SSE 订阅是后续独立 provider，不是当前 LocalGateway 的第三种协议。
 
-鉴权：所有端点要求 `Authorization: Bearer <token>`。token 生成后写入 `~/Library/RimeBuffer/gateway-token`（0600，与 RemoteIdentity 的既有决策一致——**不用 Keychain**，因为 ad-hoc 签名下 Keychain ACL 每次重装都会弹窗，这是 `RemoteIdentity.swift:12-15` 已论证并踩过的坑；拿到 Developer ID 正式签名后整体迁移 Keychain，此处与 §5.3 AI 凭据同一策略）。设置页提供「重新生成 token」与一键复制接入配置。
+除公开健康检查外，端点要求 `Authorization: Bearer <token>`。token 生成后写入 `~/Library/RimeBuffer/gateway-token`（0600，与 RemoteIdentity 的既有决策一致——**不用 Keychain**，因为 ad-hoc 签名下 Keychain ACL 每次重装都会弹窗；拿到 Developer ID 正式签名后再评估迁移）。当前设置页可复制 token、MCP 配置和 curl 命令，但**没有重新生成 token 的 UI**。
 
 端点：
 
 ```
 POST /mcp                    MCP streamable HTTP（初始化/工具调用/通知）
-GET  /mcp                    MCP SSE 下行流（服务器→客户端通知）
-POST /v1/inbound             裸 HTTP push：{text, title?, source?, stream_id?, done?}
-GET  /v1/health              健康检查（无鉴权，只回版本号）
+POST /v1/inbound             裸 HTTP push：{text, title?, source?}
+GET  /v1/health              健康检查（无鉴权，当前返回 {"ok":true}）
+GET/DELETE /mcp              当前明确返回 405，Allow: POST
 ```
 
 ### 4.2 MCP tools（面向 Claude Code / Codex 等本地智能体）
 
 ```
-buffer_push(text, title?, kind?)        → {item_id}   推一条待决条目到传入轨
+buffer_push(text, title?)               → 确认文本      推一条待决条目到收件箱
 buffer_stream_begin(title?)             → {stream_id} 开一个流式条目（占位卡片）
-buffer_stream_append(stream_id, delta)  → {}          原位追加文字（不产生新条目）
-buffer_stream_end(stream_id)            → {}          标记完成，条目变为可接受
-buffer_pending()                        → {items:[…]} 列出自己推送的待决条目状态
+buffer_stream_append(stream_id, delta)  → 确认文本      原位追加文字（不产生新条目）
+buffer_stream_end(stream_id)            → 确认文本      标记完成，条目变为可接受
 ```
 
 刻意**不提供**：读取用户缓冲区内容、读取当前输入框上下文、触发投递的任何工具。智能体只能「给」，不能「看」不能「发」——这是隐私边界，写死，不做开关。
@@ -251,22 +253,24 @@ claude mcp add --transport http etinput http://127.0.0.1:47700/mcp \
 | Provider | 形态 | v1 范围 |
 |---|---|---|
 | **HTTPProvider** | 被动收 `POST /v1/inbound`（脚本/curl 场景） | 与 MCP 共用 LocalGateway 与门控 |
-| **SSEClientProvider** | 主动订阅用户配置的 URL 列表；`data:` 行追加进同一流式条目，`event: done` 收口 | 断线指数退避重连；每 feed 一个传入轨胶囊 |
-| **SSHProvider** | `Process` 跑 `/usr/bin/ssh <host> <command>`，stdout 逐行流式进条目 | 认证完全依赖用户 `~/.ssh` 配置与 ssh-agent，**输入法不管理任何 SSH 密钥**；默认关闭，高级功能 |
-| **RemotePeerProvider** | 现有 X25519+AES-GCM 通道，**入站改道**：收到 text 不再直接 insertText，产出 InboundItem | 协议 v2，见 §6.4 |
-| **MarineProvider** | 现有轮询原样包装；`Draft.kind` 传入 `InboundItem.title`（修复字段蒸发） | 迁移期方案；Marine 改用 MCP push 后删除此 provider 与 etinput-runtime.json 握手 |
+| **SSEClientProvider** | [计划] 主动订阅用户配置的 URL 列表；流式进入 InboundBus | 当前只有设置页未来标签，尚无实现 |
+| **SSHProvider** | [计划] `Process` 跑 `/usr/bin/ssh <host> <command>`，stdout 流式进条目 | 当前只有设置页未来标签；未来认证依赖用户 `~/.ssh` 与 ssh-agent |
+| **RemoteTypingService** | 现有 X25519+AES-GCM 通道，入站继续直接 `insertRemoteText` | 不进 InboundBus；无安全目标时由 main.swift 累积到剪贴板；协议 v2 推迟 |
+| **MarineBridge** | 现有轮询，按固定 trusted 规则直接进入 BufferModel | 迁移期方案；Marine 改用 MCP push 后删除兼容握手 |
 
 ### 4.4 来源门控（传入轨的准入策略）
 
-每来源一档信任等级，存 UserDefaults：
+`SourceTrust` 类型包含三档，但**当前没有按来源配置或 UserDefaults 覆盖**。`InboundBus.trust(for:)` 的固定规则是：Marine=`trusted`；MCP/HTTP/SSE/SSH=`ask`；Rime/RemotePeer 若误入总线也按 `ask` 处理。
 
 | 等级 | 行为 |
 |---|---|
 | **询问**（默认） | 条目进传入轨待决，用户逐条接受/拒绝 |
 | **信任** | 条目直接进缓冲区成为块（仍绝不自动上屏，§1.3 不变量兜底） |
-| **拦截** | 静默丢弃，传入轨计数器闪一下作提示 |
+| **拦截** | 丢弃；当前没有设置入口，也没有“计数器闪一下”的 UI |
 
-无有效 token 的请求在 HTTP 层直接 401，不进任何 UI。MCP 客户端名与 token 绑定记录，传入轨胶囊显示自报名称。
+无有效 token 的请求在 HTTP 层直接 401，不进任何 UI。MCP 客户端名只存在于当前连接内，是未经验证的自报展示名；它不与全局 token 建立身份绑定。
+
+**[后续路线图]** 若加入来源设置页，再把三档选择持久化到 UserDefaults，并为 blocked 提示设计明确 UI；在此之前不得把它们写成现有保证。
 
 ---
 
@@ -300,7 +304,7 @@ protocol Processor {
 - OpenAI 兼容 `POST {base_url}/chat/completions`，`stream: true`，标准 SSE 解析（`data: {json}` / `data: [DONE]`）。
 - 配置：base URL、model、API key、系统提示词模板（预置「润色」「改写」「翻译」三个模板，可自定义）。
 - 凭据存储：**0600 文件** `~/Library/RimeBuffer/ai-credentials.json`，理由同 §4.1（探索稿写的「仅钥匙串」在 ad-hoc 签名现实下会重蹈 RemoteIdentity 已否决的方案；文档明示：Developer ID 落地后迁 Keychain）。
-- 网络边界声明（写进设置页文案）：**整个输入法主动出站只有四处**——AI API、SSE 订阅、SSH 子进程、隔空传字局域网；前三者默认关闭，配置后才激活。
+- 网络边界声明（写进设置页文案）：**整个输入法主动出站共五类**——AI API、SSE 订阅、SSH 子进程、隔空传字局域网、GitHub 自动更新检查。前三类尚属路线图且默认关闭；隔空传字按用户配对启用，更新检查当前每小时运行。
 - 隐私红线：发给 AI 的只有 `inputSnapshot`（用户显式选中的块），永不附带输入历史、preedit、剪贴板或屏幕上下文。
 
 ---
@@ -311,38 +315,30 @@ protocol Processor {
 
 | 目标 | 级别 | 默认 | 行为 |
 |---|---|---|---|
-| 当前输入框 | 主要 | 开，不可关 | `client.insertText`（现状） |
-| 配对设备 | 次要 | **迁移期默认开**（见 6.5），可关 | 经现有加密通道发送，等 ack |
+| 当前实时输入框 | 主要 | 开，不可关 | 只有当前 FocusToken 租约通过对象身份、bundle 与前台 app 校验后才 `insertText` |
+| 配对设备镜像 | 既有独立通路 | 用户既有设置 | 经现有加密通道发送；`.remotePeer` 来源不镜像回原设备 |
 
 探索稿的 AirDrop 目标已砍（§0.1）。
 
-### 6.2 DeliveryRouter
+### 6.2 当前本地投递基线与后续 Router
 
-`Delivery.insert` 的一行 fire-and-forget 升级为：
+- 当前本地投递由 `BufferDeliveryCoordinator` 负责：每块发送前重验同一 token；焦点变化立即停止。
+- `Delivery.insert` 调用成功只表示 IMKit 接受调用，不是宿主 ACK。因此块保留并标记 `lastSentAt`，局部失败重试跳过已尝试前缀。
+- 最近 50 条发送快照只在当前进程内，可从工作台历史下拉列表选择并恢复为待发送；显式清空也可撤销一次。跨 app 隐私清理则不可撤销，并同时删除内存历史。
+- 多目标、远端 ACK、失败状态与持久账本仍属于后续 M5，不把未来能力写成当前保证。
 
-```swift
-@MainActor
-func deliver(chunks: [Chunk], to targets: [DeliveryTarget]) -> DeliveryRecord
-```
+### 6.3 Echo 防回环
 
-- 本地目标：insertText 后立即 `.inserted`（IMK 无回执，如实记录）。
-- 远端目标：生成 `messageID`，发送后挂起等 ack（超时 5s → `.failed`，块保留在缓冲区并标红——修掉审计确认过的「flush 把存在 client 对象当送达成功、文本静默丢失」缺陷，本方案顺带兑现）。
-- 投递记录环形保留最近 200 条，调试页可看。
+配对收字维持直通，不进入缓冲；若已有 `.remotePeer` 来源块通过兼容路径进入缓冲，`origin.allowsRemoteMirror` 仍保证它不会回镜。输入法自身设置页与块编辑器也永不参与远端镜像。
 
-### 6.3 Echo 防回环（改道后的必答题）
+### 6.4 远端协议 v2（推迟）
 
-现状防回环靠「远端收字直通上屏、不进缓冲区」（`RimeBufferController.swift:1466` 注释明示）。收字改道缓冲区后，用户按 Enter 会走正常上屏路径，而该路径今天无条件镜像给远端——**原样落地就是死循环**。
+当前配对直通协议不因缓冲窗口改造而升级。messageID/ACK 只在未来多目标投递确有需求时另行设计。
 
-解法就在 Origin 上，一条规则：**`DeliveryRouter` 对 `origin == .remotePeer(X)` 的块，永不投递回设备 X**。同设备其他块正常镜像。规则写在 Router 内部，不是开关。
+### 6.5 当前行为
 
-### 6.4 远端协议 v2
-
-`SealedMessage` 扩帧：`Kind` 枚举加 `.ack`；载荷加 `messageID: UUID`。配对握手加 `protocolVersion`。两端都是自有设备（用户自己的两台 Mac），**不做 v1 兼容模式**：版本不匹配时提示对端升级，拒绝降级通信（避免半新半旧的回环语义）。seq 防重放计数器保留原职，不与 messageID 混用。
-
-### 6.5 行为变更告知（对现有使用习惯的两处打破）
-
-1. **远端收字不再直接上屏**——改为进传入轨待决。这是需求 6「统一进同一套 UI」的直接推论，也是安全不变量的要求。
-2. **镜像发送从隐式恒开变为投递目标开关**——迁移时若用户已启用隔空传字则默认保持开（最小惊讶），但从此可见、可关。
+1. 配对设备收字继续直通；当前没有安全目标或投递被拒绝时，不报告假成功。
+2. 缓冲工作台发送只认当前实时外部文本框；不会使用 recent/last client 兜底。
 
 ---
 
@@ -350,11 +346,12 @@ func deliver(chunks: [Chunk], to targets: [DeliveryTarget]) -> DeliveryRecord
 
 | 措施 | 机制 | 备注 |
 |---|---|---|
-| 密码框保护 | 监测 Carbon `IsSecureEventInputEnabled()`：激活期间发送/接受按钮禁用+锁标，捕获与投递整体短路 | macOS secure input 本身已让第三方 IME 收不到密码键入，此措施防的是「缓冲区里已有的内容被投进密码框」与边缘 app 未启用 secure input 的场景 |
-| 切换应用时重置 | `didActivateApplicationNotification`（监听已存在）触发 `BufferCore.clear()`；设置开关，默认开 | 推翻 `BufferModel.swift:53` 「preserving N queued blocks」的旧倾向，作为显式设置让用户选 |
+| 密码框保护 | `Delivery.insert` 在投递时同步检查 `IsSecureEventInputEnabled()` 并拒发；工作台遮蔽。当前收件箱「接受」只暂存到缓冲，不禁用也无锁标 | macOS secure input 本身已让第三方 IME 收不到密码键入；核心保证是已有缓冲内容不能被投进密码框 |
+| 切换应用时重置 | 显式设置，默认关；开启后仅当缓冲中没有任何外部来源块时不可撤销地清 blocks/undo/history | 常驻工作台默认跨 app 保留；外部待投递内容绝不因切目标而自动丢弃 |
+| 焦点与自有窗口 | FocusToken 精确租约；自有设置/编辑文本框既不进缓冲，也不远端镜像 | 迟到 deactivate/command/candidate click 不能影响新目标 |
 | 本地端口鉴权 | 仅绑 127.0.0.1 + Bearer token（0600 文件）+ 常数时间比较 | 无 token 401，不产生任何 UI 痕迹 |
-| 来源门控 | §4.4 三档 + 默认询问 | |
-| 网络出站清单 | AI / SSE / SSH / 隔空传字四处，前三者默认关 | 设置页明示，作为隐私承诺 |
+| 来源门控 | §4.4 三档类型 + 当前硬编码规则；无按来源设置 | 可配置覆盖属后续路线图 |
+| 网络出站清单 | AI / SSE / SSH / 隔空传字 / GitHub 更新检查五类 | 前三属路线图且默认关；后两按现有设置运行 |
 | 日志脱敏 | `IMELog` 全面改为「事件+长度」，不记 text 本体；文件 0600 + 10MB 轮转 | 连带修掉审计确认的「rimebuffer.log 明文记录所有上屏文本」高危项，随 M0 出 |
 | 隐私红线 | MCP 无读取工具（§4.2）；AI 只见显式选中内容（§5.3） | 写死，不做开关 |
 
@@ -362,41 +359,42 @@ func deliver(chunks: [Chunk], to targets: [DeliveryTarget]) -> DeliveryRecord
 
 ## 8. 设置窗信息架构
 
-5 页 → **8 页、两组**（回答探索稿悬而未决的「候选窗/维护去哪了」：不消失，归入「输入法」组）：
+当前实现是 **6 页、两组**：
 
 ```
 输入法                 工作台
-├─ 输入（现状+并击间隔） ├─ 缓冲区   工作流开关、切换应用重置、面板行为
-├─ 候选窗（现状）        ├─ 来源     MCP/HTTP/SSE/SSH/配对设备 各自的启停·信任等级·token 管理·配对管理(自「隔空传字」页迁入)
-└─ 维护（现状）          ├─ 处理器   翻译配置、AI 配置(URL/model/key/模板)
-                        └─ 投递     目标开关(当前输入框·配对设备)、投递记录
+├─ 输入（现状+并击间隔） ├─ 缓冲区   捕获、窗口显隐/pin、候选位置、移屏、切app清理
+├─ 候选窗（现状）        ├─ 连接     配对设备、网关启停/端口/配置复制；SSE/SSH 未来标签
+└─ 维护（现状）          └─ 处理器   当前为未来能力说明
 ```
 
-「隔空传字」页拆解：配对/信任管理 → 来源页；发送开关 → 投递页。「安全」不单设页——安全项就近放在其语义所属页（门控在来源、红线声明在处理器、重置在缓冲区），避免第 9 页。探索稿的「捕获策略表」退化为缓冲区页的两个开关（剪贴板行已砍、编码行本为事实、安全字段行是恒真机制）。
+缓冲页明确展示：关闭窗口会收束组字、暂停捕获并保留内容；清空是另一动作。候选默认固定在工作台，可切回跟随 caret；菜单也提供显隐、pin 与移到当前屏幕。「安全」不单设页，安全项就近放在语义所属页。
+
+**[后续路线图]** 等按来源信任和多目标投递真正实现后，可把「连接」拆成独立「来源」与「投递」页，形成原方案中的 8 页 IA；当前不得把该拆分写成已完成。
 
 ---
 
 ## 9. 迁移路径与分期
 
-每期独立可发版、可回退（不动身份三元组，CI 冻结断言继续护航）。
+每期独立可发版、可回退（不动身份三元组，CI 冻结断言继续护航）。下表已按当前决策重写；完成状态以 §12.2 为准，未实现项保留为路线图。
 
-| 里程碑 | 内容 | 依赖 | 粗估 |
+| 里程碑 | 内容 | 依赖 | 状态 / 原粗估 |
 |---|---|---|---|
-| **M0 安全底线** | secure input 短路、切换应用重置开关、日志脱敏+轮转 | 无 | ~200 行，1 天 |
-| **M1 领域改造** | Chunk+Origin 落地、InboundBus、传入轨 UI、Remote 入站改道+echo 规则+协议 v2、Marine 包装为 provider（kind 复活）、来源徽标 | M0 | ~1000 行 |
-| **M2 网关** | LocalGateway(HTTP server)、MCP server+tools、HTTP push、token 体系、来源设置页 | M1 | ~1100 行 |
+| **M0 安全底线** | secure input 短路、切换应用重置开关、日志脱敏 | 无 | ✅ 已完成 |
+| **M1 领域改造** | Origin、来源徽标与 echo 守卫已落地；工作台内传入轨后续；Remote 入站改道/协议 v2 已取消或推迟 | M0 | 部分完成 |
+| **M2 网关** | LocalGateway、stateless MCP tools、HTTP push、token 与收件箱已完成；按来源信任设置尚未实现 | M1 | ✅ 主干完成 |
 | **M3 处理器框架+翻译** | JobRunner、Processor 协议、处理胶囊/结果块 UI、TranslationProcessor（含 spike）、处理器设置页 | M1 | ~800 行 |
 | **M4 AI** | AIProcessor(SSE)、凭据管理、提示词模板 | M3 | ~500 行 |
-| **M5 投递路由** | DeliveryRouter、DeliveryRecord、ack、失败保留标红、投递设置页 | M1 | ~500 行 |
-| **M6 收尾** | SSEClientProvider、SSHProvider、设置窗 IA 重排完成、BufferBar 视觉对齐 S0d7w | M2 | ~700 行 |
+| **M5 投递路由** | [计划] DeliveryRouter、多目标、远端 ack、失败状态与持久账本；当前仅有本地精确焦点投递和内存历史 | M1 | ~500 行 |
+| **M6 收尾** | [计划] SSEClientProvider、SSHProvider、工作台内传入轨、设置窗 IA 再拆分与视觉对齐 | M2 | ~700 行 |
 
-合计 ≈ 4800 行增改（全工程现有 8500 行）。顺序上 M2/M3/M5 在 M1 之后可并行。每期验收 = §1.2 对应用户故事 + smoke（InboundBus 门控、Origin 路由、协议 v2 帧、SSE 解析器都是纯逻辑，照 matrix-smoke 模式写进 CI）。
+原始未实现部分曾粗估约 4800 行；工程当前约 14000 行，该估算不再代表剩余工作量。后续每期验收仍对应 §1.2 用户故事，并为新增纯逻辑补 smoke；协议 v2 已推迟，不属于当前 CI 契约。
 
-### 9.1 技术 spike（动工前先验证，各半天）
+### 9.1 历史技术 spike（已完成，不等于下列产品能力均已实现）
 
-1. **Translation framework 无 SwiftUI 上下文可用性**（§5.2）——失败即降级 AI 预设，方案不阻塞。
-2. **NWListener 手写 HTTP/1.1 + SSE 长连接**的稳定性（keep-alive、半关闭、背压）——失败即引入 SwiftNIO 作为第一个外部依赖。
-3. **MCP streamable HTTP 与 Claude Code / Codex 的实际握手**——用最小 echo server 先通一遍，确认两家客户端的 transport 兼容细节。
+1. **Translation framework 无 SwiftUI 上下文可用性**（§5.2）——可行性 spike 已通过；产品级模型下载与 Processor 仍未实现。
+2. **NWListener 手写 HTTP/1.1 + SSE 长连接**的稳定性——spike 已通过；当前产品只落地 stateless MCP/HTTP 子集，SSE client 仍属 M6。
+3. **MCP streamable HTTP 与 Claude Code / Codex 的实际握手**——最小握手已通过；当前正式契约以 §4.1 的 stateless POST 实现为准。
 
 ---
 
@@ -411,23 +409,25 @@ func deliver(chunks: [Chunk], to targets: [DeliveryTarget]) -> DeliveryRecord
 | 5 | 钥匙串 | 0600 文件，Dev ID 后迁移（§4.1/§5.3） |
 | 6 | 剪贴板捕获 | 砍（§0.1） |
 | 7 | 安全字段/切换重置 | M0 先行 |
-| 8 | 手动编辑分叉 | 不做，append-only 维持（§0.1） |
+| 8 | 手动编辑分叉 | 不做无边界自由编辑与自动 diff/reconcile；允许显式单块编辑并保留 id/origin/createdAt |
 | 9 | 候选窗/维护页去向 | 保留，归「输入法」组（§8） |
-| 10 | 隔空传字页去向 | 拆入 来源+投递（§8） |
-| 11 | 无条件镜像 | 变 opt-in 目标，迁移默认开（§6.5） |
+| 10 | 隔空传字页去向 | [路线图] 来源/投递能力成熟后再拆页；当前仍在「连接」页（§8） |
+| 11 | 无条件镜像 | v1 保持既有隔空传字设置；自身窗口永不镜像，`.remotePeer` 来源永不回镜（§6.3） |
 | 12 | 按住 1.2s 发送 | 保留（§1.1） |
 | 13 | 清空按钮 | 保留，与停止并存（§1.1） |
-| 14 | 紧凑面板两轨还是三轨 | 三层（用户需求 1 直接定论） |
+| 14 | 紧凑面板两轨还是三轨 | 三层目标；当前已实现缓冲轨+候选投影，传入轨仍待嵌入 |
 | 15 | 「远端」语义 | 本方案中远端=配对设备（出入站同一对端）；「远端算力」概念废弃，算力即处理器 |
 | 16 | 分期 | §9 |
 | 17 | 路线图还是草稿 | 草稿；本文档为收敛后的路线图 |
 
 ## 11. 开放风险
 
-- Translation spike 失败 → 翻译体验降级为走 AI（需 key），「内置翻译」的免配置卖点受损。
-- 三层面板高度：传入轨常驻会推高面板 ~36pt，低分屏上贴近 caret 时可能遮挡——传入轨空时隐藏（§1.1）是主要缓解，需真机验证。
+- Translation 可行性 spike 已通过，但模型下载、系统版本门控与 AppKit/SwiftUI 生命周期尚未集成到产品 Processor，仍需真机验证。
+- 焦点竞态：同一 app 多文本框可能复用 IMK client proxy；必须依靠每次 activation 新 epoch、事件顺序与迟到 callback 拒绝，真机覆盖 Safari/Electron/微信。
+- 常显隐私：工作台跨桌面/全屏可见，必须保持手动遮蔽、secure-input 低频检测与锁屏隐藏。
+- 编辑器激活会主动让旧外部目标失效；保存后必须回到目标 app 并重新取得焦点，不能偷偷复用旧租约。
 - MCP 规范演进快，streamable HTTP transport 细节可能随客户端版本变动——spike 3 锁版本，README 注明测试过的客户端版本。
-- 协议 v2 不兼容旧版：两台 Mac 必须同步升级，发版说明需醒目。
+- [未来条件风险] 若 M5 重新启动配对协议 v2/ACK 设计，必须先确定版本协商与兼容策略；当前版本未实现 v2，也不要求两台 Mac 同步升级。
 
 ---
 
@@ -435,19 +435,20 @@ func deliver(chunks: [Chunk], to targets: [DeliveryTarget]) -> DeliveryRecord
 
 ### 12.1 产品负责人已拍板的决策（覆盖 §10 的对应条目）
 
-- **隔空传字 = 「直通上屏」档**（覆盖 §10 #1 的待定）：配对设备收到的文字**直接上屏**，保留现状的无人值守实时传字。它**不进传入轨、不进缓冲区**。因此原 §6.5「远端收字改道缓冲区」与「协议 v2」在 v1 **作废/推迟**——没有改道就不存在 echo 死循环，也不需要 ack 账本。§1.3 的「外部文字先待确认」不变量只对**非配对来源**（MCP/HTTP/SSE）生效。
+- **隔空传字 = 「直通上屏」档**（覆盖 §10 #10/#15 的早期设想）：配对设备收到的文字**直接上屏**，保留现状的无人值守实时传字。它**不进传入轨、不进缓冲区**。因此原 §6.5「远端收字改道缓冲区」与「协议 v2」在 v1 **作废/推迟**——没有改道就不存在缓冲内 echo 死循环，也不需要 ack 账本。§1.3 的「外部文字先待确认」不变量只对**非配对来源**（MCP/HTTP，以及未来 SSE/SSH）生效。
 - **起步 = M0 安全底线**（已完成，见下）。
 
 ### 12.2 里程碑实际状态
 
-- **M0 安全底线** — ✅ 已发 v0.4.4：secure-input 护栏（Delivery.insert 唯一咽喉）、切换应用重置（过滤自身 bundle）、日志脱敏（IMELog.redact + 0600 + CI 断言）。
+- **M0 安全底线** — ✅ 已发 v0.4.4：secure-input 护栏（Delivery.insert 唯一咽喉）、可选切换应用清理、日志脱敏（IMELog.redact + 0600 + CI 断言）。当前常驻工作台默认不清理。
 - **M1 领域改造** — 部分完成：
-  - ✅ **M1-A 来源溯源 + echo 规则**：`Origin.swift` 枚举、`Block.origin`、`deliver` 链路带 origin、`Origin.allowsRemoteMirror` echo 守卫（远端来源不回镜）、`origin-smoke`（已入 CI）。Marine 草稿标记 `.marine`。
+  - ✅ **M1-A 来源溯源 + echo 规则**：`Origin.swift` 枚举、`Block.origin`、`Origin.allowsRemoteMirror` echo 守卫（远端来源不回镜）、`origin-smoke`（已入 CI）。Marine 草稿标记 `.marine`。
   - ✅ **来源徽标**：BufferInlineView 给非 rime 块画彩色点（远端紫/agent 琥珀/网络蓝），rime 块保持无徽标。
-  - ⏸ **传入轨 UI**：**依赖 M2** —— 唯一的真实外部来源（MCP/HTTP/SSE）要等网关才存在；配对设备走直通档不入轨；Marine 现状直接进 buffer。空壳无数据，故推迟到 M2 与 provider 一起建。
+  - ⏸ **传入轨 UI**：M2 网关前置条件已经满足；当前仍使用 `InboundToast` + `InboundTrayWindow`，嵌入独立工作台的传入轨尚未实现。配对设备继续直通不入轨，Marine 现状直接进 buffer。
   - ⏹ **远端改道 + 协议 v2**：按 §12.1 决策**作废**。
-- **M2 网关+MCP** — 未开始。**动工前置：三个 spike（§9.1）必须先跑**——NWListener 手写 HTTP/1.1+SSE 稳定性与安全、MCP streamable HTTP 与 Claude Code/Codex 握手、端口占用退避。这是整套设计里第一个真正引入网络出站面的部分，不做 spike 直接写有返工风险。
+- **M2 网关+MCP** — ✅ 主干已实现：`LocalGateway`、MCP tools、`InboundBus`、token 与收件箱可用；传入轨嵌入工作台仍后续。
+- **稳定缓冲窗口** — ✅ 2026-07-17：FocusToken、独立工作台、候选投影、块编辑防回灌、50 条内存发送历史、清空撤销、多屏/常显/隐私控制已实现；待安装后真机验收。
 
 ### 12.3 下一步真实工作量
 
-传入轨要有内容，必须先有 M2 网关喂数据。所以「三层面板」的上层（传入轨）与 M2（网关/MCP）是**同一块工作**，应合并推进：先 spike → InboundBus（数据模型，可 smoke）→ LocalGateway+MCP → InboundRailView（此时才有真实数据可渲染与验证）。
+M2 已能向收件箱与 BufferModel 喂真实数据；下一步若继续三层工作台路线，可直接把 `InboundBus.pending` 投影为工作台内固定高度的传入轨。异步事件不得自动拉起候选面板或工作台，但当前允许专用 nonactivating toast/收件箱提示。处理器与多目标/远端 ACK 仍按 M3–M5 独立推进。

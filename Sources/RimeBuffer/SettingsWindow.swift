@@ -47,7 +47,11 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     private let schemaApplyStatus = NSTextField(labelWithString: "")
     private let appearancePopUp = NSPopUpButton()
     private let bufferCheck = NSButton(checkboxWithTitle: "启用缓冲模式（提交先暂存，手动确认上屏）", target: nil, action: nil)
-    private let resetOnAppSwitchCheck = NSButton(checkboxWithTitle: "切换到其他应用时清空缓冲区", target: nil, action: nil)
+    private let bufferWindowVisibleCheck = NSButton(checkboxWithTitle: "显示独立缓冲工作台", target: nil, action: nil)
+    private let bufferPinnedCheck = NSButton(checkboxWithTitle: "常显于所有桌面与全屏空间", target: nil, action: nil)
+    private let candidatePlacementPopUp = NSPopUpButton()
+    private let moveBufferWindowButton = NSButton(title: "移到当前屏幕", target: nil, action: nil)
+    private let resetOnAppSwitchCheck = NSButton(checkboxWithTitle: "切换到其他应用时清空本地缓冲内容", target: nil, action: nil)
     private let gatewayEnableCheck = NSButton(checkboxWithTitle: "启用本地网关（127.0.0.1，仅回环，Token 鉴权）", target: nil, action: nil)
     private let gatewayConfigField = NSTextField(string: "")
     private let gatewayCopyConfigButton = NSButton(title: "复制配置 (JSON)", target: nil, action: nil)
@@ -196,6 +200,19 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
 
         bufferCheck.target = self
         bufferCheck.action = #selector(bufferToggled)
+        bufferWindowVisibleCheck.target = self
+        bufferWindowVisibleCheck.action = #selector(bufferWindowVisibilityToggled)
+        bufferPinnedCheck.target = self
+        bufferPinnedCheck.action = #selector(bufferPinnedToggled)
+        candidatePlacementPopUp.removeAllItems()
+        for placement in BufferCandidatePlacement.allCases {
+            candidatePlacementPopUp.addItem(withTitle: placement.title)
+            candidatePlacementPopUp.lastItem?.representedObject = placement.rawValue
+        }
+        candidatePlacementPopUp.target = self
+        candidatePlacementPopUp.action = #selector(bufferCandidatePlacementChanged)
+        moveBufferWindowButton.target = self
+        moveBufferWindowButton.action = #selector(moveBufferWindow)
         resetOnAppSwitchCheck.target = self
         resetOnAppSwitchCheck.action = #selector(resetOnAppSwitchToggled)
         gatewayEnableCheck.target = self
@@ -465,17 +482,17 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
 
     private func bufferPage() -> NSView {
         let note = NSTextField(wrappingLabelWithString:
-            "缓冲区开启后，Rime 提交内容会先进入输入法内部暂存区；按 Enter 手动发送，不会自动清空未确认内容。")
+            "缓冲区开启后，Rime 提交内容会进入独立工作台；轻按 Enter 发送下一块，长按 1.2 秒发送全部。发送后的块仍保留并标记，手动清空可撤销；下方隐私清理例外。")
         note.font = .systemFont(ofSize: 11)
         note.textColor = .tertiaryLabelColor
 
         let resetNote = NSTextField(wrappingLabelWithString:
-            "开启后，焦点切到别的应用会清空未发送的暂存内容，避免缓冲内容跨应用残留。打开本设置窗不算切换应用。")
+            "默认跨应用保留。开启后，仅当整个缓冲都来自本地输入时，切到其他应用会不可撤销地清空内容、撤销快照和发送历史；只要混有外部来源块就整体保留。")
         resetNote.font = .systemFont(ofSize: 11)
         resetNote.textColor = .tertiaryLabelColor
 
         let secureNote = NSTextField(wrappingLabelWithString:
-            "安全：当焦点位于密码框（系统安全输入生效）时，缓冲区内容不会被发送。此保护始终开启，无法关闭。")
+            "安全：当系统安全输入生效时，工作台会隐藏正文、统计与历史控件，关闭并擦净块编辑器，缓冲内容也不会被发送。此保护始终开启。")
         secureNote.font = .systemFont(ofSize: 11)
         secureNote.textColor = .tertiaryLabelColor
 
@@ -486,6 +503,14 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
             sectionLabel("模式"),
             bufferCheck,
             note,
+            spacer(16),
+            sectionLabel("窗口"),
+            bufferWindowVisibleCheck,
+            bufferPinnedCheck,
+            secondaryLabel("候选显示位置"),
+            candidatePlacementPopUp,
+            moveBufferWindowButton,
+            caption("关闭工作台会暂停捕获但保留内容；清空和关闭是两个独立动作。"),
             spacer(16),
             sectionLabel("安全与清理"),
             resetOnAppSwitchCheck,
@@ -826,6 +851,14 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
             schemaApplyStatus.stringValue = "勾选项都会出现在 F4；至少保留一个。"
         }
         bufferCheck.state = BufferModel.shared.enabled ? .on : .off
+        bufferWindowVisibleCheck.state = BufferWindowController.shared.isVisible ? .on : .off
+        bufferPinnedCheck.state = BufferWindowController.shared.pinned ? .on : .off
+        if let index = (0..<candidatePlacementPopUp.numberOfItems).first(where: {
+            candidatePlacementPopUp.item(at: $0)?.representedObject as? String
+                == BufferWindowController.shared.candidatePlacement.rawValue
+        }) {
+            candidatePlacementPopUp.selectItem(at: index)
+        }
         resetOnAppSwitchCheck.state = BufferModel.shared.resetOnAppSwitch ? .on : .off
         gatewayEnableCheck.state = LocalGateway.shared.enabled ? .on : .off
         gatewayConfigField.stringValue = gatewayConfigJSON()
@@ -1101,7 +1134,41 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     }
 
     @objc private func bufferToggled() {
-        BufferModel.shared.enabled = bufferCheck.state == .on
+        let enabled = bufferCheck.state == .on
+        BufferModel.shared.enabled = enabled
+        if enabled {
+            BufferWindowController.shared.show()
+        }
+        RimeBufferController.refreshActiveUI()
+        reload()
+        IMELog.write("setting bufferEnabled=\(enabled)")
+    }
+
+    @objc private func bufferWindowVisibilityToggled() {
+        if bufferWindowVisibleCheck.state == .on {
+            BufferWindowController.shared.show()
+        } else {
+            BufferWindowController.shared.closeAndPause()
+        }
+        reload()
+    }
+
+    @objc private func bufferPinnedToggled() {
+        BufferWindowController.shared.pinned = bufferPinnedCheck.state == .on
+        reload()
+    }
+
+    @objc private func bufferCandidatePlacementChanged() {
+        guard let raw = candidatePlacementPopUp.selectedItem?.representedObject as? String,
+              let placement = BufferCandidatePlacement(rawValue: raw) else { return }
+        BufferWindowController.shared.candidatePlacement = placement
+        reload()
+    }
+
+    @objc private func moveBufferWindow() {
+        BufferWindowController.shared.show()
+        BufferWindowController.shared.moveToCurrentScreen()
+        reload()
     }
 
     @objc private func remoteToggled() {

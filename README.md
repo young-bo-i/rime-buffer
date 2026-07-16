@@ -4,7 +4,15 @@
 
 > 仓库/内部代号仍是 **RimeBuffer**（SPM target、`Sources/RimeBuffer/`、控制器类）；对外产品名是 **Enter输入法 / ETInput**。
 
-**接手开发者：先读 [ARCHITECTURE.md](ARCHITECTURE.md)**——交接版全局架构，含模块规格、关键契约、实测修正（v2：marked-text 会话常驻）、P1' 任务清单与验收标准。
+**接手开发者：先读 [SYSTEM-ARCHITECTURE.md](SYSTEM-ARCHITECTURE.md)**——这是当前权威全局架构；[ARCHITECTURE.md](ARCHITECTURE.md) 保留 P1/P2 的历史契约与踩坑记录。
+
+## 缓冲工作台
+
+开启缓冲模式后，提交内容进入独立工作台。窗口可拖动、缩放、关闭，并可固定在所有桌面与全屏空间；候选和组字默认固定显示在工作台，也可改为跟随输入光标。
+
+发送只认当前实时聚焦的外部文本框。切换应用、文本框或打开块编辑器后不会使用旧目标；发送后块会保留并标记为已尝试，可从最近 50 条内存历史中选择恢复。关闭工作台会暂停捕获但不清空内容；可选的跨应用隐私清理不可撤销，只在真实外部应用 A→B 时触发，打开设置/编辑器再回到 A 不会误清空。
+
+窗口位置和显示偏好会保存；当前版本的缓冲内容、发送历史和清空撤销只在本次输入法进程内保留。
 
 ## 安装
 
@@ -18,6 +26,7 @@
 ./build_install.sh                # 构建+安装到当前用户+注册
 .build/release/RimeBuffer smoke   # 免安装引擎自检
 .build/release/RimeBuffer schema-smoke  # 设置页方案列表读写自检
+.build/release/RimeBuffer buffer-window-smoke # 焦点/生命周期门控与多屏恢复自检
 tail -f ~/rimebuffer.log          # 行为日志
 ```
 

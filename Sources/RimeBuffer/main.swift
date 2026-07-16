@@ -11,6 +11,9 @@ if CommandLine.arguments.contains("stats-smoke") {
 if CommandLine.arguments.contains("buffer-smoke") {
     exit(runBufferSmokeTest() ? 0 : 1)
 }
+if CommandLine.arguments.contains("buffer-window-smoke") {
+    exit(runBufferWindowSmokeTest() ? 0 : 1)
+}
 if CommandLine.arguments.contains("schema-smoke") {
     exit(runSchemaListStoreSmokeTest() ? 0 : 1)
 }
@@ -103,7 +106,6 @@ if CommandLine.arguments.contains("gateway-serve") {
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
     app.finishLaunching()
-    BufferModel.shared.deliver = { _, _ in true }
     InboundBus.shared.onChange = {
         let p = InboundBus.shared.pending
         print("[inbound] pending=\(p.count) latest=\(p.last.map { "\($0.origin.tag):\($0.text.count)chars streaming=\($0.streaming)" } ?? "-")")
@@ -136,22 +138,31 @@ _ = rimeEngine.start()
 
 // Mouse-selection routes to whichever controller currently owns focus — the
 // shared window must never bind to one specific controller.
-candidateWindow.onSelect = { selection in
-    RimeBufferController.active?.selectCandidate(selection)
+candidateWindow.onSelect = { owner, selection in
+    InputFocusCoordinator.shared.controller(for: owner)?
+        .selectCandidate(selection, owner: owner)
 }
 candidateWindow.onSettings = {
     SettingsWindowController.shared.show()
 }
+candidateWindow.onProjectionChange = { projection in
+    BufferWindowController.shared.updateCandidateProjection(projection)
+}
+candidateWindow.onBufferFlushProgress = { progress in
+    BufferWindowController.shared.setFlushProgress(progress)
+}
 
-// Buffer wiring: flushes deliver to the focused field; every model change
-// re-renders the inline buffer that lives inside the candidate window.
-BufferModel.shared.deliver = { text, origin in
-    RimeBufferController.deliverBufferedText(text, origin: origin)
-}
+// Buffer presentation is independent from the caret-owned candidate panel.
 BufferModel.shared.onChange = {
-    RimeBufferController.refreshBufferDisplayForCurrentOrRecent()
+    BufferWindowController.shared.refresh()
 }
-candidateWindow.refreshBuffer()
+InputFocusCoordinator.shared.onChange = {
+    BufferWindowController.shared.refresh()
+}
+InputFocusCoordinator.shared.onInvalidated = { owner in
+    candidateWindow.hide(owner: owner)
+}
+BufferWindowController.shared.showOnLaunchIfNeeded()
 
 // Local gateway: accept MCP / HTTP pushes from local agents into the inbound
 // bus (loopback-only, token-gated). Off is a one-line setting.
@@ -179,12 +190,12 @@ RemoteTypingService.shared.onReceiveText = { text in
         remoteClipboardBuffer = ""
         IMELog.write("remote: inserted received text into focused field")
     } else {
-        // No focused field — accumulate onto the clipboard (don't clobber each
-        // prior message) so the user can paste the whole thing.
+        // No safely deliverable field (focus changed, secure input, or active
+        // composition) — accumulate without clobbering the prior message.
         remoteClipboardBuffer += text
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(remoteClipboardBuffer, forType: .string)
-        IMELog.write("remote: no focused field; accumulated \(remoteClipboardBuffer.count) chars to clipboard")
+        IMELog.write("remote: direct insert unavailable; accumulated \(remoteClipboardBuffer.count) chars to clipboard")
     }
 }
 // A peer asks to pair — show 同意/拒绝 with the 4-digit SAS. One tap, no code entry.
@@ -228,36 +239,62 @@ let inputSourceChangedObserver = DistributedNotificationCenter.default().addObse
     let frontmostID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "unknown"
     IMELog.write("TIS source changed: current=\(currentID) frontmost=\(frontmostID)")
     let ownID = Bundle.main.bundleIdentifier ?? "com.isaac.inputmethod.RimeBuffer"
-    guard currentID != ownID, !currentID.hasPrefix(ownID + "."),
-          let controller = RimeBufferController.active else { return }
+    guard currentID != ownID, !currentID.hasPrefix(ownID + ".") else { return }
     IMELog.write("input source changed away programmatically -> \(currentID); finalizing active controller")
-    controller.deactivateServer(controller.client())
-    candidateWindow.hide()
+    if let lease = InputFocusCoordinator.shared.invalidateAll(reason: "input source changed") {
+        lease.controller?.finalizeDisplacedFocus(lease)
+        candidateWindow.hide(owner: lease.token)
+    } else {
+        candidateWindow.hideAll()
+    }
 }
+
+let privacyOwnBundleID = Bundle.main.bundleIdentifier ?? "com.isaac.inputmethod.RimeBuffer"
+let privacyOwnProcessIdentifier = ProcessInfo.processInfo.processIdentifier
+let initialFrontmostApplication = NSWorkspace.shared.frontmostApplication
+var lastExternalForegroundIdentity = BufferPrivacyTransitionRules.externalIdentity(
+    bundleID: initialFrontmostApplication?.bundleIdentifier,
+    processIdentifier: initialFrontmostApplication?.processIdentifier ?? 0,
+    ownBundleID: privacyOwnBundleID,
+    ownProcessIdentifier: privacyOwnProcessIdentifier
+)
 
 NSWorkspace.shared.notificationCenter.addObserver(
     forName: NSWorkspace.didActivateApplicationNotification,
     object: nil, queue: .main) { note in
-    // Hostile apps may never deliver deactivateServer on Cmd-Tab — resolve
-    // any in-flight chord/composition into its field instead of stranding
-    // marked text. No-op when the switch was already handled normally.
-    RimeBufferController.active?.forceCommit()
-
-    // Reset staged buffer when focus leaves for a DIFFERENT app — but ONLY
-    // locally-typed content. Two exceptions:
-    //  · our own windows (Settings, inbox, pairing) activate us via
-    //    NSApp.activate; filtering our bundle keeps opening them from self-wiping.
-    //  · externally-accepted content (MCP/HTTP/远端) is staged precisely to be
-    //    delivered to another app, so switching to that app must NOT wipe it.
-    if BufferModel.shared.resetOnAppSwitch, !BufferModel.shared.holdsExternalContent {
-        let activated = (note.userInfo?[NSWorkspace.applicationUserInfoKey]
-            as? NSRunningApplication)?.bundleIdentifier
-        let own = Bundle.main.bundleIdentifier
-        if let activated, activated != own {
-            BufferModel.shared.clear()
-        }
+    let activatedApplication = note.userInfo?[NSWorkspace.applicationUserInfoKey]
+        as? NSRunningApplication
+    if let lease = InputFocusCoordinator.shared.invalidateIfFrontmostChanged(
+        to: activatedApplication
+    ) {
+        lease.controller?.finalizeDisplacedFocus(lease)
+        candidateWindow.hide(owner: lease.token)
+    } else if InputFocusCoordinator.shared.owner == nil {
+        candidateWindow.hideAll()
     }
-    candidateWindow.hide()
+
+    // Reset only on a real external A -> B transition. Activating our editor or
+    // settings leaves the last external identity unchanged, so A -> ETInput -> A
+    // cannot self-wipe. Mixed/external content is kept as a whole because it was
+    // staged specifically for delivery to another application.
+    let activatedExternal = BufferPrivacyTransitionRules.externalIdentity(
+        bundleID: activatedApplication?.bundleIdentifier,
+        processIdentifier: activatedApplication?.processIdentifier ?? 0,
+        ownBundleID: privacyOwnBundleID,
+        ownProcessIdentifier: privacyOwnProcessIdentifier
+    )
+    if BufferPrivacyTransitionRules.shouldDiscard(
+        previousExternal: lastExternalForegroundIdentity,
+        activatedExternal: activatedExternal,
+        resetOnSwitch: BufferModel.shared.resetOnAppSwitch,
+        holdsExternalContent: BufferModel.shared.holdsExternalContent
+    ) {
+        BufferWindowController.shared.discardForPrivacyTransition()
+    }
+    lastExternalForegroundIdentity = BufferPrivacyTransitionRules.updatedPrevious(
+        lastExternalForegroundIdentity,
+        activatedExternal: activatedExternal
+    )
 }
 NotificationCenter.default.addObserver(
     forName: NSApplication.willTerminateNotification,
@@ -867,9 +904,7 @@ func runInboundBusSmokeTest() -> Bool {
     let bus = InboundBus.shared
     let model = BufferModel.shared
     let oldEnabled = model.enabled
-    let oldDeliver = model.deliver
-    defer { model.clear(); bus.clear(); model.enabled = oldEnabled; model.deliver = oldDeliver }
-    model.deliver = { _, _ in true }
+    defer { model.clear(); bus.clear(); model.enabled = oldEnabled }
     model.enabled = true
     model.clear(); bus.clear()
 
@@ -978,9 +1013,7 @@ func runOriginSmokeTest() -> Bool {
     // readable where the send path reads it.
     let model = BufferModel.shared
     let oldEnabled = model.enabled
-    let oldDeliver = model.deliver
-    defer { model.clear(); model.enabled = oldEnabled; model.deliver = oldDeliver }
-    model.deliver = { _, _ in true }
+    defer { model.clear(); model.enabled = oldEnabled }
     model.enabled = true
     model.clear()
     model.append("你")
@@ -1017,55 +1050,82 @@ func runBufferSmokeTest() -> Bool {
     }
     let model = BufferModel.shared
     let oldEnabled = model.enabled
-    let oldDeliver = model.deliver
     let oldOnChange = model.onChange
     defer {
         model.clear()
         model.enabled = oldEnabled
-        model.deliver = oldDeliver
         model.onChange = oldOnChange
     }
 
     model.onChange = nil
-    model.deliver = nil
     model.enabled = true
     model.clear()
 
-    var delivered: [String] = []
-    model.deliver = { text, _ in
-        delivered.append(text)
-        return true
-    }
+    // Accepted delivery attempts remain visible, but are no longer pending.
+    // This is the no-ACK safety rule and also prevents retrying an accepted
+    // prefix after a later block failed.
     model.append("你")
     model.append("好")
-    model.sendAll()
-    guard delivered == ["你", "好"], model.blocks.isEmpty, model.enabled == true else {
-        print("FAILED: sendAll success should keep buffer mode",
-              "delivered=\(delivered)",
-              "blocks=\(model.blocks.count)",
-              "enabled=\(model.enabled)")
+    let firstID = model.blocks[0].id
+    let secondID = model.blocks[1].id
+    let previousRecordIDs = Set(model.sentHistory.map(\.id))
+    model.recordDelivery(blockIDs: [firstID],
+                         targetBundleID: "com.example.target",
+                         targetName: "Target")
+    guard let firstRecord = model.sentHistory.last,
+          !previousRecordIDs.contains(firstRecord.id) else {
+        print("FAILED: delivery record was not appended")
+        return false
+    }
+    guard model.blocks.map(\.text) == ["你", "好"],
+          model.pendingDeliveryBlocks.map(\.id) == [secondID],
+          model.enabled else {
+        print("FAILED: delivery record must retain blocks and skip accepted prefix")
+        return false
+    }
+    guard model.restoreDelivery(recordID: firstRecord.id),
+          Set(model.pendingDeliveryBlocks.map(\.id)) == Set([firstID, secondID]) else {
+        print("FAILED: delivery history restore should mark blocks pending")
         return false
     }
 
-    model.enabled = true
-    model.append("保留")
-    model.deliver = { _, _ in false }
-    model.sendAll()
-    guard model.blocks.count == 1, model.enabled == true else {
-        print("FAILED: send failure should preserve state",
-              "blocks=\(model.blocks.count)",
-              "enabled=\(model.enabled)")
+    // A delivery snapshot can rebuild blocks after the user explicitly clears
+    // the visible workbench; restoring is deliberate and marks every block as
+    // pending rather than claiming to undo text in the destination app.
+    model.recordDelivery(blockIDs: [firstID, secondID],
+                         targetBundleID: "com.example.target",
+                         targetName: "Target")
+    guard let recoveryRecord = model.sentHistory.last else {
+        print("FAILED: missing recovery delivery record")
+        return false
+    }
+    model.clear()
+    guard model.restoreDelivery(recordID: recoveryRecord.id),
+          model.blocks.map(\.text) == ["你", "好"],
+          model.pendingDeliveryBlocks.map(\.id) == [firstID, secondID] else {
+        print("FAILED: cleared delivery history recovery")
+        return false
+    }
+
+    // Partial recovery preserves the delivery snapshot's relative order. A
+    // missing prefix must be restored before its surviving suffix, not appended.
+    guard model.removeBlock(id: firstID),
+          model.blocks.map(\.id) == [secondID],
+          model.restoreDelivery(recordID: recoveryRecord.id),
+          model.blocks.map(\.id) == [firstID, secondID] else {
+        print("FAILED: partial delivery history recovery order")
+        return false
+    }
+
+    // Clear never exits capture, and a mistaken clear is recoverable in memory.
+    model.clear()
+    guard model.blocks.isEmpty, model.enabled, model.canUndoClear,
+          model.undoLastClear(), model.blocks.map(\.text) == ["你", "好"] else {
+        print("FAILED: clear/undo semantics")
         return false
     }
 
     model.clear()
-    guard model.blocks.isEmpty, model.enabled == true else {
-        print("FAILED: clear should not exit buffer mode",
-              "blocks=\(model.blocks.count)",
-              "enabled=\(model.enabled)")
-        return false
-    }
-
     model.append("前")
     model.append("后")
     guard model.removeLastBlock(),
@@ -1108,20 +1168,45 @@ func runBufferSmokeTest() -> Bool {
         return false
     }
 
-    delivered.removeAll()
-    model.deliver = { text, _ in
-        delivered.append(text)
-        return true
+    // Per-block editing preserves provenance/identity/time and invalidates a
+    // previous sent mark.
+    let editedBefore = model.blocks[1]
+    model.recordDelivery(blockIDs: [editedBefore.id],
+                         targetBundleID: "com.example.target",
+                         targetName: "Target")
+    guard model.updateBlock(id: editedBefore.id, text: "二改"),
+          let edited = model.blocks.first(where: { $0.id == editedBefore.id }),
+          edited.origin == editedBefore.origin,
+          edited.createdAt == editedBefore.createdAt,
+          edited.lastSentAt == nil,
+          edited.text == "二改" else {
+        print("FAILED: block editing must preserve metadata and become pending")
+        return false
     }
-    guard model.sendNextBlock(),
-          delivered == ["一"],
-          model.blocks.map(\.text) == ["二", "三"],
-          model.enabled == true else {
-        print("FAILED: sendNextBlock should send oldest and keep buffer mode",
-              "delivered=\(delivered)",
-              "index=\(model.insertionIndex)",
-              "blocks=\(model.blocks.map(\.text))",
-              "enabled=\(model.enabled)")
+
+    model.pauseCapturePreservingContent()
+    guard !model.enabled, !model.blocks.isEmpty else {
+        print("FAILED: pause capture must preserve content")
+        return false
+    }
+
+    if let blockID = model.blocks.first?.id {
+        for _ in 0..<55 {
+            model.recordDelivery(blockIDs: [blockID],
+                                 targetBundleID: "com.example.target",
+                                 targetName: "Target")
+        }
+    }
+    guard model.sentHistory.count == 50 else {
+        print("FAILED: delivery history must retain exactly the latest 50 records")
+        return false
+    }
+
+    model.discardForPrivacy()
+    guard model.blocks.isEmpty,
+          model.sentHistory.isEmpty,
+          !model.canUndoClear else {
+        print("FAILED: privacy discard must not be recoverable")
         return false
     }
 
@@ -1129,21 +1214,430 @@ func runBufferSmokeTest() -> Bool {
     return true
 }
 
+func runBufferWindowSmokeTest() -> Bool {
+    print("== RimeBuffer buffer window smoke test ==")
+
+    guard BufferWindowVisibilityRules.isVisibleOnActiveSpace(
+            isOrdered: true,
+            isOnActiveSpace: true
+          ),
+          !BufferWindowVisibilityRules.isVisibleOnActiveSpace(
+            isOrdered: true,
+            isOnActiveSpace: false
+          ),
+          !BufferWindowVisibilityRules.isVisibleOnActiveSpace(
+            isOrdered: false,
+            isOnActiveSpace: true
+          ) else {
+        print("FAILED: workbench visibility must be scoped to the active Space")
+        return false
+    }
+
+    var epochs = FocusEpochState()
+    let tokenA = epochs.activate()
+    let tokenB = epochs.activate()
+    guard tokenA != tokenB,
+          !epochs.isCurrent(tokenA),
+          epochs.isCurrent(tokenB),
+          epochs.deactivate(tokenA) == false,
+          epochs.isCurrent(tokenB),
+          epochs.deactivate(tokenB),
+          epochs.current == nil else {
+        print("FAILED: focus epoch must reject stale deactivate")
+        return false
+    }
+
+    func targetAllowed(tokenIsCurrent: Bool = true,
+                       expectedTokenMatches: Bool = true,
+                       externalTarget: Bool = true,
+                       deliveryTrusted: Bool = true,
+                       controllerAlive: Bool = true,
+                       clientAlive: Bool = true,
+                       clientIdentityMatches: Bool = true,
+                       controllerClientIdentityMatches: Bool = true,
+                       clientBundleMatches: Bool = true,
+                       frontmostApplicationMatches: Bool = true,
+                       frontmostProcessMatches: Bool = true) -> Bool {
+        FocusTargetRules.allows(
+            tokenIsCurrent: tokenIsCurrent,
+            expectedTokenMatches: expectedTokenMatches,
+            externalTarget: externalTarget,
+            deliveryTrusted: deliveryTrusted,
+            controllerAlive: controllerAlive,
+            clientAlive: clientAlive,
+            clientIdentityMatches: clientIdentityMatches,
+            controllerClientIdentityMatches: controllerClientIdentityMatches,
+            clientBundleMatches: clientBundleMatches,
+            frontmostApplicationMatches: frontmostApplicationMatches,
+            frontmostProcessMatches: frontmostProcessMatches
+        )
+    }
+    let eligible = targetAllowed()
+    let rejectedVariants = [
+        targetAllowed(tokenIsCurrent: false),
+        targetAllowed(expectedTokenMatches: false),
+        targetAllowed(externalTarget: false),
+        targetAllowed(deliveryTrusted: false),
+        targetAllowed(controllerAlive: false),
+        targetAllowed(clientAlive: false),
+        targetAllowed(clientIdentityMatches: false),
+        targetAllowed(controllerClientIdentityMatches: false),
+        targetAllowed(clientBundleMatches: false),
+        targetAllowed(frontmostApplicationMatches: false),
+        targetAllowed(frontmostProcessMatches: false),
+    ]
+    guard eligible, rejectedVariants.allSatisfy({ !$0 }) else {
+        print("FAILED: live target eligibility gate")
+        return false
+    }
+    guard !FocusTargetRules.shouldPruneExpiredLease(
+            controllerAlive: true,
+            clientAlive: true
+          ),
+          FocusTargetRules.shouldPruneExpiredLease(
+            controllerAlive: false,
+            clientAlive: true
+          ),
+          FocusTargetRules.shouldPruneExpiredLease(
+            controllerAlive: true,
+            clientAlive: false
+          ),
+          FocusTargetRules.requiresNoClientCleanup(
+            controllerAlive: true,
+            clientAlive: false
+          ),
+          !FocusTargetRules.requiresNoClientCleanup(
+            controllerAlive: false,
+            clientAlive: false
+          ) else {
+        print("FAILED: expired lease must clear a surviving controller session")
+        return false
+    }
+    guard FocusEventRules.isOrdered(12.0, activationFloor: 11.5, lastAccepted: 11.9),
+          !FocusEventRules.isOrdered(11.4, activationFloor: 11.5, lastAccepted: nil),
+          !FocusEventRules.isOrdered(9.70, activationFloor: 9.75, lastAccepted: nil),
+          !FocusEventRules.isOrdered(11.8, activationFloor: nil, lastAccepted: 11.9),
+          FocusEventRules.mayTakeOwnership(incomingBundleID: "app.b",
+                                           currentOwnerBundleID: "app.a",
+                                           frontmostBundleID: "app.b"),
+          !FocusEventRules.mayTakeOwnership(incomingBundleID: "app.a",
+                                            currentOwnerBundleID: "app.b",
+                                            frontmostBundleID: "app.b"),
+          !FocusEventRules.mayTakeOwnership(incomingBundleID: "app.c",
+                                            currentOwnerBundleID: "app.a",
+                                            frontmostBundleID: "app.b"),
+          !FocusEventRules.mayTakeOwnership(incomingBundleID: "app.b",
+                                            currentOwnerBundleID: "app.a",
+                                            frontmostBundleID: nil),
+          FocusEventRules.mayTakeOwnership(incomingBundleID: "app.a",
+                                           currentOwnerBundleID: "app.a",
+                                           frontmostBundleID: nil),
+          FocusEventRules.mayEstablishProcessBoundLease(
+            ownerExists: false,
+            frontmostProcessIdentifier: 101,
+            knownClientProcessIdentifier: nil
+          ),
+          !FocusEventRules.mayEstablishProcessBoundLease(
+            ownerExists: true,
+            frontmostProcessIdentifier: 101,
+            knownClientProcessIdentifier: nil
+          ),
+          !FocusEventRules.mayEstablishProcessBoundLease(
+            ownerExists: false,
+            frontmostProcessIdentifier: 101,
+            knownClientProcessIdentifier: 202
+          ) else {
+        print("FAILED: focus event ordering/background callback gate")
+        return false
+    }
+    guard FocusActivationRules.shouldConfirmProvisional(
+            isProvisional: true,
+            sameControllerAndClient: true,
+            age: 0.10
+          ),
+          !FocusActivationRules.shouldConfirmProvisional(
+            isProvisional: true,
+            sameControllerAndClient: true,
+            age: 0.30
+          ),
+          !FocusActivationRules.lifecycleCallbackMayApply(
+            now: 10.05,
+            suppressionUntil: 10.10,
+            leaseAge: 0.20,
+            senderIsExplicit: true,
+            clientIdentityWasReused: false
+          ),
+          FocusActivationRules.lifecycleCallbackMayApply(
+            now: 10.20,
+            suppressionUntil: 10.10,
+            leaseAge: 0.20,
+            senderIsExplicit: true,
+            clientIdentityWasReused: false
+          ),
+          !FocusActivationRules.lifecycleCallbackMayApply(
+            now: 10.20,
+            suppressionUntil: 10.00,
+            leaseAge: 0.04,
+            senderIsExplicit: false,
+            clientIdentityWasReused: false
+          ),
+          FocusActivationRules.lifecycleCallbackMayApply(
+            now: 10.20,
+            suppressionUntil: 10.00,
+            leaseAge: 0.10,
+            senderIsExplicit: false,
+            clientIdentityWasReused: false
+          ),
+          !FocusActivationRules.lifecycleCallbackMayApply(
+            now: 99.00,
+            suppressionUntil: 10.00,
+            leaseAge: 89.00,
+            senderIsExplicit: true,
+            clientIdentityWasReused: true
+          ),
+          FocusActivationRules.currentControllerClientMayApply(
+            clientExists: true,
+            identityMatches: true
+          ),
+          !FocusActivationRules.currentControllerClientMayApply(
+            clientExists: false,
+            identityMatches: false
+          ),
+          !FocusActivationRules.currentControllerClientMayApply(
+            clientExists: true,
+            identityMatches: false
+          ),
+          FocusActivationRules.mayContinueExactLeaseWithoutBundle(
+            forceNewEpoch: false,
+            eventRequiresFreshEpoch: false
+          ),
+          !FocusActivationRules.mayContinueExactLeaseWithoutBundle(
+            forceNewEpoch: true,
+            eventRequiresFreshEpoch: false
+          ),
+          !FocusActivationRules.mayContinueExactLeaseWithoutBundle(
+            forceNewEpoch: false,
+            eventRequiresFreshEpoch: true
+          ),
+          FocusActivationRules.eventRevealsFieldChange(
+            hasEvent: true,
+            reusesExactOwner: true,
+            compositionActive: true,
+            markedRangeWasObservable: true,
+            markedRangeIsMissing: true
+          ),
+          !FocusActivationRules.eventRevealsFieldChange(
+            hasEvent: true,
+            reusesExactOwner: true,
+            compositionActive: true,
+            markedRangeWasObservable: false,
+            markedRangeIsMissing: true
+          ) else {
+        print("FAILED: provisional/lifecycle focus rules")
+        return false
+    }
+    guard FocusTargetRules.identifiesExternalTarget(
+            bundleID: "app.external",
+            processIdentifier: 101,
+            ownBundleID: "ime.own",
+            ownProcessIdentifier: 999
+          ),
+          !FocusTargetRules.identifiesExternalTarget(
+            bundleID: "unknown",
+            processIdentifier: 999,
+            ownBundleID: "ime.own",
+            ownProcessIdentifier: 999
+          ),
+          !FocusTargetRules.identifiesExternalTarget(
+            bundleID: "ime.own",
+            processIdentifier: 999,
+            ownBundleID: "ime.own",
+            ownProcessIdentifier: 999
+          ) else {
+        print("FAILED: own process must never become an external delivery target")
+        return false
+    }
+
+    let routingGate = ChordClientRoutingGate()
+    var callbackRoutingStates: [Bool] = []
+    let simulatedChordFlushCallback = {
+        callbackRoutingStates.append(routingGate.allowsClientRouting)
+    }
+    routingGate.withIsolatedClientRouting {
+        simulatedChordFlushCallback()
+    }
+    simulatedChordFlushCallback()
+    guard callbackRoutingStates == [false, true],
+          routingGate.allowsClientRouting else {
+        print("FAILED: suspended focus must isolate pending chord client routing")
+        return false
+    }
+
+    let appA = BufferPrivacyTransitionRules.externalIdentity(
+        bundleID: "app.a", processIdentifier: 101,
+        ownBundleID: "ime.own", ownProcessIdentifier: 999
+    )
+    let appB = BufferPrivacyTransitionRules.externalIdentity(
+        bundleID: "app.b", processIdentifier: 202,
+        ownBundleID: "ime.own", ownProcessIdentifier: 999
+    )
+    let relaunchedAppA = BufferPrivacyTransitionRules.externalIdentity(
+        bundleID: "app.a", processIdentifier: 303,
+        ownBundleID: "ime.own", ownProcessIdentifier: 999
+    )
+    let recycledAppPID = BufferPrivacyTransitionRules.externalIdentity(
+        bundleID: "app.c", processIdentifier: 101,
+        ownBundleID: "ime.own", ownProcessIdentifier: 999
+    )
+    let anonymousProcess = BufferPrivacyTransitionRules.externalIdentity(
+        bundleID: nil, processIdentifier: 404,
+        ownBundleID: "ime.own", ownProcessIdentifier: 999
+    )
+    let sameAnonymousProcess = BufferPrivacyTransitionRules.externalIdentity(
+        bundleID: nil, processIdentifier: 404,
+        ownBundleID: "ime.own", ownProcessIdentifier: 999
+    )
+    let knownAnonymousProcess = BufferPrivacyTransitionRules.externalIdentity(
+        bundleID: "app.anonymous", processIdentifier: 404,
+        ownBundleID: "ime.own", ownProcessIdentifier: 999
+    )
+    let ownWindow = BufferPrivacyTransitionRules.externalIdentity(
+        bundleID: "ime.own", processIdentifier: 999,
+        ownBundleID: "ime.own", ownProcessIdentifier: 999
+    )
+    guard let appA, let appB, let relaunchedAppA, let recycledAppPID,
+          let anonymousProcess, let sameAnonymousProcess,
+          let knownAnonymousProcess,
+          ownWindow == nil,
+          !BufferPrivacyTransitionRules.shouldDiscard(
+            previousExternal: nil, activatedExternal: appA,
+            resetOnSwitch: true, holdsExternalContent: false
+          ),
+          !BufferPrivacyTransitionRules.shouldDiscard(
+            previousExternal: appA, activatedExternal: appA,
+            resetOnSwitch: true, holdsExternalContent: false
+          ),
+          !BufferPrivacyTransitionRules.shouldDiscard(
+            previousExternal: appA, activatedExternal: relaunchedAppA,
+            resetOnSwitch: true, holdsExternalContent: false
+          ),
+          BufferPrivacyTransitionRules.shouldDiscard(
+            previousExternal: appA, activatedExternal: recycledAppPID,
+            resetOnSwitch: true, holdsExternalContent: false
+          ),
+          !BufferPrivacyTransitionRules.shouldDiscard(
+            previousExternal: anonymousProcess,
+            activatedExternal: sameAnonymousProcess,
+            resetOnSwitch: true, holdsExternalContent: false
+          ),
+          !BufferPrivacyTransitionRules.shouldDiscard(
+            previousExternal: anonymousProcess,
+            activatedExternal: knownAnonymousProcess,
+            resetOnSwitch: true, holdsExternalContent: false
+          ),
+          BufferPrivacyTransitionRules.updatedPrevious(
+            anonymousProcess, activatedExternal: knownAnonymousProcess
+          ) == knownAnonymousProcess,
+          BufferPrivacyTransitionRules.updatedPrevious(
+            knownAnonymousProcess, activatedExternal: anonymousProcess
+          ) == knownAnonymousProcess,
+          BufferPrivacyTransitionRules.updatedPrevious(
+            appA, activatedExternal: ownWindow
+          ) == appA,
+          BufferPrivacyTransitionRules.shouldDiscard(
+            previousExternal: appA, activatedExternal: appB,
+            resetOnSwitch: true, holdsExternalContent: false
+          ),
+          !BufferPrivacyTransitionRules.shouldDiscard(
+            previousExternal: appA, activatedExternal: appB,
+            resetOnSwitch: false, holdsExternalContent: false
+          ),
+          !BufferPrivacyTransitionRules.shouldDiscard(
+            previousExternal: appA, activatedExternal: appB,
+            resetOnSwitch: true, holdsExternalContent: true
+          ) else {
+        print("FAILED: external app privacy transition rules")
+        return false
+    }
+
+    let model = BufferModel.shared
+    let oldEnabled = model.enabled
+    let oldOnChange = model.onChange
+    model.onChange = nil
+    model.discardForPrivacy()
+    model.enabled = true
+    model.append("shield-smoke")
+    let rail = BufferInlineView()
+    _ = rail.refresh()
+    let renderedBeforeShield = !rail.isHidden && rail.renderedBlockCount == 1
+    _ = rail.refresh(shielded: true)
+    let scrubbedByShield = rail.isHidden && rail.renderedBlockCount == 0
+    model.discardForPrivacy()
+    model.beginTransientLoading(requestId: "clear-loading-smoke",
+                                message: "loading")
+    _ = rail.refresh()
+    let canClearLoadingOnlyState = model.blocks.isEmpty && rail.canClearContent
+    model.enabled = oldEnabled
+    model.clear()
+    model.onChange = oldOnChange
+    guard renderedBeforeShield, scrubbedByShield, canClearLoadingOnlyState else {
+        print("FAILED: buffer rail privacy or loading-clear behavior")
+        return false
+    }
+
+    let primary = NSRect(x: 0, y: 0, width: 1440, height: 900)
+    let secondary = NSRect(x: 1440, y: 0, width: 1280, height: 800)
+    let offscreen = NSRect(x: 4000, y: -900, width: 680, height: 230)
+    let restored = BufferWindowGeometry.clampedFrame(offscreen,
+                                                     visibleFrames: [primary, secondary],
+                                                     fallback: primary)
+    guard primary.contains(restored),
+          restored.width >= BufferWindowGeometry.standardMinimumWidth,
+          restored.height >= BufferWindowGeometry.standardMinimumHeight else {
+        print("FAILED: offscreen frame was not restored to fallback screen", restored)
+        return false
+    }
+
+    let oversized = NSRect(x: 1500, y: 40, width: 3000, height: 2000)
+    let fitted = BufferWindowGeometry.clampedFrame(oversized,
+                                                   visibleFrames: [primary, secondary],
+                                                   fallback: primary)
+    guard fitted.width <= secondary.width,
+          fitted.height <= secondary.height,
+          secondary.contains(fitted) else {
+        print("FAILED: oversized frame was not clamped to its screen", fitted)
+        return false
+    }
+
+    let tiny = NSRect(x: -480, y: 0, width: 480, height: 160)
+    let tinyFitted = BufferWindowGeometry.clampedFrame(
+        NSRect(x: -900, y: -500, width: 680, height: 230),
+        visibleFrames: [tiny],
+        fallback: tiny
+    )
+    guard tiny.contains(tinyFitted),
+          tinyFitted.width <= tiny.width,
+          tinyFitted.height <= tiny.height else {
+        print("FAILED: tiny visible frame clamp", tinyFitted)
+        return false
+    }
+
+    print("buffer window smoke: OK")
+    return true
+}
+
 func runMarineBridgeSmokeTest() -> Bool {
     print("== ETInput Marine bridge smoke test ==")
     let model = BufferModel.shared
     let oldEnabled = model.enabled
-    let oldDeliver = model.deliver
     let oldOnChange = model.onChange
     defer {
         model.clear()
         model.enabled = oldEnabled
-        model.deliver = oldDeliver
         model.onChange = oldOnChange
     }
 
     model.onChange = nil
-    model.deliver = nil
     model.clear()
 
     MarineBridge.shared.checkForFocusedIntent()

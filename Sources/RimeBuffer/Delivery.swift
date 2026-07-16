@@ -14,7 +14,7 @@ enum Delivery {
     /// delivery moment (cheap, authoritative) rather than polled.
     ///
     /// Returns whether the text was actually inserted, so the buffer can keep
-    /// unsent blocks instead of dropping them (see BufferModel.sendNextBlock).
+    /// unsent blocks instead of dropping them (see BufferDeliveryCoordinator).
     /// Does NOT cover apps that draw their own password fields without enabling
     /// secure input — that is out of this backstop's reach.
     @discardableResult

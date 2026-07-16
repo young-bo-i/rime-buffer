@@ -254,6 +254,30 @@ struct CandidateSelection {
     let index: Int
 }
 
+enum CandidatePresentationMode {
+    case caret
+    case workbench
+}
+
+enum CandidateProjectionAction {
+    case candidate(CandidateSelection)
+    case singleCharacter(index: Int)
+}
+
+struct CandidateProjectionItem {
+    let label: String
+    let text: String
+    let comment: String
+    let highlighted: Bool
+    let action: CandidateProjectionAction
+}
+
+struct CandidateProjection {
+    let owner: FocusToken
+    let preedit: String
+    let rows: [[CandidateProjectionItem]]
+}
+
 /// In-process candidate window. Candidates default to a compact one-line strip
 /// and can expand into a matrix of consecutive Rime pages, one page per row.
 /// The matrix renders at most three rows at a time, but that is a viewport, not
@@ -281,14 +305,12 @@ final class CandidateWindow {
     private let candidateScroll = NSScrollView()
     private let candidateStack = NSStackView()
     private let settingsButton = CandidateActionButton(symbolName: "gearshape", title: "")
-    private let inlineBuffer = BufferInlineView()
     private var stripHeightConstraint: NSLayoutConstraint!
     private var candidateHeightConstraint: NSLayoutConstraint!
     private var preeditHeightConstraint: NSLayoutConstraint!
     private var dividerHeightConstraint: NSLayoutConstraint!
     private var barTopConstraint: NSLayoutConstraint!
     private var barBottomConstraint: NSLayoutConstraint!
-    private var inlineBufferHeightConstraint: NSLayoutConstraint!
     private var lastGoodRect: [String: NSRect] = [:]
 
     private var currentContext = RimeContextModel()
@@ -309,17 +331,27 @@ final class CandidateWindow {
     private var expandedSelectionPageOffset = 0
     private var characterSelectionText = ""
     private var characterSelectionIndex = 0
-    private var bufferOnly = false
     private var lastCaretRect = NSRect.zero
     private var lastBundleId = ""
-    private var bufferFlushProgress: Double?
+    private var ownerToken: FocusToken?
+    private var presentationMode: CandidatePresentationMode = .caret
+    private var projectionPreedit = ""
 
-    var onSelect: ((CandidateSelection) -> Void)?
+    var onSelect: ((FocusToken, CandidateSelection) -> Void)?
     var onSettings: (() -> Void)?
+    var onProjectionChange: ((CandidateProjection?) -> Void)?
+    var onBufferFlushProgress: ((Double?) -> Void)?
 
-    var hasCandidates: Bool { panel.isVisible && !currentContext.candidates.isEmpty }
-    var isShowingInlineBuffer: Bool { panel.isVisible && !inlineBuffer.isHidden }
-    var isVisible: Bool { panel.isVisible }
+    var hasCandidates: Bool {
+        guard let ownerToken,
+              InputFocusCoordinator.shared.interactionTarget(expected: ownerToken) != nil else { return false }
+        return !currentContext.candidates.isEmpty
+    }
+    var isVisible: Bool {
+        guard let ownerToken,
+              InputFocusCoordinator.shared.interactionTarget(expected: ownerToken) != nil else { return false }
+        return !currentContext.candidates.isEmpty || !projectionPreedit.isEmpty
+    }
     var isExpanded: Bool { !expandedPages.isEmpty }
     /// How many Rime pages the matrix has fetched, and where the selection sits
     /// in them — the owner uses these to pull more pages before the selection
@@ -442,11 +474,7 @@ final class CandidateWindow {
         root.spacing = 5
         root.translatesAutoresizingMaskIntoConstraints = false
         root.addArrangedSubview(preeditLabel)
-        root.addArrangedSubview(inlineBuffer)
         root.addArrangedSubview(strip)
-        inlineBuffer.isHidden = true
-        inlineBufferHeightConstraint = inlineBuffer.heightAnchor.constraint(equalToConstant: 0)
-        inlineBufferHeightConstraint.isActive = true
 
         content.wantsLayer = true
         content.layer?.cornerRadius = 6
@@ -461,8 +489,6 @@ final class CandidateWindow {
             strip.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             preeditLabel.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 2),
             preeditLabel.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -2),
-            inlineBuffer.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            inlineBuffer.trailingAnchor.constraint(equalTo: root.trailingAnchor),
         ])
         panel.contentView = content
 
@@ -474,7 +500,7 @@ final class CandidateWindow {
         ) { [weak self] _ in
             self?.applyAppearance()
             self?.renderCandidates()
-            self?.refreshBuffer()
+            self?.publishProjection()
         }
         NotificationCenter.default.addObserver(
             forName: .candidateWindowMetricsDidChange,
@@ -483,21 +509,31 @@ final class CandidateWindow {
         ) { [weak self] _ in
             self?.applyMetrics()
             self?.renderCandidates()
-            self?.refreshBuffer()
+            self?.publishProjection()
         }
     }
 
-    func update(_ ctx: RimeContextModel, caretRect: NSRect, bundleId: String, showPreedit: Bool) {
-        guard !ctx.candidates.isEmpty || (showPreedit && !ctx.preedit.isEmpty) else {
-            if BufferModel.shared.shouldDisplay {
-                showBufferOnly(caretRect: caretRect, bundleId: bundleId)
-            } else {
-                hide()
-            }
+    func update(_ ctx: RimeContextModel,
+                caretRect: NSRect,
+                bundleId: String,
+                showPreedit: Bool,
+                owner: FocusToken,
+                presentation: CandidatePresentationMode) {
+        guard InputFocusCoordinator.shared.isCurrent(owner) else {
+            IMELog.write("candidate stale update ignored owner=\(owner)")
+            return
+        }
+        guard !ctx.candidates.isEmpty
+                || (showPreedit && (!ctx.preedit.isEmpty || !ctx.input.isEmpty)) else {
+            hide(owner: owner)
             return
         }
 
-        bufferOnly = false
+        if ownerToken != owner {
+            resetPresentationState()
+        }
+        ownerToken = owner
+        presentationMode = presentation
         strip.isHidden = false
         let signature = contextSignature(ctx)
         let signatureChanged = signature != currentSignature
@@ -520,79 +556,57 @@ final class CandidateWindow {
             }
         }
 
-        let bufferOwnsPreedit = BufferModel.shared.active
-        preeditLabel.stringValue = showPreedit && !bufferOwnsPreedit
-            ? (ctx.preedit.isEmpty ? ctx.input : ctx.preedit)
-            : ""
+        projectionPreedit = showPreedit ? (ctx.preedit.isEmpty ? ctx.input : ctx.preedit) : ""
+        preeditLabel.stringValue = projectionPreedit
         preeditLabel.isHidden = preeditLabel.stringValue.isEmpty
         applyAppearance()
         renderCandidates()
-        refreshInlineBuffer()
-        layoutPanel(caretRect: caretRect, bundleId: bundleId)
-        panel.orderFrontRegardless()
+        publishProjection()
+        if presentation == .workbench {
+            panel.orderOut(nil)
+        } else {
+            layoutPanel(caretRect: caretRect, bundleId: bundleId)
+            panel.orderFrontRegardless()
+        }
     }
 
-    func showBufferOnly(caretRect: NSRect, bundleId: String) {
-        guard BufferModel.shared.shouldDisplay else {
-            hide()
+    func hide(owner: FocusToken) {
+        guard let ownerToken else {
+            panel.orderOut(nil)
+            onProjectionChange?(nil)
             return
         }
-        bufferOnly = true
-        visualPageIndex = 0
-        selectedIndex = 0
-        resetExpandedState()
-        resetCharacterSelectionState()
-        currentContext = RimeContextModel()
-        currentSignature = ""
-        lastCaretRect = caretRect
-        lastBundleId = bundleId
-        preeditLabel.stringValue = ""
-        preeditLabel.isHidden = true
-        strip.isHidden = false
-        applyAppearance()
-        renderCandidates()
-        refreshInlineBuffer()
-        layoutPanel(caretRect: caretRect, bundleId: bundleId)
-        panel.orderFrontRegardless()
-    }
-
-    func hide() {
-        visualPageIndex = 0
-        selectedIndex = 0
-        resetExpandedState()
-        resetCharacterSelectionState()
-        bufferOnly = false
-        currentContext = RimeContextModel()
-        currentSignature = ""
-        preeditLabel.stringValue = ""
-        preeditLabel.isHidden = true
-        strip.isHidden = false
+        guard ownerToken == owner else {
+            IMELog.write("candidate stale hide ignored owner=\(owner)")
+            return
+        }
+        resetPresentationState()
         panel.orderOut(nil)
+        onProjectionChange?(nil)
     }
 
-    func refreshBuffer() {
-        refreshInlineBuffer()
-        guard panel.isVisible else {
-            return
-        }
-        if bufferOnly, !BufferModel.shared.shouldDisplay {
-            hide()
-            return
-        }
-        if inlineBuffer.isHidden, currentContext.candidates.isEmpty, preeditLabel.isHidden {
-            hide()
-            return
-        }
-        if !currentContext.candidates.isEmpty {
-            renderCandidates()
-        }
-        layoutPanel(caretRect: lastCaretRect, bundleId: lastBundleId)
-        panel.orderFrontRegardless()
+    func hideAll() {
+        resetPresentationState()
+        panel.orderOut(nil)
+        onProjectionChange?(nil)
+    }
+
+    private func resetPresentationState() {
+        visualPageIndex = 0
+        selectedIndex = 0
+        resetExpandedState()
+        resetCharacterSelectionState()
+        currentContext = RimeContextModel()
+        currentSignature = ""
+        projectionPreedit = ""
+        ownerToken = nil
+        preeditLabel.stringValue = ""
+        preeditLabel.isHidden = true
+        strip.isHidden = false
     }
 
     func setBufferFlushProgress(_ progress: Double?) {
-        bufferFlushProgress = progress
-        inlineBuffer.setFlushProgress(progress)
+        onBufferFlushProgress?(progress)
     }
 
     @discardableResult
@@ -603,9 +617,9 @@ final class CandidateWindow {
         characterSelectionText = candidateText
         characterSelectionIndex = 0
         renderCandidates()
-        refreshInlineBuffer()
+        publishProjection()
         layoutPanel(caretRect: lastCaretRect, bundleId: lastBundleId)
-        panel.orderFrontRegardless()
+        showAccordingToPresentation()
         return true
     }
 
@@ -614,7 +628,7 @@ final class CandidateWindow {
         guard isSingleCharacterSelectionActive else { return false }
         let chars = Array(characterSelectionText)
         guard !chars.isEmpty else { return false }
-        let logicalDelta = BufferModel.shared.active ? -delta : delta
+        let logicalDelta = delta
         characterSelectionIndex = clamp(characterSelectionIndex + logicalDelta, count: chars.count)
         renderCandidates()
         resetCandidateScroll()
@@ -627,9 +641,9 @@ final class CandidateWindow {
         selectedIndex = clamp(selectedIndex, count: currentContext.candidates.count)
         visualPageIndex = pageIndex(containing: selectedIndex, panelWidth: activePanelWidth())
         renderCandidates()
-        refreshInlineBuffer()
+        publishProjection()
         layoutPanel(caretRect: lastCaretRect, bundleId: lastBundleId)
-        panel.orderFrontRegardless()
+        showAccordingToPresentation()
     }
 
     @discardableResult
@@ -638,7 +652,7 @@ final class CandidateWindow {
             return moveExpandedSelection(columnDelta: delta)
         }
         guard !currentContext.candidates.isEmpty else { return false }
-        let logicalDelta = BufferModel.shared.active ? -delta : delta
+        let logicalDelta = delta
         selectedIndex = clamp(selectedIndex + logicalDelta, count: currentContext.candidates.count)
         visualPageIndex = pageIndex(containing: selectedIndex, panelWidth: activePanelWidth())
         renderCandidates()
@@ -681,9 +695,9 @@ final class CandidateWindow {
         clampExpandedSelectionToVisiblePrefix()
         renderCandidates()
         logExpandedVisiblePrefix(reason: "expand")
-        refreshInlineBuffer()
+        publishProjection()
         layoutPanel(caretRect: lastCaretRect, bundleId: lastBundleId)
-        panel.orderFrontRegardless()
+        showAccordingToPresentation()
         return true
     }
 
@@ -742,9 +756,9 @@ final class CandidateWindow {
         selectedIndex = clamp(selectedIndex, count: currentContext.candidates.count)
         visualPageIndex = pageIndex(containing: selectedIndex, panelWidth: activePanelWidth())
         renderCandidates()
-        refreshInlineBuffer()
+        publishProjection()
         layoutPanel(caretRect: lastCaretRect, bundleId: lastBundleId)
-        panel.orderFrontRegardless()
+        showAccordingToPresentation()
         return true
     }
 
@@ -755,7 +769,7 @@ final class CandidateWindow {
         }
         let row = expandedPages[expandedSelectionPageOffset].candidates
         guard !row.isEmpty else { return false }
-        let logicalDelta = BufferModel.shared.active ? -columnDelta : columnDelta
+        let logicalDelta = columnDelta
         // Bounded by the whole page, not by what fits: the column viewport
         // scrolls so ←/→ can reach candidates past the right edge.
         selectedIndex = clamp(selectedIndex + logicalDelta, count: row.count)
@@ -800,13 +814,14 @@ final class CandidateWindow {
         guard !BufferModel.shared.active else {
             IMELog.write("candidate buffer action ignored; already enabled")
             renderCandidates()
-            refreshBuffer()
+            BufferWindowController.shared.show()
             return
         }
         BufferModel.shared.enabled = true
+        BufferWindowController.shared.show()
         IMELog.write("candidate buffer action -> on")
         renderCandidates()
-        refreshBuffer()
+        BufferWindowController.shared.refresh()
     }
 
     /// Resolve a number-key selection against the row that currently owns the
@@ -832,11 +847,9 @@ final class CandidateWindow {
     private func layoutPanel(caretRect: NSRect, bundleId: String) {
         let metrics = CandidateWindowMetrics.current
         let width = panelWidth(caretRect: caretRect)
-        let bufferHeight = inlineBuffer.isHidden ? 0 : inlineBuffer.preferredHeight + root.spacing
         let stripHeight = strip.isHidden ? 0 : stripHeightConstraint.constant
         let height = stripHeight
             + (preeditLabel.isHidden ? 0 : metrics.preeditHeight + root.spacing)
-            + bufferHeight
         panel.setContentSize(NSSize(width: width, height: height))
         panel.layoutIfNeeded()
         updateCandidateDocumentSize()
@@ -881,6 +894,93 @@ final class CandidateWindow {
         return min(max(metrics.baseWidth, 360), max(360, visibleWidth))
     }
 
+    private func showAccordingToPresentation() {
+        if presentationMode == .workbench {
+            panel.orderOut(nil)
+        } else {
+            panel.orderFrontRegardless()
+        }
+    }
+
+    private func publishProjection() {
+        guard presentationMode == .workbench,
+              let ownerToken,
+              InputFocusCoordinator.shared.interactionTarget(expected: ownerToken) != nil else {
+            onProjectionChange?(nil)
+            return
+        }
+
+        let rows: [[CandidateProjectionItem]]
+        if isSingleCharacterSelectionActive {
+            rows = [Array(characterSelectionText).enumerated().map { index, character in
+                CandidateProjectionItem(
+                    label: "\(index + 1)",
+                    text: String(character),
+                    comment: "",
+                    highlighted: index == characterSelectionIndex,
+                    action: .singleCharacter(index: index)
+                )
+            }]
+        } else if isExpanded {
+            rows = expandedWindowRange().map { pageOffset in
+                expandedPages[pageOffset].candidates.enumerated().map { index, candidate in
+                    CandidateProjectionItem(
+                        label: candidate.label.isEmpty ? "\(index + 1)" : candidate.label,
+                        text: candidate.text,
+                        comment: candidate.comment,
+                        highlighted: pageOffset == expandedSelectionPageOffset && index == selectedIndex,
+                        action: .candidate(CandidateSelection(pageOffset: pageOffset, index: index))
+                    )
+                }
+            }
+        } else {
+            rows = [currentContext.candidates.enumerated().map { index, candidate in
+                CandidateProjectionItem(
+                    label: candidate.label.isEmpty ? "\(index + 1)" : candidate.label,
+                    text: candidate.text,
+                    comment: candidate.comment,
+                    highlighted: index == selectedIndex,
+                    action: .candidate(CandidateSelection(pageOffset: 0, index: index))
+                )
+            }]
+        }
+
+        let nonemptyRows = rows.filter { !$0.isEmpty }
+        guard !nonemptyRows.isEmpty || !projectionPreedit.isEmpty else {
+            onProjectionChange?(nil)
+            return
+        }
+        onProjectionChange?(CandidateProjection(owner: ownerToken,
+                                                preedit: projectionPreedit,
+                                                rows: nonemptyRows))
+    }
+
+    func performProjectedAction(_ action: CandidateProjectionAction, owner: FocusToken) {
+        guard ownerToken == owner,
+              InputFocusCoordinator.shared.interactionTarget(expected: owner) != nil else {
+            IMELog.write("candidate stale projected action ignored owner=\(owner)")
+            return
+        }
+        switch action {
+        case let .singleCharacter(index):
+            let chars = Array(characterSelectionText)
+            guard chars.indices.contains(index) else { return }
+            characterSelectionIndex = index
+            renderCandidates()
+        case let .candidate(selection):
+            if isExpanded {
+                guard expandedPages.indices.contains(selection.pageOffset) else { return }
+                expandedSelectionPageOffset = selection.pageOffset
+                selectedIndex = clamp(selection.index,
+                                      count: expandedPages[selection.pageOffset].candidates.count)
+            } else {
+                selectedIndex = clamp(selection.index, count: currentContext.candidates.count)
+                visualPageIndex = pageIndex(containing: selectedIndex, panelWidth: activePanelWidth())
+            }
+            onSelect?(owner, CandidateSelection(pageOffset: selection.pageOffset, index: selectedIndex))
+        }
+    }
+
     // MARK: Rendering
 
     private func renderCandidates() {
@@ -912,15 +1012,7 @@ final class CandidateWindow {
         }
         applyAppearance()
         updateCandidateDocumentSize()
-    }
-
-    private func refreshInlineBuffer() {
-        let bufferPreedit = BufferModel.shared.active
-            ? (currentContext.preedit.isEmpty ? currentContext.input : currentContext.preedit)
-            : ""
-        let visible = inlineBuffer.refresh(preedit: bufferPreedit)
-        inlineBuffer.setFlushProgress(bufferFlushProgress)
-        inlineBufferHeightConstraint.constant = visible ? inlineBuffer.preferredHeight : 0
+        publishProjection()
     }
 
     private func renderCompactRow() {
@@ -931,10 +1023,7 @@ final class CandidateWindow {
         let panelWidth = activePanelWidth()
         let available = candidateAvailableWidth(panelWidth: panelWidth)
         let indices = currentVisualCandidateIndices(panelWidth: panelWidth)
-        let renderedIndices = BufferModel.shared.active ? Array(indices.reversed()) : indices
-        if BufferModel.shared.active {
-            candidateStack.addArrangedSubview(candidateLeadingSpacer())
-        }
+        let renderedIndices = indices
         for (offset, i) in renderedIndices.enumerated() {
             if offset > 0 {
                 candidateStack.addArrangedSubview(candidateSeparatorView())
@@ -961,7 +1050,7 @@ final class CandidateWindow {
 
     private func renderExpandedMatrix() {
         candidateStack.orientation = .vertical
-        candidateStack.alignment = BufferModel.shared.active ? .trailing : .leading
+        candidateStack.alignment = .leading
         candidateStack.spacing = Self.expandedRowSpacing
 
         let panelWidth = activePanelWidth()
@@ -999,9 +1088,7 @@ final class CandidateWindow {
                 for: CandidateWindowMetrics.current
             )).isActive = true
 
-            let displayedCandidates = BufferModel.shared.active
-                ? Array(renderedCandidates.reversed())
-                : renderedCandidates
+            let displayedCandidates = renderedCandidates
             for (offset, element) in displayedCandidates.enumerated() {
                 let (index, candidate) = element
                 if offset > 0 {
@@ -1136,13 +1223,8 @@ final class CandidateWindow {
         let chars = Array(characterSelectionText)
         guard !chars.isEmpty else { return }
 
-        if BufferModel.shared.active {
-            candidateStack.addArrangedSubview(candidateLeadingSpacer())
-        }
         let indexedCharacters = Array(chars.enumerated())
-        let displayedCharacters = BufferModel.shared.active
-            ? Array(indexedCharacters.reversed())
-            : indexedCharacters
+        let displayedCharacters = indexedCharacters
         for (offset, element) in displayedCharacters.enumerated() {
             let (index, char) = element
             if offset > 0 {
@@ -1361,8 +1443,7 @@ final class CandidateWindow {
     private func resetCandidateScroll() {
         candidateScroll.layoutSubtreeIfNeeded()
         candidateStack.layoutSubtreeIfNeeded()
-        let maxX = max(0, candidateStack.frame.width - candidateScroll.contentSize.width)
-        let origin = NSPoint(x: BufferModel.shared.active ? maxX : 0, y: 0)
+        let origin = NSPoint(x: 0, y: 0)
         candidateScroll.contentView.scroll(to: origin)
         candidateScroll.reflectScrolledClipView(candidateScroll.contentView)
     }
@@ -1440,6 +1521,11 @@ final class CandidateWindow {
     }
 
     @objc private func candidateTapped(_ sender: NSButton) {
+        guard let ownerToken,
+              InputFocusCoordinator.shared.interactionTarget(expected: ownerToken) != nil else {
+            hideAll()
+            return
+        }
         if sender.tag == bufferActionTag {
             performBufferAction()
             return
@@ -1461,7 +1547,8 @@ final class CandidateWindow {
             selectedIndex = clamp(selection.index, count: currentContext.candidates.count)
             visualPageIndex = pageIndex(containing: selectedIndex, panelWidth: activePanelWidth())
         }
-        onSelect?(CandidateSelection(pageOffset: selection.pageOffset, index: selectedIndex))
+        onSelect?(ownerToken,
+                  CandidateSelection(pageOffset: selection.pageOffset, index: selectedIndex))
     }
 
     @objc private func settingsTapped() {
