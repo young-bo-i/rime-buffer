@@ -58,6 +58,15 @@ final class BufferModel {
         }
     }
 
+    /// Clear staged blocks when focus leaves for another application, so buffer
+    /// content can't linger across app boundaries. Default on. Stored inverted
+    /// (`bufferKeepOnAppSwitch`) so the default-on behavior holds when the key
+    /// is unset — UserDefaults.bool defaults to false.
+    var resetOnAppSwitch: Bool {
+        get { !UserDefaults.standard.bool(forKey: "bufferKeepOnAppSwitch") }
+        set { UserDefaults.standard.set(!newValue, forKey: "bufferKeepOnAppSwitch") }
+    }
+
     func append(_ text: String) {
         guard !text.isEmpty else { return }
         let index = clampedInsertionIndex()
@@ -71,7 +80,7 @@ final class BufferModel {
         transientEnabled = true
         loadingRequestId = requestId
         loadingMessage = message
-        IMELog.write("buffer transient loading request=\(requestId) message='\(message)'")
+        IMELog.write("buffer transient loading request=\(requestId) message=\(IMELog.redact(message))")
         onChange?()
     }
 
@@ -91,7 +100,7 @@ final class BufferModel {
         transientEnabled = true
         loadingRequestId = requestId
         loadingMessage = message
-        IMELog.write("buffer transient failed request=\(requestId) message='\(message)'")
+        IMELog.write("buffer transient failed request=\(requestId) message=\(IMELog.redact(message))")
         onChange?()
     }
 
@@ -110,7 +119,7 @@ final class BufferModel {
     func removeLastBlock() -> Bool {
         guard let removed = blocks.popLast() else { return false }
         clampInsertionIndexInPlace()
-        IMELog.write("buffer remove last block '\(removed.text)' remaining=\(blocks.count)")
+        IMELog.write("buffer remove last block \(IMELog.redact(removed.text)) remaining=\(blocks.count)")
         onChange?()
         return true
     }
@@ -141,7 +150,7 @@ final class BufferModel {
                 onChange?()
                 return
             }
-            IMELog.write("buffer send attempted '\(block.text)'")
+            IMELog.write("buffer send attempted \(IMELog.redact(block.text))")
         }
         let count = blocks.count
         blocks.removeAll()
@@ -156,7 +165,7 @@ final class BufferModel {
     @discardableResult
     func sendNextBlock() -> Bool {
         guard let block = blocks.first else { return false }
-        IMELog.write("buffer send next start block='\(block.text)' remaining=\(blocks.count)")
+        IMELog.write("buffer send next start block=\(IMELog.redact(block.text)) remaining=\(blocks.count)")
         guard deliver?(block.text) == true else {
             IMELog.write("buffer send next blocked; keeping \(blocks.count) blocks")
             onChange?()
@@ -169,7 +178,7 @@ final class BufferModel {
         }
         clampInsertionIndexInPlace()
         settleTransientIfIdle()
-        IMELog.write("buffer send next attempted '\(block.text)' remaining=\(blocks.count)")
+        IMELog.write("buffer send next attempted \(IMELog.redact(block.text)) remaining=\(blocks.count)")
         onChange?()
         return true
     }

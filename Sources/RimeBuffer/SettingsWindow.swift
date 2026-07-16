@@ -38,6 +38,8 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     private let bufferCheck = NSButton(checkboxWithTitle: "启用缓冲模式（提交先暂存，手动确认上屏）", target: nil, action: nil)
     private var candidateMetricFields: [CandidateWindowMetric: NSTextField] = [:]
     private var candidateMetricSteppers: [CandidateWindowMetric: NSStepper] = [:]
+    private let chordDurationField = NSTextField(string: "")
+    private let chordDurationStepper = NSStepper()
     private let statsDatePicker = NSDatePicker()
     private let statsSummary = NSTextField(labelWithString: "")
     private let statsTopKey = NSTextField(labelWithString: "")
@@ -163,6 +165,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         appearancePopUp.target = self
         appearancePopUp.action = #selector(appearanceChosen)
         configureCandidateMetricControls()
+        configureChordControl()
 
         statsDatePicker.datePickerElements = [.yearMonthDay]
         statsDatePicker.datePickerStyle = .textFieldAndStepper
@@ -223,6 +226,31 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         }
     }
 
+    private func configureChordControl() {
+        let formatter = NumberFormatter()
+        formatter.minimumFractionDigits = 2
+        formatter.maximumFractionDigits = 2
+        formatter.allowsFloats = true
+        formatter.minimum = NSNumber(value: ChordSettings.range.lowerBound)
+        formatter.maximum = NSNumber(value: ChordSettings.range.upperBound)
+
+        chordDurationField.formatter = formatter
+        chordDurationField.alignment = .right
+        chordDurationField.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        chordDurationField.target = self
+        chordDurationField.action = #selector(chordDurationFieldChanged)
+        chordDurationField.delegate = self
+        chordDurationField.translatesAutoresizingMaskIntoConstraints = false
+        chordDurationField.widthAnchor.constraint(equalToConstant: 64).isActive = true
+
+        chordDurationStepper.minValue = ChordSettings.range.lowerBound
+        chordDurationStepper.maxValue = ChordSettings.range.upperBound
+        chordDurationStepper.increment = 0.01
+        chordDurationStepper.valueWraps = false
+        chordDurationStepper.target = self
+        chordDurationStepper.action = #selector(chordDurationStepperChanged)
+    }
+
     private func showPage(_ page: Page) {
         selectedPage = page
         for (p, button) in navButtons {
@@ -260,6 +288,12 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
             "配置目录是 ~/Library/RimeBuffer。未显示的方案文件仅作为词典或反查依赖保留，不会出现在 F4。")
         note.font = .systemFont(ofSize: 11)
         note.textColor = .tertiaryLabelColor
+
+        let chordNote = NSTextField(wrappingLabelWithString:
+            "仅并击方案生效：多个键在此间隔内先后按下会合并成一次并击。值越小越跟手，太小容易漏字。默认 0.10 秒，修改后立即生效。")
+        chordNote.font = .systemFont(ofSize: 11)
+        chordNote.textColor = .tertiaryLabelColor
+
         return contentColumn([
             title("输入"),
             caption("勾选允许使用的方案；实际切换统一使用 F4。"),
@@ -270,10 +304,40 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
             schemaApplyStatus,
             deployBtn,
             spacer(16),
+            sectionLabel("并击间隔"),
+            chordDurationRow(),
+            chordNote,
+            spacer(16),
             sectionLabel("配置目录"),
             openDirBtn,
             note,
         ])
+    }
+
+    private func chordDurationRow() -> NSView {
+        let label = NSTextField(labelWithString: "并击间隔")
+        label.alignment = .right
+        label.font = .systemFont(ofSize: 12)
+        label.textColor = .secondaryLabelColor
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.widthAnchor.constraint(equalToConstant: 96).isActive = true
+
+        let unit = NSTextField(labelWithString: "秒")
+        unit.font = .systemFont(ofSize: 11)
+        unit.textColor = .tertiaryLabelColor
+        unit.translatesAutoresizingMaskIntoConstraints = false
+        unit.widthAnchor.constraint(equalToConstant: 24).isActive = true
+
+        let resetBtn = NSButton(title: "恢复默认", target: self, action: #selector(resetChordDuration))
+        resetBtn.bezelStyle = .rounded
+
+        chordDurationField.removeFromSuperview()
+        chordDurationStepper.removeFromSuperview()
+        let row = NSStackView(views: [label, chordDurationField, chordDurationStepper, unit, resetBtn])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        return row
     }
 
     private func schemaChecklistView() -> NSView {
@@ -529,6 +593,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
             appearancePopUp.selectItem(at: idx)
         }
         refreshCandidateMetricControls()
+        refreshChordDurationControl()
         refreshRemoteStatus()
         refreshStats()
     }
@@ -544,6 +609,12 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
             candidateMetricFields[metric]?.stringValue = formatMetricValue(value)
             candidateMetricSteppers[metric]?.doubleValue = Double(value)
         }
+    }
+
+    private func refreshChordDurationControl() {
+        let value = ChordSettings.duration
+        chordDurationField.stringValue = String(format: "%.2f", value)
+        chordDurationStepper.doubleValue = value
     }
 
     private func formatMetricValue(_ value: CGFloat) -> String {
@@ -762,6 +833,27 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         IMELog.write("appearance -> \(mode.rawValue)")
     }
 
+    @objc private func chordDurationFieldChanged() {
+        applyChordDuration(chordDurationField.doubleValue)
+    }
+
+    @objc private func chordDurationStepperChanged() {
+        applyChordDuration(chordDurationStepper.doubleValue)
+    }
+
+    @objc private func resetChordDuration() {
+        window?.makeFirstResponder(nil)
+        ChordSettings.resetToDefault()
+        refreshChordDurationControl()
+    }
+
+    /// Persist + broadcast the new chord window (setter clamps to range), then
+    /// snap the field/stepper back to the stored value.
+    private func applyChordDuration(_ value: Double) {
+        ChordSettings.duration = value
+        refreshChordDurationControl()
+    }
+
     @objc private func candidateMetricFieldChanged(_ sender: NSTextField) {
         syncCandidateMetricControl(tag: sender.tag, value: sender.doubleValue)
     }
@@ -771,8 +863,12 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     }
 
     func controlTextDidEndEditing(_ obj: Notification) {
-        guard let field = obj.object as? NSTextField,
-              candidateMetricFields.values.contains(where: { $0 === field }) else { return }
+        guard let field = obj.object as? NSTextField else { return }
+        if field === chordDurationField {
+            applyChordDuration(field.doubleValue)
+            return
+        }
+        guard candidateMetricFields.values.contains(where: { $0 === field }) else { return }
         syncCandidateMetricControl(tag: field.tag, value: field.doubleValue)
     }
 

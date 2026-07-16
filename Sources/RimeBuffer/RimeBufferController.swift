@@ -14,12 +14,14 @@ final class RimeBufferController: IMKInputController {
     /// persistence route through the live session here.
     private(set) static weak var active: RimeBufferController?
     private static weak var recent: RimeBufferController?
-    private static var chordDurationCache: TimeInterval?
     private static let duplicateBackspaceCommandWindow: CFTimeInterval = 0.05
     private static let duplicateEnterCommandWindow: CFTimeInterval = 0.05
     private static let duplicateArrowCommandWindow: CFTimeInterval = 0.05
     private static let bufferEnterHoldDelay: TimeInterval = 1.2
     private static let bufferEnterPollInterval: TimeInterval = 0.02
+    /// Rime pages fetched per matrix batch — also the initial expand size, so
+    /// the first ↓ costs the same as before and deeper rows load on demand.
+    private static let expandedPageBatch = 3
 
     private var session: UInt64 = 0
     private var currentSchemaId = ""
@@ -47,6 +49,7 @@ final class RimeBufferController: IMKInputController {
     private var candidateOptionClient: IMKTextInput?
     private let composition = CompositionSession()
     private let chord = ChordController()
+    private var chordDurationObserver: NSObjectProtocol?
 
     private var chordGated: Bool { currentSchemaId == "my_combo" }
 
@@ -57,6 +60,16 @@ final class RimeBufferController: IMKInputController {
         chord.onFlush = { [weak self] keys, client in
             self?.replayChordReleases(keys, client: client)
         }
+        chord.duration = ChordSettings.duration
+        // Settings ▸ 输入 can retune the chord window while this controller is
+        // live; pick up the new value immediately instead of only on next focus.
+        chordDurationObserver = NotificationCenter.default.addObserver(
+            forName: .chordDurationDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.chord.duration = ChordSettings.duration
+        }
         // NOTE: candidateWindow is shared; its onSelect is wired ONCE in
         // main.swift to route through `active` — wiring it here per-controller
         // would leave clicks bound to whichever controller initialized last.
@@ -66,6 +79,9 @@ final class RimeBufferController: IMKInputController {
         resetBufferEnterGesture()
         resetCandidateOptionGesture()
         chord.invalidate()
+        if let chordDurationObserver {
+            NotificationCenter.default.removeObserver(chordDurationObserver)
+        }
         if session != 0 { rimeEngine.destroySession(session) }
     }
 
@@ -117,12 +133,7 @@ final class RimeBufferController: IMKInputController {
         }
         guard session != 0 else { return false }
 
-        if Self.chordDurationCache == nil {
-            let resolved = Self.resolveChordDuration()
-            Self.chordDurationCache = resolved.duration
-            IMELog.write("chord_duration=\(resolved.duration) source=\(resolved.source)")
-        }
-        chord.duration = Self.chordDurationCache ?? 0.10
+        chord.duration = ChordSettings.duration
 
         if applyPreference || fresh {
             applyStoredPreferenceIfNeeded()
@@ -134,57 +145,6 @@ final class RimeBufferController: IMKInputController {
             refreshSchema()
         }
         return true
-    }
-
-    /// Squirrel deploys its frontend config into ~/Library/Rime/build, but a
-    /// standalone librime deployment does not build squirrel.yaml. Read our
-    /// copied frontend config directly before falling back to the bridge so a
-    /// missing build file does not silently double the user's chord window.
-    private static func resolveChordDuration() -> (duration: TimeInterval, source: String) {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let environment = ProcessInfo.processInfo.environment
-        let userDirectory = environment["RIMEBUFFER_USER_DIR"].map {
-            URL(fileURLWithPath: $0, isDirectory: true)
-        } ?? home.appendingPathComponent("Library/RimeBuffer", isDirectory: true)
-        let squirrelDirectory = home.appendingPathComponent("Library/Rime", isDirectory: true)
-        let candidates = [
-            userDirectory.appendingPathComponent("build/squirrel.yaml"),
-            userDirectory.appendingPathComponent("squirrel.custom.yaml"),
-            userDirectory.appendingPathComponent("squirrel.yaml"),
-            squirrelDirectory.appendingPathComponent("build/squirrel.yaml"),
-            squirrelDirectory.appendingPathComponent("squirrel.custom.yaml"),
-            squirrelDirectory.appendingPathComponent("squirrel.yaml"),
-        ]
-
-        var visited: Set<String> = []
-        for url in candidates {
-            let path = url.standardizedFileURL.path
-            guard visited.insert(path).inserted,
-                  let duration = chordDuration(in: url) else { continue }
-            return (duration, path)
-        }
-
-        if let duration = rimeEngine.configDouble("squirrel", "chord_duration"),
-           duration > 0 {
-            return (duration, "librime:squirrel")
-        }
-        return (0.10, "fallback")
-    }
-
-    private static func chordDuration(in url: URL) -> TimeInterval? {
-        guard let contents = try? String(contentsOf: url, encoding: .utf8) else { return nil }
-        for rawLine in contents.components(separatedBy: .newlines) {
-            let uncommented = rawLine.split(separator: "#", maxSplits: 1,
-                                            omittingEmptySubsequences: false).first ?? ""
-            let parts = uncommented.split(separator: ":", maxSplits: 1,
-                                          omittingEmptySubsequences: false)
-            guard parts.count == 2,
-                  parts[0].trimmingCharacters(in: .whitespaces) == "chord_duration",
-                  let duration = Double(parts[1].trimmingCharacters(in: .whitespaces)),
-                  duration > 0 else { continue }
-            return duration
-        }
-        return nil
     }
 
     /// Resolve Squirrel's `keyboard_layout` setting without requiring a
@@ -794,7 +754,7 @@ final class RimeBufferController: IMKInputController {
         Self.active = self
         Self.recent = self
         lastClient = client
-        IMELog.write("candidate option selection started text='\(candidateText)'")
+        IMELog.write("candidate option selection started text=\(IMELog.redact(candidateText))")
         return true
     }
 
@@ -872,14 +832,14 @@ final class RimeBufferController: IMKInputController {
             } else {
                 composition.markCleared()
             }
-            IMELog.write("candidate single-character '\(text)' -> buffer by \(source) (\(BufferModel.shared.blocks.count) blocks)")
+            IMELog.write("candidate single-character \(IMELog.redact(text)) -> buffer by \(source) (\(BufferModel.shared.blocks.count) blocks)")
         } else if let resolvedClient {
             Delivery.insert(text, into: resolvedClient)
             composition.commitDidInsert()
             RemoteTypingService.shared.send(text)
-            IMELog.write("candidate single-character '\(text)' -> \(bundleId(of: resolvedClient)) by \(source)")
+            IMELog.write("candidate single-character \(IMELog.redact(text)) -> \(bundleId(of: resolvedClient)) by \(source)")
         } else {
-            IMELog.write("candidate single-character '\(text)' dropped by \(source); no client")
+            IMELog.write("candidate single-character \(IMELog.redact(text)) dropped by \(source); no client")
             composition.markCleared()
             return true
         }
@@ -1023,12 +983,12 @@ final class RimeBufferController: IMKInputController {
         if BufferModel.shared.active {
             BufferModel.shared.append(text)
             composition.clear(client: client)
-            IMELog.write("\(source) text '\(text)' -> buffer (\(BufferModel.shared.blocks.count) blocks)")
+            IMELog.write("\(source) text \(IMELog.redact(text)) -> buffer (\(BufferModel.shared.blocks.count) blocks)")
         } else {
             Delivery.insert(text, into: client)
             composition.commitDidInsert()
             RemoteTypingService.shared.send(text)
-            IMELog.write("\(source) text '\(text)' -> \(bundleId(of: client))")
+            IMELog.write("\(source) text \(IMELog.redact(text)) -> \(bundleId(of: client))")
         }
         BufferModel.shared.compositionActive = false
         if BufferModel.shared.shouldDisplay {
@@ -1275,9 +1235,10 @@ final class RimeBufferController: IMKInputController {
             return candidateWindow.moveSelection(delta: 1)
         case RimeKey.down:
             if candidateWindow.isExpanded {
+                extendExpandedPagesIfNeeded()
                 return candidateWindow.moveExpandedSelection(rowDelta: 1)
             }
-            let pages = previewCandidatePages(maxCount: 3)
+            let pages = previewCandidatePages(maxCount: Self.expandedPageBatch)
             if pages.count > 1 {
                 IMELog.write("candidate matrix expanded rows=\(pages.count)")
                 return candidateWindow.expand(with: pages)
@@ -1299,7 +1260,7 @@ final class RimeBufferController: IMKInputController {
             let selection = candidateWindow.selectedCandidateSelection
             let candidateText = candidateWindow.selectedCandidateText ?? ""
             let originalBlockCount = BufferModel.shared.blocks.count
-            IMELog.write("buffer zero begin text='\(candidateText)' pageOffset=\(selection?.pageOffset ?? -1) index=\(selection?.index ?? -1)")
+            IMELog.write("buffer zero begin text=\(IMELog.redact(candidateText)) pageOffset=\(selection?.pageOffset ?? -1) index=\(selection?.index ?? -1)")
             candidateWindow.performBufferAction()
             guard let selection else {
                 IMELog.write("buffer zero enabled without candidate selection")
@@ -1308,11 +1269,11 @@ final class RimeBufferController: IMKInputController {
             let selected = selectCandidate(selection)
             let finalBlockCount = BufferModel.shared.blocks.count
             if selected, finalBlockCount > originalBlockCount {
-                IMELog.write("buffer zero committed text='\(candidateText)' blocks=\(originalBlockCount)->\(finalBlockCount)")
+                IMELog.write("buffer zero committed text=\(IMELog.redact(candidateText)) blocks=\(originalBlockCount)->\(finalBlockCount)")
             } else if selected {
-                IMELog.write("buffer zero selected but no commit text='\(candidateText)'")
+                IMELog.write("buffer zero selected but no commit text=\(IMELog.redact(candidateText))")
             } else {
-                IMELog.write("buffer zero failed text='\(candidateText)' buffer remains enabled")
+                IMELog.write("buffer zero failed text=\(IMELog.redact(candidateText)) buffer remains enabled")
             }
             return true
         case 0x31...0x39 where candidateWindow.isExpanded:
@@ -1367,6 +1328,19 @@ final class RimeBufferController: IMKInputController {
         }
         updateUI(client: client)
         return true
+    }
+
+    /// The matrix shows three rows but must reach every candidate, so pull the
+    /// next batch of Rime pages once the selection lands on the fetched tail.
+    /// Pages are re-read from the anchor (cheap: the session never leaves page
+    /// 0), which keeps `expandedPages` index == anchor-relative page offset.
+    private func extendExpandedPagesIfNeeded() {
+        guard candidateWindow.isExpanded,
+              !candidateWindow.expandedTailIsLastPage else { return }
+        let loaded = candidateWindow.expandedPageCount
+        guard candidateWindow.expandedSelectionPage >= loaded - 1 else { return }
+        let pages = previewCandidatePages(maxCount: loaded + Self.expandedPageBatch)
+        candidateWindow.extendExpandedPages(with: pages)
     }
 
     private func previewCandidatePages(maxCount: Int) -> [RimeContextModel] {
@@ -1439,12 +1413,12 @@ final class RimeBufferController: IMKInputController {
         if BufferModel.shared.active {
             BufferModel.shared.append(raw)
             composition.clear(client: client)
-            IMELog.write("raw input '\(raw)' -> buffer (\(BufferModel.shared.blocks.count) blocks)")
+            IMELog.write("raw input \(IMELog.redact(raw)) -> buffer (\(BufferModel.shared.blocks.count) blocks)")
         } else {
             Delivery.insert(raw, into: client)
             composition.commitDidInsert()
             RemoteTypingService.shared.send(raw)   // mirror to paired Mac (no-op if off)
-            IMELog.write("raw input '\(raw)' -> \(bundleId(of: client))")
+            IMELog.write("raw input \(IMELog.redact(raw)) -> \(bundleId(of: client))")
         }
         BufferModel.shared.compositionActive = false
         updateUI(client: client)
@@ -1462,12 +1436,12 @@ final class RimeBufferController: IMKInputController {
         if BufferModel.shared.active {
             BufferModel.shared.append(commit)
             composition.clear(client: client)
-            IMELog.write("commit '\(commit)' -> buffer (\(BufferModel.shared.blocks.count) blocks)")
+            IMELog.write("commit \(IMELog.redact(commit)) -> buffer (\(BufferModel.shared.blocks.count) blocks)")
         } else {
             Delivery.insert(commit, into: client)
             composition.commitDidInsert()
             RemoteTypingService.shared.send(commit)   // mirror to paired Mac (no-op if off)
-            IMELog.write("commit '\(commit)' -> \(bundleId(of: client))")
+            IMELog.write("commit \(IMELog.redact(commit)) -> \(bundleId(of: client))")
         }
         return commit
     }
@@ -1480,7 +1454,10 @@ final class RimeBufferController: IMKInputController {
             IMELog.write("buffer send blocked; no active IMK client")
             return false
         }
-        Delivery.insert(text, into: client)
+        guard Delivery.insert(text, into: client) else {
+            // Secure input refused the insert — keep the block, don't mirror.
+            return false
+        }
         composition.commitDidInsert()
         RemoteTypingService.shared.send(text)   // mirror buffer flush to paired Mac (no-op if off)
         lastClient = client
@@ -1642,7 +1619,7 @@ final class RimeBufferController: IMKInputController {
         // would otherwise put the session on an empty schema with no candidates.
         let available = rimeEngine.schemaList().map(\.id)
         guard available.isEmpty || available.contains(pref) else {
-            IMELog.write("preferredSchema '\(pref)' not deployed; keeping current schema")
+            IMELog.write("preferredSchema \(pref) not deployed; keeping current schema")
             return
         }
         let current = rimeEngine.getStatus(session: session).schemaId

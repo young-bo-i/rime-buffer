@@ -20,6 +20,9 @@ if CommandLine.arguments.contains("marine-bridge-smoke") {
 if CommandLine.arguments.contains("remote-smoke") {
     exit(runRemoteSmokeTest() ? 0 : 1)
 }
+if CommandLine.arguments.contains("matrix-smoke") {
+    exit(runCandidateMatrixSmokeTest() ? 0 : 1)
+}
 if CommandLine.arguments.contains("smoke") {
     exit(runEngineSmokeTest() ? 0 : 1)
 }
@@ -150,11 +153,24 @@ let inputSourceChangedObserver = DistributedNotificationCenter.default().addObse
 
 NSWorkspace.shared.notificationCenter.addObserver(
     forName: NSWorkspace.didActivateApplicationNotification,
-    object: nil, queue: .main) { _ in
+    object: nil, queue: .main) { note in
     // Hostile apps may never deliver deactivateServer on Cmd-Tab — resolve
     // any in-flight chord/composition into its field instead of stranding
     // marked text. No-op when the switch was already handled normally.
     RimeBufferController.active?.forceCommit()
+
+    // Reset staged buffer when focus leaves for a DIFFERENT app. Our own
+    // windows (Settings, pairing prompts) activate us via NSApp.activate and
+    // must NOT count as an app switch, or opening Settings would wipe the
+    // buffer. Filter on the activated app's bundle id.
+    if BufferModel.shared.resetOnAppSwitch {
+        let activated = (note.userInfo?[NSWorkspace.applicationUserInfoKey]
+            as? NSRunningApplication)?.bundleIdentifier
+        let own = Bundle.main.bundleIdentifier
+        if let activated, activated != own {
+            BufferModel.shared.clear()
+        }
+    }
     candidateWindow.hide()
 }
 NotificationCenter.default.addObserver(
@@ -576,6 +592,145 @@ func runStatsSmokeTest() -> Bool {
     }
 
     print("stats smoke: OK")
+    return true
+}
+
+/// Pins the matrix viewport math. The three-row cap is visual only: the window
+/// must slide far enough to reach the last page, never past the ends, and must
+/// always keep the selected row on screen — a wrong base here would render one
+/// row while selecting a different page's candidate.
+func runCandidateMatrixSmokeTest() -> Bool {
+    print("== RimeBuffer candidate matrix smoke test ==")
+    let maxRows = CandidateWindow.expandedMaxRows
+    guard maxRows == 3 else {
+        print("FAILED: expected a three-row viewport, got \(maxRows)")
+        return false
+    }
+
+    // Walking ↓ through six pages: the window pins to the top until the
+    // selection leaves it, then trails the selection one row at a time.
+    let walkDown = [0, 0, 0, 1, 2, 3]
+    var base = 0
+    for selection in 0..<6 {
+        base = CandidateWindow.windowBase(selection: selection, currentBase: base, pageCount: 6)
+        guard base == walkDown[selection] else {
+            print("FAILED: ↓ to row \(selection) expected base \(walkDown[selection]), got \(base)")
+            return false
+        }
+    }
+    // ...and walking back ↑ retraces it, so the first page stays reachable.
+    let walkUp = [0, 1, 2, 3, 3, 3]
+    for selection in (0..<6).reversed() {
+        base = CandidateWindow.windowBase(selection: selection, currentBase: base, pageCount: 6)
+        guard base == walkUp[selection] else {
+            print("FAILED: ↑ to row \(selection) expected base \(walkUp[selection]), got \(base)")
+            return false
+        }
+    }
+
+    // Fewer pages than rows must never scroll.
+    for pageCount in 1...maxRows {
+        for selection in 0..<pageCount {
+            let b = CandidateWindow.windowBase(selection: selection, currentBase: 0, pageCount: pageCount)
+            guard b == 0 else {
+                print("FAILED: \(pageCount) pages should not scroll, got base \(b)")
+                return false
+            }
+        }
+    }
+
+    // Invariants over every reachable (pageCount, base, selection): the base is
+    // in range and its window contains the selection — from any starting base,
+    // so a click or a re-fetch can never strand the selection off screen.
+    for pageCount in 1...12 {
+        for startBase in 0..<pageCount {
+            for selection in 0..<pageCount {
+                let b = CandidateWindow.windowBase(selection: selection,
+                                                   currentBase: startBase,
+                                                   pageCount: pageCount)
+                let maxBase = max(0, pageCount - maxRows)
+                guard b >= 0, b <= maxBase else {
+                    print("FAILED: base \(b) out of 0...\(maxBase) (pages=\(pageCount) sel=\(selection))")
+                    return false
+                }
+                guard selection >= b, selection < b + maxRows else {
+                    print("FAILED: row \(selection) outside window \(b)..<\(b + maxRows) (pages=\(pageCount))")
+                    return false
+                }
+            }
+        }
+    }
+
+    // The last page must be reachable: its window is the final one.
+    for pageCount in 4...12 {
+        let b = CandidateWindow.windowBase(selection: pageCount - 1, currentBase: 0, pageCount: pageCount)
+        guard b == pageCount - maxRows else {
+            print("FAILED: last page of \(pageCount) expected base \(pageCount - maxRows), got \(b)")
+            return false
+        }
+    }
+
+    // --- Column viewport ---------------------------------------------------
+    // A page_size:9 row that fits (9*40 + 8 separators*8 = 424 <= 460): the
+    // common case, where the viewport must never scroll.
+    let roomy = Array(repeating: CGFloat(40), count: 9)
+    guard CandidateWindow.fittedColumnCount(widths: roomy, separator: 8, available: 460, base: 0) == 9 else {
+        print("FAILED: nine 40pt candidates should all fit in 460pt")
+        return false
+    }
+    for selection in 0..<9 {
+        let b = CandidateWindow.columnBase(selection: selection, currentBase: 0, widths: roomy,
+                                           separator: 8, available: 460)
+        guard b == 0 else {
+            print("FAILED: a row that fits must not scroll, got base \(b) for column \(selection)")
+            return false
+        }
+    }
+
+    // Narrow row: only some columns fit, so the tail is reachable only if the
+    // viewport scrolls — this is the case the fix exists for.
+    let tight = Array(repeating: CGFloat(100), count: 9)
+    let fits = CandidateWindow.fittedColumnCount(widths: tight, separator: 8, available: 320, base: 0)
+    guard fits > 0, fits < 9 else {
+        print("FAILED: expected a partially fitting row, got \(fits)/9")
+        return false
+    }
+    // Every candidate must be reachable, and the window must contain it.
+    var colBase = 0
+    for selection in 0..<9 {
+        colBase = CandidateWindow.columnBase(selection: selection, currentBase: colBase, widths: tight,
+                                             separator: 8, available: 320)
+        let count = CandidateWindow.fittedColumnCount(widths: tight, separator: 8,
+                                                      available: 320, base: colBase)
+        guard selection >= colBase, selection < colBase + count else {
+            print("FAILED: column \(selection) unreachable — window \(colBase)..<\(colBase + count)")
+            return false
+        }
+    }
+    // ...and walking back left retraces to the first column.
+    for selection in (0..<9).reversed() {
+        colBase = CandidateWindow.columnBase(selection: selection, currentBase: colBase, widths: tight,
+                                             separator: 8, available: 320)
+        let count = CandidateWindow.fittedColumnCount(widths: tight, separator: 8,
+                                                      available: 320, base: colBase)
+        guard selection >= colBase, selection < colBase + count else {
+            print("FAILED: column \(selection) unreachable going back — window \(colBase)..<\(colBase + count)")
+            return false
+        }
+    }
+    guard colBase == 0 else {
+        print("FAILED: walking left should return to column 0, got base \(colBase)")
+        return false
+    }
+
+    // A single candidate wider than the whole row still renders (and stays
+    // selectable) rather than vanishing.
+    guard CandidateWindow.fittedColumnCount(widths: [900, 50], separator: 8, available: 460, base: 0) == 1 else {
+        print("FAILED: an over-wide candidate must still occupy one column")
+        return false
+    }
+
+    print("candidate matrix smoke OK")
     return true
 }
 

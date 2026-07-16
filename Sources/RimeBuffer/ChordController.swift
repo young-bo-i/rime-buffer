@@ -1,16 +1,55 @@
 import Cocoa
 import InputMethodKit
 
+extension Notification.Name {
+    static let chordDurationDidChange = Notification.Name("ChordDurationDidChange")
+}
+
+/// User-tunable 并击 (chord) release window, persisted in UserDefaults and
+/// surfaced in Settings ▸ 输入. This is the single source of truth: the value
+/// replaces the old squirrel.yaml `chord_duration` read so tuning never needs a
+/// config-file edit or redeploy. Changing it posts `.chordDurationDidChange`,
+/// which every live controller observes to update its `ChordController` at once.
+enum ChordSettings {
+    static let defaultDuration: TimeInterval = 0.10
+    static let range: ClosedRange<TimeInterval> = 0.02...0.50
+    private static let key = "chord.duration"
+
+    private static func clamp(_ value: TimeInterval) -> TimeInterval {
+        min(max(value, range.lowerBound), range.upperBound)
+    }
+
+    static var duration: TimeInterval {
+        get {
+            let defaults = UserDefaults.standard
+            guard defaults.object(forKey: key) != nil else { return defaultDuration }
+            return clamp(defaults.double(forKey: key))
+        }
+        set {
+            let clamped = clamp(newValue)
+            UserDefaults.standard.set(clamped, forKey: key)
+            IMELog.write("chord_duration=\(clamped) source=preference")
+            NotificationCenter.default.post(name: .chordDurationDidChange, object: nil)
+        }
+    }
+
+    static func resetToDefault() {
+        UserDefaults.standard.removeObject(forKey: key)
+        IMELog.write("chord_duration reset -> \(defaultDuration)")
+        NotificationCenter.default.post(name: .chordDurationDidChange, object: nil)
+    }
+}
+
 /// Chord (并击) release-replay, Squirrel-style: chord keys that Rime handled are
 /// buffered; when `duration` elapses with no new chord key, every buffered key
 /// is replayed with releaseMask so chord_composer resolves the chord.
 ///
 /// The OWNER gates this on the active schema (only my_combo uses
 /// chord_composer) — sequential schemas must never see synthetic releases.
-/// `duration` comes from the deployed squirrel config's `chord_duration`
-/// (user-tuned to 0.05s); never hardcode.
+/// `duration` is seeded from `ChordSettings.duration` by the owner; never
+/// hardcode a competing value here.
 final class ChordController {
-    var duration: TimeInterval = 0.10
+    var duration: TimeInterval = ChordSettings.defaultDuration
 
     private var pending: [(keycode: Int32, mask: Int32)] = []
     private var timer: Timer?

@@ -40,6 +40,15 @@ jobs:
           test "$MODE_ID" = "$DECLARED_MODE_ID"
           test "$CONNECTION" = 'RimeBuffer_1_Connection'
           test "$CHILD_REPERTOIRE" = 'Array{HansHant}'
+          # Freeze the input-source identity to exact literals. The structure
+          # checks above still pass if the whole trio is renamed together, but
+          # macOS burns these ids into the protected TIS preferences: any drift
+          # orphans the old rows and stacks duplicate "Enter输入法" entries in
+          # System Settings (this bit us across the 0.3–0.4 renames — see
+          # RELEASE.md). Never change these without a migration story.
+          test "$BUNDLE_ID" = 'com.isaac.inputmethod.RimeBuffer'
+          test "$MODE_ID" = 'com.isaac.inputmethod.RimeBuffer.Hans'
+          test "$MODE_ID" = "${BUNDLE_ID}.Hans"
           if /usr/libexec/PlistBuddy -c 'Print :tsInputMethodCharacterRepertoireKey' Info.plist >/dev/null 2>&1; then
             echo 'Parent input method must not declare a repertoire; only the Hans child mode does.'
             exit 1

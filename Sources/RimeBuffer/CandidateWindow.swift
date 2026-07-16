@@ -148,7 +148,11 @@ struct CandidateSelection {
 }
 
 /// In-process candidate window. Candidates default to a compact one-line strip
-/// and can expand into a three-row preview of consecutive Rime pages.
+/// and can expand into a matrix of consecutive Rime pages, one page per row.
+/// The matrix renders at most three rows at a time, but that is a viewport, not
+/// a limit: it slides over every page fetched so far and the owner keeps pulling
+/// pages until Rime reports the last one, so the whole candidate list is
+/// reachable by holding ↓.
 final class CandidateWindow {
     private static let candidateSpacing: CGFloat = 3
     private static let candidateSeparatorWidth: CGFloat = 8
@@ -157,7 +161,9 @@ final class CandidateWindow {
     private static let actionButtonSize: CGFloat = 28
     private static let compactCandidateHorizontalPadding: CGFloat = 6
     private static let expandedRowSpacing: CGFloat = 3
-    private static let expandedMaxRows = 3
+    /// Vertical limit of the matrix. Three rows is the visual cap, NOT the
+    /// reach: the viewport slides over every fetched page (see `windowBase`).
+    static let expandedMaxRows = 3
     private static let characterSelectionTagBase = 200_000
 
     private let panel: NSPanel
@@ -182,7 +188,17 @@ final class CandidateWindow {
     private var currentSignature = ""
     private var selectedIndex = 0
     private var visualPageIndex = 0
+    /// Every Rime page fetched so far, one row each. The index IS the page
+    /// offset from the anchor page, which is what `CandidateSelection.pageOffset`
+    /// means — so this array may grow past the three visible rows, but an entry
+    /// must never be dropped or reordered.
     private var expandedPages: [RimeContextModel] = []
+    /// Page offset of the top rendered row: the three-row viewport slides over
+    /// `expandedPages` so the whole candidate list stays reachable.
+    private var expandedWindowBase = 0
+    /// Candidate index of the leftmost rendered column. Slides the same way when
+    /// a page holds more candidates than the panel can show at once.
+    private var expandedColumnBase = 0
     private var expandedSelectionPageOffset = 0
     private var characterSelectionText = ""
     private var characterSelectionIndex = 0
@@ -198,6 +214,13 @@ final class CandidateWindow {
     var isShowingInlineBuffer: Bool { panel.isVisible && !inlineBuffer.isHidden }
     var isVisible: Bool { panel.isVisible }
     var isExpanded: Bool { !expandedPages.isEmpty }
+    /// How many Rime pages the matrix has fetched, and where the selection sits
+    /// in them — the owner uses these to pull more pages before the selection
+    /// runs off the fetched tail.
+    var expandedPageCount: Int { expandedPages.count }
+    var expandedSelectionPage: Int { expandedSelectionPageOffset }
+    /// True when Rime says the last fetched page ends the list (nothing to pull).
+    var expandedTailIsLastPage: Bool { expandedPages.last?.isLastPage ?? true }
     var isSingleCharacterSelectionActive: Bool { !characterSelectionText.isEmpty }
     var rawInputForCommit: String { currentContext.input }
     var selectedCandidateText: String? {
@@ -205,9 +228,8 @@ final class CandidateWindow {
         if isExpanded {
             let pageOffset = clamp(expandedSelectionPageOffset, count: expandedPages.count)
             let row = expandedPages[pageOffset].candidates
-            let visibleCount = expandedVisibleCandidateCount(pageOffset: pageOffset)
-            guard visibleCount > 0 else { return nil }
-            return row[clamp(selectedIndex, count: visibleCount)].text
+            guard !row.isEmpty else { return nil }
+            return row[clamp(selectedIndex, count: row.count)].text
         }
         guard !currentContext.candidates.isEmpty else { return nil }
         return currentContext.candidates[clamp(selectedIndex, count: currentContext.candidates.count)].text
@@ -222,10 +244,10 @@ final class CandidateWindow {
         guard hasCandidates else { return nil }
         if isExpanded {
             let pageOffset = clamp(expandedSelectionPageOffset, count: expandedPages.count)
-            let visibleCount = expandedVisibleCandidateCount(pageOffset: pageOffset)
-            guard visibleCount > 0 else { return nil }
+            let count = expandedCandidateCount(pageOffset: pageOffset)
+            guard count > 0 else { return nil }
             return CandidateSelection(pageOffset: pageOffset,
-                                      index: clamp(selectedIndex, count: visibleCount))
+                                      index: clamp(selectedIndex, count: count))
         }
         return CandidateSelection(pageOffset: 0,
                                   index: clamp(selectedIndex, count: currentContext.candidates.count))
@@ -524,8 +546,11 @@ final class CandidateWindow {
             return collapseExpanded()
         }
         let nextOffset = expandedSelectionPageOffset + rowDelta
+        // At the fetched tail the owner had its chance to pull more pages; if
+        // none arrived we are genuinely at the end of the list, so hold still.
         guard expandedPages.indices.contains(nextOffset) else { return true }
         expandedSelectionPageOffset = nextOffset
+        scrollExpandedWindowToSelection()
         clampExpandedSelectionToVisiblePrefix()
         renderCandidates()
         logExpandedVisiblePrefix(reason: "row move")
@@ -535,13 +560,14 @@ final class CandidateWindow {
 
     @discardableResult
     func expand(with pages: [RimeContextModel]) -> Bool {
-        let visiblePages = Array(pages.prefix(Self.expandedMaxRows))
-            .filter { !$0.candidates.isEmpty }
-        guard !visiblePages.isEmpty else { return false }
-        expandedPages = visiblePages
+        let usablePages = pages.filter { !$0.candidates.isEmpty }
+        guard !usablePages.isEmpty else { return false }
+        expandedPages = usablePages
         expandedSelectionPageOffset = min(expandedSelectionPageOffset, expandedPages.count - 1)
-        guard expandedVisibleCandidateCount(pageOffset: expandedSelectionPageOffset) > 0 else {
-            IMELog.write("candidate matrix skipped; first shared column exceeds available width")
+        expandedColumnBase = 0
+        scrollExpandedWindowToSelection()
+        guard expandedCandidateCount(pageOffset: expandedSelectionPageOffset) > 0 else {
+            IMELog.write("candidate matrix skipped; selected row has no candidates")
             resetExpandedState()
             return true
         }
@@ -552,6 +578,54 @@ final class CandidateWindow {
         layoutPanel(caretRect: lastCaretRect, bundleId: lastBundleId)
         panel.orderFrontRegardless()
         return true
+    }
+
+    /// Take a longer page list re-read from the same anchor. Index still means
+    /// page offset, so the current row/selection stay valid and only the
+    /// reachable tail grows.
+    func extendExpandedPages(with pages: [RimeContextModel]) {
+        guard isExpanded else { return }
+        let usablePages = pages.filter { !$0.candidates.isEmpty }
+        guard usablePages.count > expandedPages.count else { return }
+        expandedPages = usablePages
+        IMELog.write("candidate matrix pages fetched=\(expandedPages.count) last=\(expandedTailIsLastPage)")
+    }
+
+    /// Slide the viewport so `selection` stays visible, one row at a time.
+    /// Pure and static so `matrix-smoke` can pin the scroll invariants without
+    /// a window server: the result is always a valid base whose `maxRows`-tall
+    /// window contains `selection`.
+    static func windowBase(selection: Int, currentBase: Int, pageCount: Int,
+                           maxRows: Int = CandidateWindow.expandedMaxRows) -> Int {
+        guard pageCount > 0, maxRows > 0 else { return 0 }
+        var base = currentBase
+        if selection < base {
+            base = selection
+        } else if selection >= base + maxRows {
+            base = selection - maxRows + 1
+        }
+        return min(max(0, base), max(0, pageCount - maxRows))
+    }
+
+    /// Keep the selected row inside the three-row viewport.
+    private func scrollExpandedWindowToSelection() {
+        expandedWindowBase = Self.windowBase(selection: expandedSelectionPageOffset,
+                                             currentBase: expandedWindowBase,
+                                             pageCount: expandedPages.count)
+    }
+
+    /// Page offsets of the rows currently rendered.
+    private func expandedWindowRange() -> Range<Int> {
+        guard !expandedPages.isEmpty else { return 0..<0 }
+        let base = min(max(0, expandedWindowBase),
+                       max(0, expandedPages.count - Self.expandedMaxRows))
+        return base..<min(base + Self.expandedMaxRows, expandedPages.count)
+    }
+
+    private func expandedWindowPages() -> [RimeContextModel] {
+        let range = expandedWindowRange()
+        guard !range.isEmpty else { return [] }
+        return Array(expandedPages[range])
     }
 
     @discardableResult
@@ -574,17 +648,21 @@ final class CandidateWindow {
         }
         let row = expandedPages[expandedSelectionPageOffset].candidates
         guard !row.isEmpty else { return false }
-        let visibleCount = expandedVisibleCandidateCount(pageOffset: expandedSelectionPageOffset)
-        guard visibleCount > 0 else { return false }
         let logicalDelta = BufferModel.shared.active ? -columnDelta : columnDelta
-        selectedIndex = clamp(selectedIndex + logicalDelta, count: visibleCount)
+        // Bounded by the whole page, not by what fits: the column viewport
+        // scrolls so ←/→ can reach candidates past the right edge.
+        selectedIndex = clamp(selectedIndex + logicalDelta, count: row.count)
+        scrollExpandedColumnsToSelection()
         renderCandidates()
+        logExpandedVisiblePrefix(reason: "column move")
         resetCandidateScroll()
         return true
     }
 
     private func resetExpandedState() {
         expandedPages.removeAll()
+        expandedWindowBase = 0
+        expandedColumnBase = 0
         expandedSelectionPageOffset = 0
     }
 
@@ -625,15 +703,21 @@ final class CandidateWindow {
     }
 
     /// Resolve a number-key selection against the row that currently owns the
-    /// matrix labels. Hidden tail candidates are deliberately not selectable.
+    /// matrix labels. Keys count the columns actually on screen, so they map
+    /// through the column viewport onto the candidate's real page index.
     func expandedSelection(atVisibleIndex index: Int) -> CandidateSelection? {
         guard isExpanded,
               expandedPages.indices.contains(expandedSelectionPageOffset),
-              index >= 0,
-              index < expandedVisibleCandidateCount(pageOffset: expandedSelectionPageOffset) else {
+              index >= 0 else {
             return nil
         }
-        return CandidateSelection(pageOffset: expandedSelectionPageOffset, index: index)
+        let columns = expandedColumnRange()
+        let candidateIndex = columns.lowerBound + index
+        guard index < columns.count,
+              candidateIndex < expandedCandidateCount(pageOffset: expandedSelectionPageOffset) else {
+            return nil
+        }
+        return CandidateSelection(pageOffset: expandedSelectionPageOffset, index: candidateIndex)
     }
 
     // MARK: Positioning
@@ -700,8 +784,10 @@ final class CandidateWindow {
 
         applyMetrics()
         if isExpanded {
-            if expandedVisibleCandidateCount(pageOffset: expandedSelectionPageOffset) == 0 {
-                IMELog.write("candidate matrix collapsed; first shared column no longer fits")
+            // A too-narrow panel no longer collapses the matrix: at least one
+            // column always renders and the viewport scrolls to the rest.
+            if expandedCandidateCount(pageOffset: expandedSelectionPageOffset) == 0 {
+                IMELog.write("candidate matrix collapsed; selected row has no candidates")
                 resetExpandedState()
             } else {
                 clampExpandedSelectionToVisiblePrefix()
@@ -773,13 +859,30 @@ final class CandidateWindow {
 
         let panelWidth = activePanelWidth()
         let available = candidateAvailableWidth(panelWidth: panelWidth)
-        let pages = Array((expandedPages.isEmpty ? [currentContext] : expandedPages)
-            .prefix(Self.expandedMaxRows))
-        let columnWidths = expandedMatrixColumnWidths(pages: pages, availableWidth: available)
+        let windowRange = expandedWindowRange()
+        let pages = expandedPages.isEmpty ? [currentContext] : Array(expandedPages[windowRange])
+        // Rows carry their absolute page offset: button tags encode it, and
+        // selection replays it as page-downs from the anchor.
+        let baseOffset = expandedPages.isEmpty ? 0 : windowRange.lowerBound
+        let naturalWidths = expandedMatrixNaturalWidths(pages: pages)
+        let columnBase = min(max(0, expandedColumnBase), max(0, naturalWidths.count - 1))
+        let columnCount = naturalWidths.isEmpty ? 0 : Self.fittedColumnCount(
+            widths: naturalWidths,
+            separator: separatorRunWidth(),
+            available: available,
+            base: columnBase
+        )
 
-        for (pageOffset, page) in pages.enumerated() {
+        for (rowIndex, page) in pages.enumerated() {
+            let pageOffset = baseOffset + rowIndex
             let isActiveRow = pageOffset == expandedSelectionPageOffset
-            let renderedCandidates = Array(page.candidates.prefix(columnWidths.count))
+            // Candidates carry their absolute index within the page, so tags and
+            // number labels stay correct after the column viewport scrolls.
+            let renderedCandidates = Array(
+                page.candidates.enumerated()
+                    .dropFirst(columnBase)
+                    .prefix(columnCount)
+            )
             let row = NSStackView()
             row.orientation = .horizontal
             row.alignment = .centerY
@@ -789,10 +892,9 @@ final class CandidateWindow {
                 for: CandidateWindowMetrics.current
             )).isActive = true
 
-            let indexedCandidates = Array(renderedCandidates.enumerated())
             let displayedCandidates = BufferModel.shared.active
-                ? Array(indexedCandidates.reversed())
-                : indexedCandidates
+                ? Array(renderedCandidates.reversed())
+                : renderedCandidates
             for (offset, element) in displayedCandidates.enumerated() {
                 let (index, candidate) = element
                 if offset > 0 {
@@ -804,7 +906,7 @@ final class CandidateWindow {
                     candidate: candidate,
                     highlighted: isActiveRow && index == selectedIndex,
                     compact: true,
-                    width: columnWidths[index],
+                    width: naturalWidths[index],
                     showsLabel: isActiveRow
                 ))
             }
@@ -814,21 +916,16 @@ final class CandidateWindow {
 
     /// Every matrix row shares the same width for a given column. Width
     /// measurement reserves the number label and selected font weight for all
-    /// rows, although only the active row renders labels. This keeps the grid
-    /// fixed while moving vertically. Once the next whole column cannot fit,
-    /// it and the tail are omitted from every row.
-    private func expandedMatrixColumnWidths(
-        pages: [RimeContextModel],
-        availableWidth: CGFloat
-    ) -> [CGFloat] {
+    /// rows, although only the active row renders labels, so neither horizontal
+    /// nor vertical navigation reflows the grid. Index == candidate index
+    /// within a page; this covers ALL columns, fitting happens separately.
+    private func expandedMatrixNaturalWidths(pages: [RimeContextModel]) -> [CGFloat] {
         let columnCount = pages.map { $0.candidates.count }.max() ?? 0
         guard columnCount > 0 else { return [] }
 
         var naturalWidths = Array(repeating: CGFloat(0), count: columnCount)
         for page in pages {
             for (index, candidate) in page.candidates.enumerated() {
-                // Reserve the maximum rendered title width so neither
-                // horizontal nor vertical navigation reflows the grid.
                 let width = ceil(measuredCandidateWidth(candidate,
                                                         highlighted: true,
                                                         compact: true,
@@ -836,42 +933,92 @@ final class CandidateWindow {
                 naturalWidths[index] = max(naturalWidths[index], width)
             }
         }
-
-        var visibleWidths: [CGFloat] = []
-        var usedWidth: CGFloat = 0
-        for naturalWidth in naturalWidths {
-            let addedWidth = (visibleWidths.isEmpty ? 0 : separatorRunWidth()) + naturalWidth
-            guard usedWidth + addedWidth <= availableWidth else { break }
-            visibleWidths.append(naturalWidth)
-            usedWidth += addedWidth
-        }
-
-        return visibleWidths
+        return naturalWidths
     }
 
-    private func expandedVisibleCandidateCount(pageOffset: Int) -> Int {
-        guard expandedPages.indices.contains(pageOffset) else { return 0 }
-        let columnWidths = expandedMatrixColumnWidths(
-            pages: Array(expandedPages.prefix(Self.expandedMaxRows)),
-            availableWidth: candidateAvailableWidth(panelWidth: activePanelWidth())
+    /// How many whole columns fit starting at `base`. Pure for `matrix-smoke`.
+    /// A column wider than the viewport still counts as one: dropping it would
+    /// make that candidate permanently unreachable, which is the bug this
+    /// viewport exists to avoid.
+    static func fittedColumnCount(widths: [CGFloat], separator: CGFloat,
+                                  available: CGFloat, base: Int) -> Int {
+        guard base >= 0, base < widths.count else { return 0 }
+        var count = 0
+        var used: CGFloat = 0
+        for width in widths[base...] {
+            let added = (count == 0 ? 0 : separator) + width
+            guard used + added <= available else { break }
+            used += added
+            count += 1
+        }
+        return max(count, 1)
+    }
+
+    /// Slide the column viewport so `selection` stays visible. Pure for the
+    /// smoke: the result always yields a window containing `selection`.
+    static func columnBase(selection: Int, currentBase: Int, widths: [CGFloat],
+                           separator: CGFloat, available: CGFloat) -> Int {
+        guard !widths.isEmpty else { return 0 }
+        var base = min(max(0, currentBase), widths.count - 1)
+        let target = min(max(0, selection), widths.count - 1)
+        if target < base { return target }
+        while target >= base + fittedColumnCount(widths: widths, separator: separator,
+                                                 available: available, base: base),
+              base < widths.count - 1 {
+            base += 1
+        }
+        return base
+    }
+
+    /// Candidate indices rendered in every row: [columnBase, columnBase+fitted).
+    /// Measured across the rendered row window so the grid stays aligned.
+    private func expandedColumnRange() -> Range<Int> {
+        let widths = expandedMatrixNaturalWidths(pages: expandedWindowPages())
+        guard !widths.isEmpty else { return 0..<0 }
+        let base = min(max(0, expandedColumnBase), widths.count - 1)
+        let count = Self.fittedColumnCount(
+            widths: widths,
+            separator: separatorRunWidth(),
+            available: candidateAvailableWidth(panelWidth: activePanelWidth()),
+            base: base
         )
-        return min(expandedPages[pageOffset].candidates.count, columnWidths.count)
+        return base..<min(base + count, widths.count)
+    }
+
+    /// Selection is bounded by the page's real candidate count, not by what
+    /// currently fits — the column viewport scrolls to reveal the rest.
+    private func expandedCandidateCount(pageOffset: Int) -> Int {
+        guard expandedPages.indices.contains(pageOffset) else { return 0 }
+        return expandedPages[pageOffset].candidates.count
+    }
+
+    private func scrollExpandedColumnsToSelection() {
+        let widths = expandedMatrixNaturalWidths(pages: expandedWindowPages())
+        guard !widths.isEmpty else { return }
+        expandedColumnBase = Self.columnBase(
+            selection: selectedIndex,
+            currentBase: expandedColumnBase,
+            widths: widths,
+            separator: separatorRunWidth(),
+            available: candidateAvailableWidth(panelWidth: activePanelWidth())
+        )
     }
 
     private func clampExpandedSelectionToVisiblePrefix() {
         guard expandedPages.indices.contains(expandedSelectionPageOffset) else { return }
         selectedIndex = clamp(
             selectedIndex,
-            count: expandedVisibleCandidateCount(pageOffset: expandedSelectionPageOffset)
+            count: expandedCandidateCount(pageOffset: expandedSelectionPageOffset)
         )
+        scrollExpandedColumnsToSelection()
     }
 
     private func logExpandedVisiblePrefix(reason: String) {
         guard expandedPages.indices.contains(expandedSelectionPageOffset) else { return }
-        let total = expandedPages[expandedSelectionPageOffset].candidates.count
-        let visible = expandedVisibleCandidateCount(pageOffset: expandedSelectionPageOffset)
-        guard visible < total else { return }
-        IMELog.write("candidate matrix \(reason) row=\(expandedSelectionPageOffset) visible=\(visible)/\(total) hidden=\(total - visible)")
+        let total = expandedCandidateCount(pageOffset: expandedSelectionPageOffset)
+        let range = expandedColumnRange()
+        guard range.count < total else { return }
+        IMELog.write("candidate matrix \(reason) row=\(expandedSelectionPageOffset) cols=\(range.lowerBound)..<\(range.upperBound)/\(total)")
     }
 
     private func renderSingleCharacterSelectionRow() {
