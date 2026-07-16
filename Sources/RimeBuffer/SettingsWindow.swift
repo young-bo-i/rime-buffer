@@ -864,20 +864,10 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         return values
     }
 
-    /// Resolve raw control values into the supported set: a "container" metric
-    /// (strip height, candidate glyph) is free within its own range; a "child"
-    /// (button height, index label) is clamped to what its container currently
-    /// allows, so an unsupported interval can never be committed.
+    /// Resolve raw control values through the full dependency chain so an
+    /// unsupported interval can never be previewed or committed.
     private func resolveMetricValues(_ raw: [CandidateWindowMetric: Double]) -> [CandidateWindowMetric: Double] {
-        var out: [CandidateWindowMetric: Double] = [:]
-        for metric in CandidateWindowMetric.allCases where metric.containerMetric == nil {
-            out[metric] = clamp((raw[metric] ?? metric.defaultValue).rounded(), to: metric.range)
-        }
-        for metric in CandidateWindowMetric.allCases where metric.containerMetric != nil {
-            let supported = metric.supportedRange(given: out)
-            out[metric] = clamp((raw[metric] ?? metric.defaultValue).rounded(), to: supported)
-        }
-        return out
+        CandidateWindowMetrics.resolvedValues(raw)
     }
 
     /// Push a resolved value set into every control (value + supported bounds +
@@ -1211,10 +1201,6 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     @objc private func resetCandidateMetrics() {
         CandidateWindowMetrics.resetToDefaults()
         refreshCandidateMetricControls()
-    }
-
-    private func clamp(_ value: Double, to range: ClosedRange<Double>) -> Double {
-        min(max(value, range.lowerBound), range.upperBound)
     }
 
     @objc private func statsDateChanged() {

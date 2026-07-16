@@ -75,13 +75,19 @@ struct CandidateWindowMetrics {
     let labelFontSize: CGFloat
 
     static var current: CandidateWindowMetrics {
-        CandidateWindowMetrics(
-            baseWidth: value(for: .baseWidth),
-            compactStripHeight: value(for: .compactStripHeight),
-            compactCandidateHeight: value(for: .compactCandidateHeight),
-            preeditHeight: value(for: .preeditHeight),
-            candidateFontSize: value(for: .candidateFontSize),
-            labelFontSize: value(for: .labelFontSize)
+        let values = resolvedValues(Dictionary(uniqueKeysWithValues:
+            CandidateWindowMetric.allCases.map { ($0, Double(value(for: $0))) }
+        ))
+        func get(_ metric: CandidateWindowMetric) -> CGFloat {
+            CGFloat(values[metric] ?? metric.defaultValue)
+        }
+        return CandidateWindowMetrics(
+            baseWidth: get(.baseWidth),
+            compactStripHeight: get(.compactStripHeight),
+            compactCandidateHeight: get(.compactCandidateHeight),
+            preeditHeight: get(.preeditHeight),
+            candidateFontSize: get(.candidateFontSize),
+            labelFontSize: get(.labelFontSize)
         )
     }
 
@@ -102,13 +108,49 @@ struct CandidateWindowMetrics {
     }
 
     static func apply(_ values: [CandidateWindowMetric: Double]) {
+        let resolved = resolvedValues(values)
         for metric in CandidateWindowMetric.allCases {
-            guard let value = values[metric] else { continue }
-            UserDefaults.standard.set(clamp(value, to: metric.range),
-                                      forKey: metric.userDefaultsKey)
+            guard let value = resolved[metric] else { continue }
+            UserDefaults.standard.set(value, forKey: metric.userDefaultsKey)
         }
         IMELog.write("candidate window metrics applied")
         NotificationCenter.default.post(name: .candidateWindowMetricsDidChange, object: nil)
+    }
+
+    /// Resolve the container chain in dependency order. Repeating the pass keeps
+    /// this correct even if enum declaration order changes: strip -> button ->
+    /// candidate font -> index label.
+    static func resolvedValues(
+        _ raw: [CandidateWindowMetric: Double]
+    ) -> [CandidateWindowMetric: Double] {
+        var resolved: [CandidateWindowMetric: Double] = [:]
+
+        while resolved.count < CandidateWindowMetric.allCases.count {
+            let countBeforePass = resolved.count
+            for metric in CandidateWindowMetric.allCases where resolved[metric] == nil {
+                if let dependency = metric.containerMetric,
+                   resolved[dependency.metric] == nil {
+                    continue
+                }
+                let supported = metric.supportedRange(given: resolved)
+                resolved[metric] = clamp(
+                    (raw[metric] ?? metric.defaultValue).rounded(),
+                    to: supported
+                )
+            }
+
+            guard resolved.count > countBeforePass else {
+                // Defensive fallback for a future accidental dependency cycle.
+                for metric in CandidateWindowMetric.allCases where resolved[metric] == nil {
+                    resolved[metric] = clamp(
+                        (raw[metric] ?? metric.defaultValue).rounded(),
+                        to: metric.range
+                    )
+                }
+                break
+            }
+        }
+        return resolved
     }
 
     static func resetToDefaults() {
@@ -151,9 +193,11 @@ enum CandidateLayout {
     static let actionButtonSize: CGFloat = 28
     static let candidateSpacing: CGFloat = 3
     static let candidateSeparatorWidth: CGFloat = 8
+    static let candidateSeparatorRunWidth = candidateSeparatorWidth + candidateSpacing * 2
     static let barSpacing: CGFloat = 4
     static let barHorizontalPadding: CGFloat = 5
     static let compactCandidateHorizontalPadding: CGFloat = 6
+    static let bufferActionMinWidth: CGFloat = 38
     static let rootSpacing: CGFloat = 5
 
     /// Vertical inset between the strip edge and its tallest child.
@@ -183,12 +227,13 @@ enum CandidateLayout {
 
 extension CandidateWindowMetric {
     /// A metric whose current value caps this metric's usable upper bound. A
-    /// "child" (candidate button, index label) can never render larger than the
-    /// "container" that holds it (the strip, the candidate glyph); past that
-    /// point the window silently clamps, so the size control must not allow it.
+    /// "child" (candidate button, candidate glyph, index label) can never render
+    /// larger than the container that holds it; past that point the window clips
+    /// or silently clamps, so the size control must not allow it.
     var containerMetric: (metric: CandidateWindowMetric, slack: Double)? {
         switch self {
         case .compactCandidateHeight: return (.compactStripHeight, 2)   // button ≤ strip − 2px
+        case .candidateFontSize:       return (.compactCandidateHeight, 6) // glyph ≤ button − 6px
         case .labelFontSize:          return (.candidateFontSize, 0)     // index label ≤ candidate glyph
         default:                      return nil
         }
@@ -216,12 +261,12 @@ struct CandidateSelection {
 /// pages until Rime reports the last one, so the whole candidate list is
 /// reachable by holding ↓.
 final class CandidateWindow {
-    private static let candidateSpacing: CGFloat = 3
-    private static let candidateSeparatorWidth: CGFloat = 8
-    private static let barSpacing: CGFloat = 4
-    private static let barHorizontalPadding: CGFloat = 5
-    private static let actionButtonSize: CGFloat = 28
-    private static let compactCandidateHorizontalPadding: CGFloat = 6
+    private static let candidateSpacing = CandidateLayout.candidateSpacing
+    private static let candidateSeparatorWidth = CandidateLayout.candidateSeparatorWidth
+    private static let barSpacing = CandidateLayout.barSpacing
+    private static let barHorizontalPadding = CandidateLayout.barHorizontalPadding
+    private static let actionButtonSize = CandidateLayout.actionButtonSize
+    private static let compactCandidateHorizontalPadding = CandidateLayout.compactCandidateHorizontalPadding
     private static let expandedRowSpacing: CGFloat = 3
     /// Vertical limit of the matrix. Three rows is the visual cap, NOT the
     /// reach: the viewport slides over every fetched page (see `windowBase`).
@@ -1232,7 +1277,8 @@ final class CandidateWindow {
     }
 
     private func bufferActionWidth() -> CGFloat {
-        max(38, ceil(measuredCandidateWidth(bufferActionCandidate(), highlighted: false, compact: true)))
+        max(CandidateLayout.bufferActionMinWidth,
+            ceil(measuredCandidateWidth(bufferActionCandidate(), highlighted: false, compact: true)))
     }
 
     private func candidateMaxWidth(panelWidth: CGFloat) -> CGFloat {
@@ -1280,7 +1326,7 @@ final class CandidateWindow {
     }
 
     private func separatorRunWidth() -> CGFloat {
-        Self.candidateSeparatorWidth + Self.candidateSpacing * 2
+        CandidateLayout.candidateSeparatorRunWidth
     }
 
     private func currentVisualCandidateIndices(panelWidth: CGFloat) -> [Int] {
@@ -1507,8 +1553,13 @@ final class CandidatePreviewView: NSView {
     }
 
     private let canvasPadding: CGFloat = 18
+    private let statusHeight: CGFloat = 16
+    private let statusSpacing: CGFloat = 4
     private let maxWidth: CGFloat
     private let backdrop = NSView()
+    private let previewScroll = NSScrollView()
+    private let previewDocument = NSView()
+    private let widthStatusLabel = NSTextField(labelWithString: "")
     private let windowMock = NSView()
     private let preeditLabel = NSTextField(labelWithString: "")
     private let strip = NSView()
@@ -1540,9 +1591,26 @@ final class CandidatePreviewView: NSView {
         backdrop.translatesAutoresizingMaskIntoConstraints = false
         addSubview(backdrop)
 
+        previewScroll.drawsBackground = false
+        previewScroll.borderType = .noBorder
+        previewScroll.hasVerticalScroller = false
+        previewScroll.horizontalScrollElasticity = .none
+        previewScroll.verticalScrollElasticity = .none
+        previewScroll.scrollerStyle = .overlay
+        previewScroll.autohidesScrollers = false
+        previewScroll.translatesAutoresizingMaskIntoConstraints = false
+        previewScroll.documentView = previewDocument
+        backdrop.addSubview(previewScroll)
+
+        widthStatusLabel.font = .monospacedDigitSystemFont(ofSize: 10, weight: .regular)
+        widthStatusLabel.textColor = .tertiaryLabelColor
+        widthStatusLabel.alignment = .right
+        widthStatusLabel.translatesAutoresizingMaskIntoConstraints = false
+        backdrop.addSubview(widthStatusLabel)
+
         windowMock.wantsLayer = true
         windowMock.translatesAutoresizingMaskIntoConstraints = false
-        backdrop.addSubview(windowMock)
+        previewDocument.addSubview(windowMock)
 
         preeditLabel.lineBreakMode = .byTruncatingTail
         preeditLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -1596,8 +1664,22 @@ final class CandidatePreviewView: NSView {
             backdrop.topAnchor.constraint(equalTo: topAnchor),
             backdrop.bottomAnchor.constraint(equalTo: bottomAnchor),
 
-            windowMock.leadingAnchor.constraint(equalTo: backdrop.leadingAnchor, constant: canvasPadding),
-            windowMock.topAnchor.constraint(equalTo: backdrop.topAnchor, constant: canvasPadding),
+            previewScroll.leadingAnchor.constraint(equalTo: backdrop.leadingAnchor),
+            previewScroll.trailingAnchor.constraint(equalTo: backdrop.trailingAnchor),
+            previewScroll.topAnchor.constraint(equalTo: backdrop.topAnchor),
+            previewScroll.bottomAnchor.constraint(equalTo: widthStatusLabel.topAnchor,
+                                                  constant: -statusSpacing),
+
+            widthStatusLabel.leadingAnchor.constraint(greaterThanOrEqualTo: backdrop.leadingAnchor,
+                                                       constant: 8),
+            widthStatusLabel.trailingAnchor.constraint(equalTo: backdrop.trailingAnchor, constant: -8),
+            widthStatusLabel.bottomAnchor.constraint(equalTo: backdrop.bottomAnchor, constant: -4),
+            widthStatusLabel.heightAnchor.constraint(equalToConstant: statusHeight),
+
+            windowMock.leadingAnchor.constraint(equalTo: previewDocument.leadingAnchor,
+                                                constant: canvasPadding),
+            windowMock.topAnchor.constraint(equalTo: previewDocument.topAnchor,
+                                            constant: canvasPadding),
 
             preeditLabel.leadingAnchor.constraint(equalTo: windowMock.leadingAnchor, constant: 2),
             preeditLabel.topAnchor.constraint(equalTo: windowMock.topAnchor),
@@ -1646,32 +1728,97 @@ final class CandidatePreviewView: NSView {
         // Geometry (identical to the live window).
         let stripHeight = CandidateLayout.compactStripHeight(m)
         let buttonHeight = CandidateLayout.candidateButtonHeight(m)
-        let windowWidth = min(m.baseWidth, maxWidth - 2 * canvasPadding)
+        let windowWidth = m.baseWidth
+        let previewWindowHeight = m.preeditHeight + CandidateLayout.rootSpacing + stripHeight
+        let scrollHeight = canvasPadding * 2 + previewWindowHeight
+        let documentWidth = max(maxWidth, windowWidth + 2 * canvasPadding)
+        let overflows = documentWidth > maxWidth + 0.5
+        let previousScrollX = previewScroll.contentView.bounds.minX
 
         preeditHeightConstraint.constant = m.preeditHeight
         stripHeightConstraint.constant = stripHeight
         candidateRowHeightConstraint.constant = buttonHeight
         dividerHeightConstraint.constant = CandidateLayout.dividerHeight(m)
         windowWidthConstraint.constant = windowWidth
+        previewDocument.frame = NSRect(x: 0, y: 0, width: documentWidth, height: scrollHeight)
+        previewScroll.hasHorizontalScroller = overflows
+        widthStatusLabel.stringValue = overflows
+            ? "实际宽度 \(Int(windowWidth.rounded())) px · 左右滚动查看"
+            : "实际宽度 \(Int(windowWidth.rounded())) px"
 
         // Fill candidates until the strip is full (mirrors real paging).
-        candidateRow.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        candidateRow.arrangedSubviews.forEach {
+            candidateRow.removeArrangedSubview($0)
+            $0.removeFromSuperview()
+        }
         let gearArea = CandidateLayout.actionButtonSize + CandidateLayout.barSpacing * 2 + 1
         let available = windowWidth - 2 * CandidateLayout.barHorizontalPadding - gearArea
+        let bufferAttr = candidateAttr(label: "0", text: "🅔", highlighted: false, m: m)
+        let bufferWidth = max(CandidateLayout.bufferActionMinWidth,
+                              ceil(bufferAttr.size().width)
+                                  + CandidateLayout.compactCandidateHorizontalPadding)
+        let candidateAvailable = max(64,
+                                     available - bufferWidth
+                                         - CandidateLayout.candidateSeparatorRunWidth)
         var used: CGFloat = 0
         for (i, item) in sampleCandidates.enumerated() {
             let attr = candidateAttr(label: item.label, text: item.text, highlighted: i == 0, m: m)
             let w = ceil(attr.size().width) + CandidateLayout.compactCandidateHorizontalPadding
-            let next = candidateRow.arrangedSubviews.isEmpty ? w : used + CandidateLayout.candidateSpacing + w
-            if !candidateRow.arrangedSubviews.isEmpty, next > available { break }
+            let hasCandidate = used > 0
+            let separatorRun = CandidateLayout.candidateSeparatorRunWidth
+            let next = hasCandidate ? used + separatorRun + w : w
+            if hasCandidate, next > candidateAvailable { break }
+            if hasCandidate {
+                candidateRow.addArrangedSubview(candidateSeparator(m: m))
+            }
             used = next
-            let label = NSTextField(labelWithAttributedString: attr)
-            label.setContentHuggingPriority(.required, for: .horizontal)
-            candidateRow.addArrangedSubview(label)
+            candidateRow.addArrangedSubview(candidatePill(attr,
+                                                          width: w,
+                                                          height: buttonHeight))
         }
+        if !candidateRow.arrangedSubviews.isEmpty {
+            candidateRow.addArrangedSubview(candidateSeparator(m: m))
+        }
+        candidateRow.addArrangedSubview(candidatePill(bufferAttr,
+                                                      width: min(bufferWidth, available),
+                                                      height: buttonHeight))
 
-        heightConstraint.constant = canvasPadding * 2 + m.preeditHeight + CandidateLayout.rootSpacing + stripHeight
+        heightConstraint.constant = scrollHeight + statusSpacing + statusHeight + 4
+        let maxScrollX = max(0, documentWidth - maxWidth)
+        previewScroll.contentView.scroll(to: NSPoint(x: min(max(0, previousScrollX), maxScrollX),
+                                                     y: previewScroll.contentView.bounds.minY))
+        previewScroll.reflectScrolledClipView(previewScroll.contentView)
         needsLayout = true
+    }
+
+    private func candidatePill(
+        _ title: NSAttributedString,
+        width: CGFloat,
+        height: CGFloat
+    ) -> NSView {
+        let pill = NSView()
+        pill.translatesAutoresizingMaskIntoConstraints = false
+        let label = NSTextField(labelWithAttributedString: title)
+        label.alignment = .center
+        label.translatesAutoresizingMaskIntoConstraints = false
+        pill.addSubview(label)
+        NSLayoutConstraint.activate([
+            pill.widthAnchor.constraint(equalToConstant: width),
+            pill.heightAnchor.constraint(equalToConstant: height),
+            label.centerXAnchor.constraint(equalTo: pill.centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
+        ])
+        return pill
+    }
+
+    private func candidateSeparator(m: CandidateWindowMetrics) -> NSView {
+        let label = NSTextField(labelWithString: "|")
+        label.font = .systemFont(ofSize: max(12, m.candidateFontSize - 1), weight: .regular)
+        label.textColor = RimeUI.borderStrong
+        label.alignment = .center
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.widthAnchor.constraint(equalToConstant: CandidateLayout.candidateSeparatorWidth).isActive = true
+        return label
     }
 
     private func candidateAttr(label: String, text: String, highlighted: Bool, m: CandidateWindowMetrics) -> NSAttributedString {

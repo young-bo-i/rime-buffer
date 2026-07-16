@@ -831,6 +831,39 @@ func runCandidateMatrixSmokeTest() -> Bool {
 /// here would let unverified external text reach the buffer without review.
 func runInboundBusSmokeTest() -> Bool {
     print("== RimeBuffer inbound bus smoke test ==")
+
+    // DNS-rebinding defence: command-line clients omit Origin, while browser
+    // origins must parse to an exact loopback host (prefix lookalikes are not local).
+    let allowedOrigins: [String?] = [
+        nil,
+        "http://localhost",
+        "https://localhost:47700",
+        "http://127.0.0.1:47700",
+        "http://[::1]:47700",
+    ]
+    guard allowedOrigins.allSatisfy({ LocalGateway.isAllowedOrigin($0) }) else {
+        print("FAILED: a valid loopback Origin was rejected")
+        return false
+    }
+    let rejectedOrigins = [
+        "",
+        "null",
+        "file://localhost",
+        "http://localhost.evil.example",
+        "http://127.0.0.1.evil.example",
+        "http://localhost@evil.example",
+        "http://%6cocalhost",
+        "http://localhost:99999",
+        "http://localhost/",
+        "https://example.com",
+        "http://localhost?redirect=evil",
+        "http://localhost/#fragment",
+    ]
+    guard rejectedOrigins.allSatisfy({ !LocalGateway.isAllowedOrigin($0) }) else {
+        print("FAILED: a non-loopback or malformed Origin was accepted")
+        return false
+    }
+
     let bus = InboundBus.shared
     let model = BufferModel.shared
     let oldEnabled = model.enabled
@@ -1256,10 +1289,10 @@ func runRemoteSmokeTest() -> Bool {
 }
 
 /// Pins the "unsupported interval" rule behind the candidate-window size controls:
-/// a child metric (button height, index label) can only be set as high as its
-/// container (strip height, candidate glyph) currently allows, because anything
-/// taller is silently absorbed by the layout and never renders. A wrong verdict
-/// here means the settings sliders would let you dial in sizes that do nothing.
+/// a dependent metric (button height, candidate glyph, index label) can only be
+/// set as high as its container currently allows, because anything taller is
+/// clipped or silently absorbed by the layout. A wrong verdict here means the
+/// settings sliders would offer sizes that cannot render faithfully.
 func runCandidateMetricsSmokeTest() -> Bool {
     print("== RimeBuffer candidate metrics smoke test ==")
     var ok = true
@@ -1267,12 +1300,14 @@ func runCandidateMetricsSmokeTest() -> Bool {
         if !cond { print("FAILED: \(msg)"); ok = false }
     }
 
-    // Only the two children are container-bounded; the rest are free.
+    // The dependency chain must stay strip -> button -> candidate glyph -> label.
     check(CandidateWindowMetric.compactCandidateHeight.containerMetric?.metric == .compactStripHeight,
           "button height should be bounded by strip height")
+    check(CandidateWindowMetric.candidateFontSize.containerMetric?.metric == .compactCandidateHeight,
+          "candidate glyph should be bounded by button height")
     check(CandidateWindowMetric.labelFontSize.containerMetric?.metric == .candidateFontSize,
           "index label should be bounded by candidate glyph")
-    for m in [CandidateWindowMetric.baseWidth, .compactStripHeight, .preeditHeight, .candidateFontSize] {
+    for m in [CandidateWindowMetric.baseWidth, .compactStripHeight, .preeditHeight] {
         check(m.containerMetric == nil, "\(m.rawValue) should be a free container metric")
     }
 
@@ -1289,6 +1324,29 @@ func runCandidateMetricsSmokeTest() -> Bool {
     check(CandidateWindowMetric.compactCandidateHeight
         .supportedRange(given: vals(strip: 64, button: 24, glyph: 16, label: 10)).upperBound == 44,
           "strip=64 should allow the full 44 button")
+
+    // Candidate glyph ceiling tracks the button with enough room for AppKit's
+    // ascender/descender line box (24pt is roughly 30px tall on the system font).
+    check(CandidateWindowMetric.candidateFontSize
+        .supportedRange(given: vals(strip: 32, button: 22, glyph: 16, label: 10)).upperBound == 16,
+          "button=22 should cap the candidate glyph at 16")
+    check(CandidateWindowMetric.candidateFontSize
+        .supportedRange(given: vals(strip: 64, button: 44, glyph: 16, label: 10)).upperBound == 24,
+          "button=44 should allow the full 24 candidate glyph")
+
+    let resolvedChain = CandidateWindowMetrics.resolvedValues(
+        vals(strip: 32, button: 22, glyph: 24, label: 18)
+    )
+    check(resolvedChain[.compactCandidateHeight] == 22,
+          "a supported button height should remain unchanged")
+    check(resolvedChain[.candidateFontSize] == 16,
+          "the full resolver should clamp candidate glyphs to their button")
+    check(resolvedChain[.labelFontSize] == 16,
+          "the full resolver should then clamp labels to the candidate glyph")
+    check(CandidateLayout.candidateSeparatorRunWidth == 14,
+          "preview and live candidate separators should occupy the same width")
+    check(CandidateLayout.bufferActionMinWidth == 38,
+          "preview and live buffer actions should share the same minimum width")
 
     // Index-label ceiling tracks the candidate glyph.
     check(CandidateWindowMetric.labelFontSize

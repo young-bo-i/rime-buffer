@@ -15,6 +15,48 @@ final class LocalGateway {
     private static let maxHeaderBytes = 32 * 1024
     private static let maxBodyBytes = 256 * 1024
 
+    /// CLI/agent clients normally omit Origin. When it is present, accept only
+    /// a syntactically complete HTTP(S) loopback origin (an optional port is OK).
+    /// Kept pure and internal so the CLI smoke harness can pin the edge cases.
+    static func isAllowedOrigin(_ rawOrigin: String?) -> Bool {
+        guard let rawOrigin else { return true }
+        let origin = rawOrigin.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !origin.isEmpty,
+              let components = URLComponents(string: origin),
+              components.url != nil,
+              let scheme = components.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              components.user == nil,
+              components.password == nil,
+              components.query == nil,
+              components.fragment == nil,
+              components.path.isEmpty,
+              let parsedHost = components.host?.lowercased()
+        else { return false }
+
+        // Foundation has returned both bracketed and unbracketed IPv6 hosts
+        // across OS releases; brackets are URL syntax, not part of the host.
+        let host = parsedHost.hasPrefix("[") && parsedHost.hasSuffix("]")
+            ? String(parsedHost.dropFirst().dropLast())
+            : parsedHost
+        let serializedHost: String
+        switch host {
+        case "localhost", "127.0.0.1": serializedHost = host
+        case "::1": serializedHost = "[::1]"
+        default: return false
+        }
+        let portSuffix: String
+        if let port = components.port {
+            guard (0...65_535).contains(port) else { return false }
+            portSuffix = ":\(port)"
+        } else {
+            portSuffix = ""
+        }
+        // Comparing the reconstructed origin also rejects percent-encoded hosts,
+        // empty/invalid ports, paths, and other parser-normalized spellings.
+        return origin.lowercased() == "\(scheme)://\(serializedHost)\(portSuffix)"
+    }
+
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "etinput.gateway")
     private var connections: [ObjectIdentifier: Connection] = [:]
@@ -73,9 +115,8 @@ final class LocalGateway {
         private let conn: NWConnection
         private let onClose: (Connection) -> Void
         private var buffer = Data()
-        // Each MCP session gets a server-issued id + the client's self-reported
-        // (unverified) name, used only for the source label.
-        private var mcpSessionID = ""
+        // Stateless MCP has no server-side session. Keep only a connection-local,
+        // unverified client name as a best-effort source label.
         private var mcpClientName = "MCP"
 
         init(_ c: NWConnection, onClose: @escaping (Connection) -> Void) {
@@ -99,9 +140,6 @@ final class LocalGateway {
                 guard let self else { return }
                 if let data, !data.isEmpty {
                     self.buffer.append(data)
-                    if self.buffer.count > LocalGateway.maxHeaderBytes + LocalGateway.maxBodyBytes {
-                        self.close(); return
-                    }
                     self.drain()
                 }
                 if isDone || err != nil { self.close(); return }
@@ -110,7 +148,19 @@ final class LocalGateway {
         }
 
         private func drain() {
-            while let (req, consumed) = parse(buffer) {
+            while true {
+                let req: Req
+                let consumed: Int
+                switch parse(buffer) {
+                case .incomplete:
+                    return
+                case .invalid:
+                    close()
+                    return
+                case .complete(let parsedReq, let parsedBytes):
+                    req = parsedReq
+                    consumed = parsedBytes
+                }
                 buffer.removeSubrange(0..<consumed)
                 handle(req)
                 if (req.headers["connection"] ?? "").lowercased() == "close" { return }
@@ -120,16 +170,27 @@ final class LocalGateway {
         // MARK: HTTP parse
 
         private struct Req { var method = "", path = ""; var headers: [String: String] = [:]; var body = Data() }
+        private enum ParseResult {
+            case incomplete
+            case invalid
+            case complete(Req, Int)
+        }
 
-        private func parse(_ data: Data) -> (Req, Int)? {
-            guard let end = data.range(of: Data("\r\n\r\n".utf8)) else {
-                return nil  // header terminator not in yet; receive() caps total buffer size
+        private func parse(_ data: Data) -> ParseResult {
+            let terminator = Data("\r\n\r\n".utf8)
+            guard let end = data.range(of: terminator) else {
+                // Leave room for a partial terminator beginning exactly at the
+                // header limit; anything beyond that can never become valid.
+                return data.count > LocalGateway.maxHeaderBytes + terminator.count - 1
+                    ? .invalid : .incomplete
             }
-            guard let headerStr = String(data: data.subdata(in: 0..<end.lowerBound), encoding: .utf8) else { return nil }
+            guard end.lowerBound <= LocalGateway.maxHeaderBytes,
+                  let headerStr = String(data: data.subdata(in: 0..<end.lowerBound), encoding: .utf8)
+            else { return .invalid }
             var lines = headerStr.components(separatedBy: "\r\n")
-            guard !lines.isEmpty else { return nil }
+            guard !lines.isEmpty else { return .invalid }
             let start = lines.removeFirst().split(separator: " ")
-            guard start.count == 3 else { return nil }
+            guard start.count == 3 else { return .invalid }
             var req = Req(); req.method = String(start[0]); req.path = String(start[1])
             for line in lines {
                 guard let c = line.firstIndex(of: ":") else { continue }
@@ -137,10 +198,20 @@ final class LocalGateway {
                     line[line.index(after: c)...].trimmingCharacters(in: .whitespaces)
             }
             let bodyStart = end.upperBound
-            let len = min(Int(req.headers["content-length"] ?? "0") ?? 0, LocalGateway.maxBodyBytes)
-            guard data.count - bodyStart >= len else { return nil }
+            let len: Int
+            if let rawLength = req.headers["content-length"] {
+                guard !rawLength.isEmpty,
+                      rawLength.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }),
+                      let parsedLength = Int(rawLength),
+                      parsedLength <= LocalGateway.maxBodyBytes
+                else { return .invalid }
+                len = parsedLength
+            } else {
+                len = 0
+            }
+            guard data.count - bodyStart >= len else { return .incomplete }
             req.body = data.subdata(in: bodyStart..<(bodyStart + len))
-            return (req, bodyStart + len)
+            return .complete(req, bodyStart + len)
         }
 
         // MARK: responses
@@ -155,11 +226,9 @@ final class LocalGateway {
             conn.send(content: out, completion: .contentProcessed { _ in })
         }
 
-        private func json(_ obj: Any, status: String = "200 OK", session: String? = nil) {
+        private func json(_ obj: Any, status: String = "200 OK") {
             let data = (try? JSONSerialization.data(withJSONObject: obj)) ?? Data("{}".utf8)
-            var h = ["Content-Type": "application/json"]
-            if let session { h["Mcp-Session-Id"] = session }
-            send(status, headers: h, body: data)
+            send(status, headers: ["Content-Type": "application/json"], body: data)
         }
 
         // MARK: routing
@@ -169,7 +238,7 @@ final class LocalGateway {
             if req.method == "GET", path == "/v1/health" { json(["ok": true]); return }
             // Spec MUST: reject cross-origin browsers (DNS-rebinding defence). Real
             // MCP agents are not browsers and omit Origin, so they pass through.
-            guard originAllowed(req) else {
+            guard LocalGateway.isAllowedOrigin(req.headers["origin"]) else {
                 json(["error": "forbidden origin"], status: "403 Forbidden"); return
             }
             guard let auth = req.headers["authorization"], auth.hasPrefix("Bearer "),
@@ -179,24 +248,12 @@ final class LocalGateway {
             switch (req.method, path) {
             case ("POST", "/v1/inbound"): handleInbound(req)
             case ("POST", "/mcp"): handleMCP(req)
-            // Streamable HTTP: we push no server-initiated messages, so per spec the
-            // GET SSE stream is declined with 405 (clients treat this as "no stream").
-            case ("GET", "/mcp"): send("405 Method Not Allowed", headers: ["Allow": "POST, DELETE"])
-            // Session teardown — we hold no per-session state, so just acknowledge.
-            case ("DELETE", "/mcp"): mcpSessionID = ""; send("200 OK")
+            // Legal stateless Streamable HTTP: POST is the only implemented MCP
+            // transport method. There is no SSE stream or session to terminate.
+            case ("GET", "/mcp"), ("DELETE", "/mcp"):
+                send("405 Method Not Allowed", headers: ["Allow": "POST"])
             default: json(["error": "not found"], status: "404 Not Found")
             }
-        }
-
-        /// Origin is absent for CLI/agent clients (allowed). A browser attacker
-        /// reaching the loopback port would carry a non-local Origin — rejected.
-        private func originAllowed(_ req: Req) -> Bool {
-            guard let origin = req.headers["origin"], !origin.isEmpty else { return true }
-            let o = origin.lowercased()
-            return o == "null"
-                || o.hasPrefix("http://localhost") || o.hasPrefix("https://localhost")
-                || o.hasPrefix("http://127.0.0.1") || o.hasPrefix("https://127.0.0.1")
-                || o.hasPrefix("http://[::1]") || o.hasPrefix("https://[::1]")
         }
 
         private func handleInbound(_ req: Req) {
@@ -238,7 +295,6 @@ final class LocalGateway {
 
             switch method {
             case "initialize":
-                mcpSessionID = "s-" + UUID().uuidString   // visible-ASCII, unique per spec
                 let params = msg["params"] as? [String: Any]
                 if let ci = params?["clientInfo"] as? [String: Any],
                    let name = ci["name"] as? String { mcpClientName = name }
@@ -253,7 +309,7 @@ final class LocalGateway {
                     "serverInfo": ["name": "Enter输入法", "title": "Enter输入法 缓冲区", "version": "1"],
                     "instructions": "把文字送进用户输入法的缓冲区收件箱，等用户确认后由用户上屏。"
                         + "只进不出：无法读取缓冲区，也不会自动上屏。",
-                ]], session: mcpSessionID)
+                ]])
             case "notifications/initialized":
                 send("202 Accepted")
             case "ping":
