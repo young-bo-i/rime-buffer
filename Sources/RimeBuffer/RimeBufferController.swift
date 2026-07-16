@@ -1594,6 +1594,10 @@ final class RimeBufferController: IMKInputController {
         StatusMenu.shared.openSettings()
     }
 
+    @objc func openWorkbenchPreviewFromInputMenu(_ sender: Any?) {
+        StatusMenu.shared.openWorkbenchPreview()
+    }
+
     @objc func checkUpdateFromInputMenu(_ sender: Any?) {
         StatusMenu.shared.checkUpdate()
     }

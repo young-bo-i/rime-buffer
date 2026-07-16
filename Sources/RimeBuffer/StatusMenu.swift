@@ -45,6 +45,13 @@ final class StatusMenu {
             keyEquivalent: "")
         settings.target = target
         menu.addItem(settings)
+
+        let workbench = NSMenuItem(
+            title: "工作台预览（开发）…",
+            action: #selector(RimeBufferController.openWorkbenchPreviewFromInputMenu(_:)),
+            keyEquivalent: "")
+        workbench.target = target
+        menu.addItem(workbench)
         menu.addItem(.separator())
 
         let checkUpdate = NSMenuItem(
@@ -87,6 +94,10 @@ final class StatusMenu {
 
     func openSettings() {
         SettingsWindowController.shared.show()
+    }
+
+    func openWorkbenchPreview() {
+        WorkbenchBarView.showPreviewWindow()
     }
 
     func checkUpdate() {

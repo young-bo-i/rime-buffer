@@ -7,19 +7,30 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     static let shared = SettingsWindowController()
 
     private enum Page: Int, CaseIterable {
+        // 输入法组
         case input
         case candidateWindow
-        case buffer
-        case remote
         case maintenance
+        // 工作台组
+        case buffer
+        case connections
+        case processors
 
         var title: String {
             switch self {
             case .input: return "输入"
             case .candidateWindow: return "候选窗"
-            case .buffer: return "缓冲区"
-            case .remote: return "隔空传字"
             case .maintenance: return "维护"
+            case .buffer: return "缓冲区"
+            case .connections: return "连接"
+            case .processors: return "处理器"
+            }
+        }
+
+        var group: String {
+            switch self {
+            case .input, .candidateWindow, .maintenance: return "输入法"
+            case .buffer, .connections, .processors: return "工作台"
             }
         }
     }
@@ -36,6 +47,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     private let schemaApplyStatus = NSTextField(labelWithString: "")
     private let appearancePopUp = NSPopUpButton()
     private let bufferCheck = NSButton(checkboxWithTitle: "启用缓冲模式（提交先暂存，手动确认上屏）", target: nil, action: nil)
+    private let resetOnAppSwitchCheck = NSButton(checkboxWithTitle: "切换到其他应用时清空缓冲区", target: nil, action: nil)
     private var candidateMetricFields: [CandidateWindowMetric: NSTextField] = [:]
     private var candidateMetricSteppers: [CandidateWindowMetric: NSStepper] = [:]
     private let chordDurationField = NSTextField(string: "")
@@ -69,6 +81,22 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         window?.makeKeyAndOrderFront(nil)
     }
 
+    /// Dev-only: render one settings page to a PNG by drawing the window's own
+    /// view hierarchy (no screen-recording permission needed). Used to preview
+    /// the UI without a live input session.
+    func renderForPreview(pageIndex: Int, to path: String) {
+        if window == nil { build() }
+        reload()
+        showPage(Page(rawValue: pageIndex) ?? .buffer)
+        guard let content = window?.contentView else { return }
+        content.layoutSubtreeIfNeeded()
+        content.display()
+        guard let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds) else { return }
+        content.cacheDisplay(in: content.bounds, to: rep)
+        try? rep.representation(using: .png, properties: [:])?
+            .write(to: URL(fileURLWithPath: path))
+    }
+
     // MARK: UI construction
 
     private func build() {
@@ -87,7 +115,12 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         sidebar.edgeInsets = NSEdgeInsets(top: 16, left: 12, bottom: 16, right: 12)
         sidebar.translatesAutoresizingMaskIntoConstraints = false
 
+        var lastGroup: String?
         for page in Page.allCases {
+            if page.group != lastGroup {
+                sidebar.addArrangedSubview(sidebarGroupHeader(page.group, first: lastGroup == nil))
+                lastGroup = page.group
+            }
             let button = NSButton(title: page.title, target: self, action: #selector(pageChosen(_:)))
             button.tag = page.rawValue
             button.bezelStyle = .regularSquare
@@ -156,6 +189,8 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
 
         bufferCheck.target = self
         bufferCheck.action = #selector(bufferToggled)
+        resetOnAppSwitchCheck.target = self
+        resetOnAppSwitchCheck.action = #selector(resetOnAppSwitchToggled)
 
         appearancePopUp.removeAllItems()
         for mode in RimeAppearanceMode.allCases {
@@ -264,7 +299,8 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         case .input: pageView = inputPage()
         case .candidateWindow: pageView = candidateWindowPage()
         case .buffer: pageView = bufferPage()
-        case .remote: pageView = remotePage()
+        case .connections: pageView = connectionsPage()
+        case .processors: pageView = processorsPage()
         case .maintenance: pageView = maintenancePage()
         }
         pageView.translatesAutoresizingMaskIntoConstraints = false
@@ -276,7 +312,17 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
             pageView.bottomAnchor.constraint(lessThanOrEqualTo: contentHost.bottomAnchor),
         ])
         if page == .maintenance { refreshStats() }
-        if page == .remote { refreshRemoteStatus() }
+        if page == .connections { refreshRemoteStatus() }
+    }
+
+    private func sidebarGroupHeader(_ title: String, first: Bool) -> NSView {
+        let label = NSTextField(labelWithString: title.uppercased())
+        label.font = .systemFont(ofSize: 10, weight: .semibold)
+        label.textColor = .tertiaryLabelColor
+        let wrap = NSStackView(views: [label])
+        wrap.orientation = .horizontal
+        wrap.edgeInsets = NSEdgeInsets(top: first ? 2 : 12, left: 6, bottom: 4, right: 6)
+        return wrap
     }
 
     private func inputPage() -> NSView {
@@ -382,35 +428,132 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         note.font = .systemFont(ofSize: 11)
         note.textColor = .tertiaryLabelColor
 
+        let resetNote = NSTextField(wrappingLabelWithString:
+            "开启后，焦点切到别的应用会清空未发送的暂存内容，避免缓冲内容跨应用残留。打开本设置窗不算切换应用。")
+        resetNote.font = .systemFont(ofSize: 11)
+        resetNote.textColor = .tertiaryLabelColor
+
+        let secureNote = NSTextField(wrappingLabelWithString:
+            "安全：当焦点位于密码框（系统安全输入生效）时，缓冲区内容不会被发送。此保护始终开启，无法关闭。")
+        secureNote.font = .systemFont(ofSize: 11)
+        secureNote.textColor = .tertiaryLabelColor
+
         return contentColumn([
             title("缓冲区"),
             caption("把提交内容先暂存，再由你确认发送到当前输入框。"),
             spacer(8),
+            sectionLabel("模式"),
             bufferCheck,
             note,
+            spacer(16),
+            sectionLabel("安全与清理"),
+            resetOnAppSwitchCheck,
+            resetNote,
+            spacer(8),
+            secureNote,
         ])
     }
 
-    private func remotePage() -> NSView {
+    private func connectionsPage() -> NSView {
         let applyNameBtn = NSButton(title: "应用名称", target: self, action: #selector(applyRemoteName))
         let nameRow = NSStackView(views: [remoteNameField, applyNameBtn])
         nameRow.orientation = .horizontal
         nameRow.alignment = .centerY
         nameRow.spacing = 8
 
+        let sourcesNote = NSTextField(wrappingLabelWithString:
+            "外部来源把文字送进缓冲区，需你逐条接受后才成为可发送的块。以下来源即将支持。")
+        sourcesNote.font = .systemFont(ofSize: 11)
+        sourcesNote.textColor = .tertiaryLabelColor
+
+        let sources = NSStackView(views: [
+            comingSoonRow("本地智能体（MCP）", "Claude Code / Codex 通过 MCP 推送草稿", "M2"),
+            comingSoonRow("HTTP 推送", "脚本经本地端口 POST 文字", "M2"),
+            comingSoonRow("SSE 订阅", "订阅外部事件流，流式进缓冲区", "M6"),
+            comingSoonRow("SSH", "远程主机命令输出流式进缓冲区", "M6"),
+        ])
+        sources.orientation = .vertical
+        sources.alignment = .leading
+        sources.spacing = 8
+
         return contentColumn([
-            title("隔空传字"),
-            caption("在已配对的 Mac 之间加密同步输入内容。"),
+            title("连接"),
+            caption("配对设备与外部来源的收发与信任，都在这里管理。"),
             spacer(8),
+            sectionLabel("配对设备（隔空传字）"),
             remoteCheck,
             remoteStatusLabel,
-            spacer(12),
-            sectionLabel("本机名称"),
+            spacer(8),
+            secondaryLabel("本机名称"),
             nameRow,
-            spacer(16),
-            sectionLabel("设备"),
+            spacer(6),
+            secondaryLabel("已配对设备"),
             remoteDevicesStack,
+            spacer(16),
+            sectionLabel("外部来源"),
+            sourcesNote,
+            sources,
         ])
+    }
+
+    private func processorsPage() -> NSView {
+        let note = NSTextField(wrappingLabelWithString:
+            "处理器在文字发送前对缓冲区内容做变换，结果作为新块回到缓冲区供你确认。以下处理器即将支持。")
+        note.font = .systemFont(ofSize: 11)
+        note.textColor = .tertiaryLabelColor
+
+        let procs = NSStackView(views: [
+            comingSoonRow("翻译", "Apple 设备端翻译，中英互译，本地运行", "M3"),
+            comingSoonRow("AI 润色 / 改写", "OpenAI 兼容接口，流式返回", "M4"),
+        ])
+        procs.orientation = .vertical
+        procs.alignment = .leading
+        procs.spacing = 8
+
+        return contentColumn([
+            title("处理器"),
+            caption("发送前把缓冲区文字翻译或用 AI 改写。"),
+            spacer(8),
+            sectionLabel("可用处理器"),
+            note,
+            procs,
+        ])
+    }
+
+    /// A disabled preview row for a not-yet-built connection/processor, with a
+    /// milestone tag so the settings window shows where the workbench is going
+    /// without pretending the control works yet.
+    private func comingSoonRow(_ name: String, _ detail: String, _ milestone: String) -> NSView {
+        let dot = NSView()
+        dot.wantsLayer = true
+        dot.layer?.backgroundColor = NSColor.tertiaryLabelColor.cgColor
+        dot.layer?.cornerRadius = 3
+        dot.translatesAutoresizingMaskIntoConstraints = false
+        dot.widthAnchor.constraint(equalToConstant: 6).isActive = true
+        dot.heightAnchor.constraint(equalToConstant: 6).isActive = true
+
+        let nameLabel = NSTextField(labelWithString: name)
+        nameLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        let detailLabel = NSTextField(labelWithString: detail)
+        detailLabel.font = .systemFont(ofSize: 11)
+        detailLabel.textColor = .secondaryLabelColor
+        let textCol = NSStackView(views: [nameLabel, detailLabel])
+        textCol.orientation = .vertical
+        textCol.alignment = .leading
+        textCol.spacing = 1
+
+        let tag = NSTextField(labelWithString: milestone)
+        tag.font = .monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
+        tag.textColor = .tertiaryLabelColor
+
+        let row = NSStackView(views: [dot, textCol, flexSpacer(), tag])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.widthAnchor.constraint(equalToConstant: 560).isActive = true
+        row.alphaValue = 0.7
+        return row
     }
 
     private func maintenancePage() -> NSView {
@@ -587,6 +730,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
             schemaApplyStatus.stringValue = "勾选项都会出现在 F4；至少保留一个。"
         }
         bufferCheck.state = BufferModel.shared.enabled ? .on : .off
+        resetOnAppSwitchCheck.state = BufferModel.shared.resetOnAppSwitch ? .on : .off
         if let idx = (0..<appearancePopUp.numberOfItems).first(where: {
             appearancePopUp.item(at: $0)?.representedObject as? String == RimeUI.appearance.rawValue
         }) {
@@ -599,7 +743,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     }
 
     func remoteStatusDidChange() {
-        guard selectedPage == .remote else { return }
+        guard selectedPage == .connections else { return }
         refreshRemoteStatus()
     }
 
@@ -790,6 +934,11 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
 
     private func shellQuote(_ value: String) -> String {
         "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
+    }
+
+    @objc private func resetOnAppSwitchToggled() {
+        BufferModel.shared.resetOnAppSwitch = resetOnAppSwitchCheck.state == .on
+        IMELog.write("setting resetOnAppSwitch=\(resetOnAppSwitchCheck.state == .on)")
     }
 
     @objc private func bufferToggled() {

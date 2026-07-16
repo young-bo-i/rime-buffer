@@ -42,6 +42,40 @@ if CommandLine.arguments.contains("--install") {
 if CommandLine.arguments.contains("--prepare-update") {
     exit(selectFallbackInputSourceForUpdate() ? 0 : 1)
 }
+// Dev-only: show the Settings window standalone (no IMK) so it can be reviewed
+// or screenshotted without a live input session. Not wired into the shipped
+// menus; invoked manually as `ETInput settings-preview`.
+if CommandLine.arguments.contains("settings-preview") {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.regular)
+    SettingsWindowController.shared.show()
+    app.activate(ignoringOtherApps: true)
+    app.run()
+}
+// Dev-only: `ETInput settings-render <dir>` writes page-N.png for every page.
+if let i = CommandLine.arguments.firstIndex(of: "settings-render"),
+   i + 1 < CommandLine.arguments.count {
+    let dir = CommandLine.arguments[i + 1]
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    app.finishLaunching()
+    for page in 0..<6 {
+        SettingsWindowController.shared.renderForPreview(
+            pageIndex: page, to: "\(dir)/page-\(page).png")
+    }
+    print("rendered settings pages to \(dir)")
+    exit(0)
+}
+// Dev-only: `ETInput panel-render <path>` writes the three-layer workbench bar.
+if let i = CommandLine.arguments.firstIndex(of: "panel-render"),
+   i + 1 < CommandLine.arguments.count {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    app.finishLaunching()
+    WorkbenchBarView.renderDemo(to: CommandLine.arguments[i + 1])
+    print("rendered workbench bar")
+    exit(0)
+}
 
 // IMK bootstrap. The connection name MUST match Info.plist; IMK finds our
 // controller via InputMethodServerControllerClass = RimeBufferController.
