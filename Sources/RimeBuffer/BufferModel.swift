@@ -32,6 +32,15 @@ final class BufferModel {
         blocks.map(\.text).joined()
     }
 
+    /// True when the buffer holds any block that came from outside (accepted
+    /// inbound / processor result), as opposed to the user's own typing. Such
+    /// content is deliberately staged to be delivered to ANOTHER app, so the
+    /// switch-app reset must not wipe it — that reset only guards against
+    /// locally-typed content lingering across app boundaries.
+    var holdsExternalContent: Bool {
+        blocks.contains { $0.origin != .rime }
+    }
+
     var stagedCharacterCount: Int {
         stagedText.count
     }
@@ -73,6 +82,14 @@ final class BufferModel {
     var resetOnAppSwitch: Bool {
         get { !UserDefaults.standard.bool(forKey: "bufferKeepOnAppSwitch") }
         set { UserDefaults.standard.set(!newValue, forKey: "bufferKeepOnAppSwitch") }
+    }
+
+    /// Stage text that came from outside (an accepted inbound item). Turns the
+    /// buffer transiently active so the block shows and Enter can commit it,
+    /// without flipping the user's persistent buffer-mode setting.
+    func stageExternal(_ text: String, origin: Origin) {
+        transientEnabled = true
+        append(text, origin: origin)
     }
 
     func append(_ text: String, origin: Origin = .rime) {

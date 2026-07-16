@@ -1,0 +1,145 @@
+import Foundation
+
+/// How much an external source is trusted. Per the security review, an MCP
+/// client's self-reported name is NOT verifiable, so MCP/HTTP/SSE default to
+/// `.ask` (every item waits for a manual accept). Marine keeps its current
+/// auto-into-buffer behavior via `.trusted` during the migration window.
+enum SourceTrust: String {
+    case ask       // item waits in the inbound rail for manual accept
+    case trusted   // item drops straight into the buffer (never auto-delivered)
+    case blocked   // item is discarded
+}
+
+/// A single item offered by an external source, awaiting the user's decision.
+struct InboundItem: Identifiable, Equatable {
+    let id: UUID
+    let origin: Origin
+    var title: String?
+    var text: String
+    var streaming: Bool
+    var state: State
+    let createdAt: Date
+
+    enum State: Equatable { case pending, accepted, rejected }
+
+    init(id: UUID = UUID(), origin: Origin, title: String? = nil, text: String,
+         streaming: Bool = false, state: State = .pending, createdAt: Date = Date()) {
+        self.id = id; self.origin = origin; self.title = title; self.text = text
+        self.streaming = streaming; self.state = state; self.createdAt = createdAt
+    }
+}
+
+/// Aggregates every external source, applies per-source gating, and holds the
+/// items awaiting acceptance. Providers (MCP/HTTP/SSE/SSH) call `submit`/stream
+/// methods; the inbound-rail UI reads `pending` and calls `accept`/`reject`.
+/// Called on the main thread (like BufferModel); providers hop to main before
+/// submitting.
+final class InboundBus {
+    static let shared = InboundBus()
+
+    /// Hard caps so a chatty or hostile local process can't exhaust memory / UI.
+    /// (RemotePeer has its own pendingCap=50; the gateway needs the same guard.)
+    static let maxPending = 50
+    static let maxTextCount = 20_000
+
+    private(set) var pending: [InboundItem] = []
+    private var streamItemID: [String: UUID] = [:]   // provider streamID -> item id
+    var onChange: (() -> Void)?
+
+    var pendingCount: Int { pending.count }
+
+    /// Default trust per source family. Persisted overrides land in M2's
+    /// connections settings page; for now these are the ship defaults.
+    func trust(for origin: Origin) -> SourceTrust {
+        switch origin {
+        case .marine: return .trusted           // preserve current Marine flow
+        case .mcp, .http, .sse, .ssh: return .ask
+        case .rime, .remotePeer: return .ask    // shouldn't arrive here; be safe
+        }
+    }
+
+    /// Offer a complete item. Returns its id when it lands in the rail as
+    /// pending, or nil when it was auto-accepted (trusted) or dropped.
+    @discardableResult
+    func submit(origin: Origin, text: String, title: String? = nil) -> UUID? {
+        let clean = String(text.prefix(Self.maxTextCount))
+        guard !clean.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        switch trust(for: origin) {
+        case .blocked:
+            IMELog.write("inbound dropped origin=\(origin.tag) chars=\(clean.count) (blocked)")
+            return nil
+        case .trusted:
+            BufferModel.shared.stageExternal(clean, origin: origin)
+            IMELog.write("inbound trusted->buffer origin=\(origin.tag) chars=\(clean.count)")
+            return nil
+        case .ask:
+            guard pending.count < Self.maxPending else {
+                IMELog.write("inbound dropped origin=\(origin.tag) (pending cap \(Self.maxPending))")
+                return nil
+            }
+            let item = InboundItem(origin: origin, title: title, text: clean)
+            pending.append(item)
+            IMELog.write("inbound pending+ origin=\(origin.tag) chars=\(clean.count) count=\(pending.count)")
+            onChange?()
+            return item.id
+        }
+    }
+
+    // MARK: streaming (SSE / MCP stream tools)
+
+    /// Open a streaming placeholder item. Trusted sources still stream into the
+    /// rail (not straight to buffer) so partial text stays reviewable.
+    @discardableResult
+    func beginStream(origin: Origin, streamID: String, title: String? = nil) -> UUID? {
+        guard trust(for: origin) != .blocked else { return nil }
+        guard pending.count < Self.maxPending else { return nil }
+        let item = InboundItem(origin: origin, title: title, text: "", streaming: true)
+        streamItemID[streamID] = item.id
+        pending.append(item)
+        IMELog.write("inbound stream begin origin=\(origin.tag) stream=\(streamID)")
+        onChange?()
+        return item.id
+    }
+
+    func appendStream(streamID: String, delta: String) {
+        guard let id = streamItemID[streamID],
+              let idx = pending.firstIndex(where: { $0.id == id }) else { return }
+        pending[idx].text = String((pending[idx].text + delta).prefix(Self.maxTextCount))
+        onChange?()
+    }
+
+    func endStream(streamID: String) {
+        guard let id = streamItemID.removeValue(forKey: streamID),
+              let idx = pending.firstIndex(where: { $0.id == id }) else { return }
+        pending[idx].streaming = false
+        IMELog.write("inbound stream end stream=\(streamID) chars=\(pending[idx].text.count)")
+        onChange?()
+    }
+
+    // MARK: user decisions
+
+    /// Accept an item: it becomes a buffer block carrying its origin. A still-
+    /// streaming item accepts a snapshot and keeps streaming into a fresh item.
+    func accept(_ id: UUID) {
+        guard let idx = pending.firstIndex(where: { $0.id == id }) else { return }
+        let item = pending[idx]
+        BufferModel.shared.stageExternal(item.text, origin: item.origin)
+        IMELog.write("inbound accepted origin=\(item.origin.tag) chars=\(item.text.count)")
+        if !item.streaming { pending.remove(at: idx) }
+        onChange?()
+    }
+
+    func reject(_ id: UUID) {
+        guard let idx = pending.firstIndex(where: { $0.id == id }) else { return }
+        streamItemID = streamItemID.filter { $0.value != id }
+        IMELog.write("inbound rejected origin=\(pending[idx].origin.tag)")
+        pending.remove(at: idx)
+        onChange?()
+    }
+
+    func clear() {
+        pending.removeAll()
+        streamItemID.removeAll()
+        onChange?()
+    }
+}

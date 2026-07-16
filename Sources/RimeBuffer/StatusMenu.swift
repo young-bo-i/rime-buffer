@@ -46,6 +46,13 @@ final class StatusMenu {
         settings.target = target
         menu.addItem(settings)
 
+        let inbox = NSMenuItem(
+            title: "外部来源收件箱…",
+            action: #selector(RimeBufferController.openInboundTrayFromInputMenu(_:)),
+            keyEquivalent: "")
+        inbox.target = target
+        menu.addItem(inbox)
+
         let workbench = NSMenuItem(
             title: "工作台预览（开发）…",
             action: #selector(RimeBufferController.openWorkbenchPreviewFromInputMenu(_:)),
@@ -98,6 +105,10 @@ final class StatusMenu {
 
     func openWorkbenchPreview() {
         WorkbenchBarView.showPreviewWindow()
+    }
+
+    func openInboundTray() {
+        InboundTrayWindow.shared.show()
     }
 
     func checkUpdate() {

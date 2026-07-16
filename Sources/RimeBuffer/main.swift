@@ -26,6 +26,9 @@ if CommandLine.arguments.contains("matrix-smoke") {
 if CommandLine.arguments.contains("origin-smoke") {
     exit(runOriginSmokeTest() ? 0 : 1)
 }
+if CommandLine.arguments.contains("inbound-smoke") {
+    exit(runInboundBusSmokeTest() ? 0 : 1)
+}
 if CommandLine.arguments.contains("smoke") {
     exit(runEngineSmokeTest() ? 0 : 1)
 }
@@ -76,6 +79,24 @@ if let i = CommandLine.arguments.firstIndex(of: "panel-render"),
     print("rendered workbench bar")
     exit(0)
 }
+// Dev-only: `ETInput gateway-serve` runs the local gateway + a runloop and prints
+// each inbound event, so the productized HTTP/MCP path can be exercised by curl
+// and the real `claude` client without the full IMK bootstrap.
+if CommandLine.arguments.contains("gateway-serve") {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    app.finishLaunching()
+    BufferModel.shared.deliver = { _, _ in true }
+    InboundBus.shared.onChange = {
+        let p = InboundBus.shared.pending
+        print("[inbound] pending=\(p.count) latest=\(p.last.map { "\($0.origin.tag):\($0.text.count)chars streaming=\($0.streaming)" } ?? "-")")
+        fflush(stdout)
+    }
+    LocalGateway.shared.start()
+    print("gateway-serve on 127.0.0.1:\(LocalGateway.shared.port) token=\(GatewayToken.current())")
+    fflush(stdout)
+    app.run()
+}
 
 // IMK bootstrap. The connection name MUST match Info.plist; IMK finds our
 // controller via InputMethodServerControllerClass = RimeBufferController.
@@ -114,6 +135,15 @@ BufferModel.shared.onChange = {
     RimeBufferController.refreshBufferDisplayForCurrentOrRecent()
 }
 candidateWindow.refreshBuffer()
+
+// Local gateway: accept MCP / HTTP pushes from local agents into the inbound
+// bus (loopback-only, token-gated). Off is a one-line setting.
+InboundBus.shared.onChange = {
+    InboundTrayWindow.refreshIfOpen()
+    InboundToast.shared.update(pendingCount: InboundBus.shared.pendingCount,
+                               trayVisible: InboundTrayWindow.isVisible)
+}
+LocalGateway.shared.startIfEnabled()
 
 // No standalone NSStatusItem: ETInput's commands are supplied by
 // RimeBufferController.menu() under the system input-source icon.
@@ -196,11 +226,13 @@ NSWorkspace.shared.notificationCenter.addObserver(
     // marked text. No-op when the switch was already handled normally.
     RimeBufferController.active?.forceCommit()
 
-    // Reset staged buffer when focus leaves for a DIFFERENT app. Our own
-    // windows (Settings, pairing prompts) activate us via NSApp.activate and
-    // must NOT count as an app switch, or opening Settings would wipe the
-    // buffer. Filter on the activated app's bundle id.
-    if BufferModel.shared.resetOnAppSwitch {
+    // Reset staged buffer when focus leaves for a DIFFERENT app — but ONLY
+    // locally-typed content. Two exceptions:
+    //  · our own windows (Settings, inbox, pairing) activate us via
+    //    NSApp.activate; filtering our bundle keeps opening them from self-wiping.
+    //  · externally-accepted content (MCP/HTTP/远端) is staged precisely to be
+    //    delivered to another app, so switching to that app must NOT wipe it.
+    if BufferModel.shared.resetOnAppSwitch, !BufferModel.shared.holdsExternalContent {
         let activated = (note.userInfo?[NSWorkspace.applicationUserInfoKey]
             as? NSRunningApplication)?.bundleIdentifier
         let own = Bundle.main.bundleIdentifier
@@ -776,6 +808,99 @@ func runCandidateMatrixSmokeTest() -> Bool {
 /// forever (or, the other way, that a legitimately-typed block silently fails
 /// to reach the other Mac). Also checks the block-origin plumbing: appended
 /// text carries its origin, and the send path can read it back.
+/// Pins the inbound gating: trusted sources drop straight to the buffer, `ask`
+/// sources wait as pending, blocked sources vanish, the pending cap holds, and
+/// accept moves an item into the buffer carrying its origin. A wrong verdict
+/// here would let unverified external text reach the buffer without review.
+func runInboundBusSmokeTest() -> Bool {
+    print("== RimeBuffer inbound bus smoke test ==")
+    let bus = InboundBus.shared
+    let model = BufferModel.shared
+    let oldEnabled = model.enabled
+    let oldDeliver = model.deliver
+    defer { model.clear(); bus.clear(); model.enabled = oldEnabled; model.deliver = oldDeliver }
+    model.deliver = { _, _ in true }
+    model.enabled = true
+    model.clear(); bus.clear()
+
+    // Trust defaults: mcp/http = ask, marine = trusted.
+    guard bus.trust(for: .mcp(client: "x")) == .ask,
+          bus.trust(for: .http(source: "s")) == .ask,
+          bus.trust(for: .marine) == .trusted else {
+        print("FAILED: trust defaults wrong")
+        return false
+    }
+
+    // ask source → pending, NOT in the buffer yet.
+    let id = bus.submit(origin: .mcp(client: "codex"), text: "草稿一", title: "t")
+    guard let id, bus.pendingCount == 1, model.blocks.isEmpty else {
+        print("FAILED: ask source should wait in pending, not enter buffer")
+        return false
+    }
+    // trusted source → straight to buffer, no pending.
+    _ = bus.submit(origin: .marine, text: "marine 草稿")
+    guard bus.pendingCount == 1, model.blocks.count == 1,
+          model.blocks[0].origin == .marine else {
+        print("FAILED: trusted source should drop into buffer")
+        return false
+    }
+    // accept the pending mcp item → becomes a buffer block with mcp origin.
+    bus.accept(id)
+    guard bus.pendingCount == 0, model.blocks.count == 2,
+          model.blocks.contains(where: { $0.origin == .mcp(client: "codex") }) else {
+        print("FAILED: accept should move item into buffer with its origin")
+        return false
+    }
+    // Externally-staged content must be marked so the switch-app reset spares it
+    // (otherwise focusing the target field wipes what MCP/远端 just delivered).
+    guard model.holdsExternalContent else {
+        print("FAILED: buffer with external blocks must report holdsExternalContent")
+        return false
+    }
+    // reject removes without touching the buffer.
+    let rid = bus.submit(origin: .http(source: "s"), text: "拒绝我")
+    bus.reject(rid!)
+    guard bus.pendingCount == 0, model.blocks.count == 2 else {
+        print("FAILED: reject should drop the item, not deliver it")
+        return false
+    }
+
+    // Streaming: text updates in place, one pending item, endStream settles it.
+    model.clear(); bus.clear()
+    _ = bus.beginStream(origin: .mcp(client: "a"), streamID: "s1")
+    bus.appendStream(streamID: "s1", delta: "部分")
+    bus.appendStream(streamID: "s1", delta: "文本")
+    guard bus.pendingCount == 1, bus.pending[0].text == "部分文本", bus.pending[0].streaming else {
+        print("FAILED: streaming should update one item in place")
+        return false
+    }
+    bus.endStream(streamID: "s1")
+    guard !bus.pending[0].streaming else {
+        print("FAILED: endStream should settle the item")
+        return false
+    }
+
+    // Pending cap holds.
+    bus.clear()
+    for i in 0..<(InboundBus.maxPending + 10) { _ = bus.submit(origin: .mcp(client: "a"), text: "x\(i)") }
+    guard bus.pendingCount == InboundBus.maxPending else {
+        print("FAILED: pending cap not enforced, got \(bus.pendingCount)")
+        return false
+    }
+
+    // A purely locally-typed buffer must NOT count as external, so the switch-
+    // app reset still clears normal typing.
+    model.clear(); bus.clear()
+    model.append("本地打字")   // origin defaults to .rime
+    guard !model.holdsExternalContent else {
+        print("FAILED: locally-typed buffer must not report holdsExternalContent")
+        return false
+    }
+
+    print("inbound bus smoke OK")
+    return true
+}
+
 func runOriginSmokeTest() -> Bool {
     print("== RimeBuffer origin/echo smoke test ==")
 

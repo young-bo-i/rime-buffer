@@ -48,6 +48,9 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     private let appearancePopUp = NSPopUpButton()
     private let bufferCheck = NSButton(checkboxWithTitle: "启用缓冲模式（提交先暂存，手动确认上屏）", target: nil, action: nil)
     private let resetOnAppSwitchCheck = NSButton(checkboxWithTitle: "切换到其他应用时清空缓冲区", target: nil, action: nil)
+    private let gatewayEnableCheck = NSButton(checkboxWithTitle: "启用本地网关（127.0.0.1，仅回环，Token 鉴权）", target: nil, action: nil)
+    private let gatewayCommandField = NSTextField(string: "")
+    private let gatewayCopyButton = NSButton(title: "复制接入命令", target: nil, action: nil)
     private var candidateMetricFields: [CandidateWindowMetric: NSTextField] = [:]
     private var candidateMetricSteppers: [CandidateWindowMetric: NSStepper] = [:]
     private let chordDurationField = NSTextField(string: "")
@@ -191,6 +194,17 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         bufferCheck.action = #selector(bufferToggled)
         resetOnAppSwitchCheck.target = self
         resetOnAppSwitchCheck.action = #selector(resetOnAppSwitchToggled)
+        gatewayEnableCheck.target = self
+        gatewayEnableCheck.action = #selector(gatewayToggled)
+        gatewayCommandField.isEditable = false
+        gatewayCommandField.isSelectable = true
+        gatewayCommandField.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        gatewayCommandField.lineBreakMode = .byCharWrapping
+        gatewayCommandField.maximumNumberOfLines = 4
+        gatewayCommandField.translatesAutoresizingMaskIntoConstraints = false
+        gatewayCommandField.widthAnchor.constraint(equalToConstant: 560).isActive = true
+        gatewayCopyButton.target = self
+        gatewayCopyButton.action = #selector(copyGatewayCommand)
 
         appearancePopUp.removeAllItems()
         for mode in RimeAppearanceMode.allCases {
@@ -462,19 +476,17 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         nameRow.spacing = 8
 
         let sourcesNote = NSTextField(wrappingLabelWithString:
-            "外部来源把文字送进缓冲区，需你逐条接受后才成为可发送的块。以下来源即将支持。")
+            "本地智能体（MCP）和脚本（HTTP）把文字送进缓冲区收件箱，需你逐条确认后才成为可发送的块。")
         sourcesNote.font = .systemFont(ofSize: 11)
         sourcesNote.textColor = .tertiaryLabelColor
 
-        let sources = NSStackView(views: [
-            comingSoonRow("本地智能体（MCP）", "Claude Code / Codex 通过 MCP 推送草稿", "M2"),
-            comingSoonRow("HTTP 推送", "脚本经本地端口 POST 文字", "M2"),
+        let laterSources = NSStackView(views: [
             comingSoonRow("SSE 订阅", "订阅外部事件流，流式进缓冲区", "M6"),
             comingSoonRow("SSH", "远程主机命令输出流式进缓冲区", "M6"),
         ])
-        sources.orientation = .vertical
-        sources.alignment = .leading
-        sources.spacing = 8
+        laterSources.orientation = .vertical
+        laterSources.alignment = .leading
+        laterSources.spacing = 8
 
         return contentColumn([
             title("连接"),
@@ -490,10 +502,31 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
             secondaryLabel("已配对设备"),
             remoteDevicesStack,
             spacer(16),
-            sectionLabel("外部来源"),
+            sectionLabel("本地网关（MCP / HTTP 接入）"),
+            gatewayEnableCheck,
             sourcesNote,
-            sources,
+            spacer(6),
+            secondaryLabel("接入命令（贴进终端，让本地智能体接上）"),
+            gatewayCommandField,
+            gatewayCopyButton,
+            spacer(16),
+            sectionLabel("更多来源"),
+            laterSources,
         ])
+    }
+
+    private func gatewayCommand() -> String {
+        "claude mcp add --transport http etinput http://127.0.0.1:\(LocalGateway.shared.port)/mcp "
+            + "--header \"Authorization: Bearer \(GatewayToken.current())\""
+    }
+
+    @objc private func gatewayToggled() {
+        LocalGateway.shared.enabled = gatewayEnableCheck.state == .on
+    }
+
+    @objc private func copyGatewayCommand() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(gatewayCommand(), forType: .string)
     }
 
     private func processorsPage() -> NSView {
@@ -731,6 +764,8 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         }
         bufferCheck.state = BufferModel.shared.enabled ? .on : .off
         resetOnAppSwitchCheck.state = BufferModel.shared.resetOnAppSwitch ? .on : .off
+        gatewayEnableCheck.state = LocalGateway.shared.enabled ? .on : .off
+        gatewayCommandField.stringValue = gatewayCommand()
         if let idx = (0..<appearancePopUp.numberOfItems).first(where: {
             appearancePopUp.item(at: $0)?.representedObject as? String == RimeUI.appearance.rawValue
         }) {
