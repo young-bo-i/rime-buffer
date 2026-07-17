@@ -482,7 +482,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
 
     private func bufferPage() -> NSView {
         let note = NSTextField(wrappingLabelWithString:
-            "缓冲区开启后，Rime 提交内容会进入独立工作台；轻按 Enter 发送下一块，长按 1.2 秒发送全部。发送后的块仍保留并标记，手动清空可撤销；下方隐私清理例外。")
+            "缓冲区开启后，Rime 提交内容会进入单行缓冲条；轻按 Enter 发送下一块，长按 1.2 秒发送全部。成功发送的块会立即消失，并保留在最近 50 条进程内历史中供显式恢复；发送失败或尚未发送的块不会丢失。")
         note.font = .systemFont(ofSize: 11)
         note.textColor = .tertiaryLabelColor
 
@@ -1083,7 +1083,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
 
     @objc private func reinstallInputMethod() {
         guard let script = installScriptURL() else {
-            info("找不到 build_install.sh。默认查找：~/Documents/DEV/rime-buffer 或 ~/Documents/05-dev/apps/rime-buffer。")
+            info("找不到 build_install.sh。默认查找：~/Documents/DEV/rime-buffer-1、~/Documents/05-dev/apps/rime-buffer-1 或旧版 rime-buffer 目录。")
             return
         }
 
@@ -1099,7 +1099,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
 
         let command = [
             "cd \(shellQuote(script.deletingLastPathComponent().path))",
-            "nohup /bin/bash ./build_install.sh > \(shellQuote(installLogURL.path)) 2>&1 &",
+            "nohup env RB_KEEP_USERDB=1 /bin/bash ./build_install.sh > \(shellQuote(installLogURL.path)) 2>&1 &",
         ].joined(separator: " && ")
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
@@ -1117,6 +1117,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     private func installScriptURL() -> URL? {
         let home = URL(fileURLWithPath: NSHomeDirectory())
         let candidates = [
+            home.appendingPathComponent("Documents/DEV/rime-buffer-1/build_install.sh"),
             home.appendingPathComponent("Documents/05-dev/apps/rime-buffer-1/build_install.sh"),
             home.appendingPathComponent("Documents/DEV/rime-buffer/build_install.sh"),
             home.appendingPathComponent("Documents/05-dev/apps/rime-buffer/build_install.sh"),

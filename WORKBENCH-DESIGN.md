@@ -5,7 +5,9 @@
 上游输入：`new-rime.pen` 七张探索稿（wBwdM/XKzFo/e9aJFL/FBS3A/rulod/BMbRV/S0d7w）+ 产品负责人 2026-07-16 口头需求收敛
 关系：本文档记录工作台路线与历史裁决；`new-rime.pen` 是视觉参考；`ARCHITECTURE.md` 是 P1 时代交接文档。运行时事实与本文冲突时以 `SYSTEM-ARCHITECTURE.md` 为准。
 
-> 2026-07-17 决策覆盖：缓冲区不再内嵌于跟随 caret 的候选 panel，而是独立、可拖动/缩放/关闭/常显的被动窗口。候选与 preedit 默认固定投影进该窗口，仍复用 `CandidateWindow` 状态机；可在设置中切回跟随 caret。块级显式编辑、发送历史恢复与清空撤销纳入 v1。
+> 2026-07-17 早期决策（已被下一条覆盖）：缓冲区从候选 panel 拆成独立工作台，曾采用内嵌候选投影、全文预览与发送后留块方案。
+>
+> **2026-07-17 紧凑条覆盖决策（当前）**：工作台折叠为 44pt 单行细条，全部功能（含发送、清空）从细条向上展开到总高 78pt，展开前后底边与候选锚点不动；圆角材质内缩并以 backing-scale hairline 避免边缘裁剪毛边。缓冲模式复用常规 `CandidateWindow` 面板与样式，默认锚定在细条下方。普通/Shift+Return 与 Backspace 在缓冲模式下永不落到宿主文本框；有未决组字时，本次 Return 只收束为块，否则轻按发送下一块、按住约 1.2 秒发送全部，2px 进度线沿细条底部显示按住状态。展开工具层的纸飞机保留为显式发送全部入口。成功发送的 block 立即从 live buffer 消失，同时进入最近 50 条进程内历史供显式恢复，失败和未发送 block 原位保留。本文后续若仍描述“候选投影 / 全文预览 / 已发送对号留块”，均视为历史方案。
 
 ---
 
@@ -39,6 +41,8 @@
 
 ### 1.1 独立缓冲工作台（缓冲模式主交互面）
 
+下图是三轨产品路线的历史结构参考；当前运行时折叠为 44pt 单行缓冲条，功能层向上展开后总高 78pt，候选使用条下方的常规候选窗，传入轨仍由独立收件箱承载。
+
 ```
 ┌────────────────────────────────────────────────┐
 │ ① 传入轨  MCP·Claude ⋯ HTTP脚本  待接收 3         │  ← 外部数据源（后续嵌入）
@@ -49,20 +53,20 @@
 └────────────────────────────────────────────────┘
 ```
 
-实现载体：`BufferWindowController` 拥有独立 `nonactivatingPanel`，其中组合候选投影、只读全文预览、`BufferInlineView` 与历史操作。面板可拖动、缩放、关闭、固定到所有桌面/全屏空间，frame 持久化并在多屏变化后校正。`CandidateWindow` 继续独占候选状态与翻页逻辑：普通模式显示 caret 面板；工作台模式发布带 `FocusToken` 的投影并隐藏 caret 面板。
+实现载体：`BufferWindowController` 拥有独立 `nonactivatingPanel`。折叠态是 44pt 的 `BufferInlineView` 单行主条，只保留缓冲轨与展开入口；目标状态、发送、清空及其余按钮统一放在向上工具层，展开后总高 78pt。切换展开态时保持窗口底边不动，因此条下方候选锚点稳定；面板可拖动、调整宽度、关闭、固定到所有桌面/全屏空间，frame 与展开态持久化并在多屏变化后校正。圆角材质层内缩到透明窗口边距，边框按 backing scale 在路径内画 hairline，避免边缘/圆角裁剪毛边。`CandidateWindow` 继续独占候选状态、视觉与翻页逻辑：普通模式锚定 caret，缓冲模式默认把同一个 panel 锚定在细条下方。
 
 各层职责：
 
 - **① 传入轨（后续）**：当前外部待决项仍在 `InboundTrayWindow` 接受/拒绝，异步来源不得自行拉起工作台。未来可作为工作台内固定高度区域加入。
-- **② 缓冲轨（已实现基础）**：块 chips、来源徽标、待发送/已尝试发送状态、插入点、长按 1.2 秒全发、清空。发送后不自动删除，因为 IMK 没有宿主 ACK；历史可恢复为待发送。
-- **③ 候选区（已实现投影）**：候选、preedit、矩阵/单字选择都从同一状态机投影；任何点击必须携带当前 `FocusToken`，过期动作无效。
+- **② 缓冲轨（已实现基础）**：主条只显示待发送块 chips、来源徽标、插入点、Enter 长按进度与展开入口。清空、历史和纸飞机等显式功能收进向上工具层；轻按 Enter 发送下一块，按住约 1.2 秒或点击纸飞机发送全部。成功发送后 block 从 live rail 消失；失败和未发送 block 保留，历史菜单可显式恢复。
+- **③ 候选区（已实现常规面板复用）**：候选、preedit、矩阵/单字选择始终由同一个 `CandidateWindow` 呈现；缓冲模式只把锚点移到细条下方，任何点击仍必须携带当前 `FocusToken`，过期动作无效。
 - **编辑与隐私（已实现）**：单块编辑使用独立 key window，输入法对自身编辑器绕过缓冲捕获；被动工作台不抢外部焦点。支持临时遮蔽、secure-input 遮蔽、会话锁定隐藏。
 
 ### 1.2 用户故事（验收场景）
 
-1. **打字暂存**（现状不回归）：缓冲模式下打字 → 候选/preedit 固定显示在工作台 → commit 成块 → Enter 短按逐块上屏 / 长按 1.2s 全发。窗口与内容跨文本框保留，但发送目标只认当前实时焦点。
-2. **智能体推稿**：Claude Code / Codex 通过 MCP 调 `buffer_push` → 当前由专用 toast/`InboundTrayWindow` 显示「MCP · <来源名>」待决项 → 用户点接受 → 成为带来源徽标的块 → Enter 上屏到微信输入框。传入轨嵌入工作台是后续 UI 路线图。
-3. **翻译**：选中/框选缓冲区里的块 → 点「翻译」→ 处理胶囊转圈计时 → 结果块出现（原块保留）→ 用户按 Enter 发结果块。
+1. **打字暂存**（现状不回归）：缓冲模式下打字 → 常规候选窗显示在细条下方 → commit 成块。有未决组字时，本次普通/Shift+Return 只收束为块；没有组字时轻按发送下一块、按住约 1.2 秒发送全部。Backspace 只编辑 Rime/缓冲；两个键在任何引擎/焦点状态下都绝不影响宿主文本框。焦点不可信时只吞不投递；引擎故障但没有未决组字时，已有块仍可发送。发送目标只认 Return keyDown 绑定且当前仍有效的精确焦点；成功块立即离开 live rail。
+2. **智能体推稿**：Claude Code / Codex 通过 MCP 调 `buffer_push` → 当前由专用 toast/`InboundTrayWindow` 显示「MCP · <来源名>」待决项 → 用户点接受 → 成为带来源徽标的块 → 轻按 Enter 逐块发送，或长按/点击纸飞机发送全部到微信输入框。传入轨嵌入工作台是后续 UI 路线图。
+3. **翻译**：选中/框选缓冲区里的块 → 点「翻译」→ 处理胶囊转圈计时 → 结果块出现（原块保留）→ 用户用 Enter 手势或展开层纸飞机发送结果块。
 4. **AI 润色**：同上，处理器换成 AI；SSE 流式期间**只更新同一个结果块**的文字，不产生逐 token 的碎块。
 5. **隔空传字（收）**：配对 Mac 发来文字 → 沿既有加密直通路径上屏；若当前没有可用目标则累积到剪贴板。该产品例外不进入缓冲或传入轨（§12.1）。
 6. **安全底线**：焦点在密码框（系统 secure input 生效）时，工作台遮蔽且发送被 `Delivery.insert` 拒绝，缓冲区任何内容不会被投递。当前收件箱的「接受」只把条目放进缓冲，因此不禁用也不显示锁标。
@@ -71,7 +75,7 @@
 
 - **非配对外部文字按当前固定门控进入收件箱或缓冲**：MCP/HTTP/SSE/SSH 为「询问」，Marine 为「信任」；无论哪一种都**永不**自动上屏。按来源自定义信任是后续能力；配对设备维持直通例外。
 - **一切处理器结果先回缓冲区成为结果块**，绝不直接上屏。
-- **缓冲内容、非配对外部文字与未来处理器结果的上屏只由用户 Enter/发送触发**。缓冲关闭时的普通 Rime commit，以及配对设备的既有直通收字，是明确例外。
+- **缓冲内容、非配对外部文字与未来处理器结果只由用户明确触发上屏**：没有未决组字时，普通/Shift+Return 轻按发送下一块、按住约 1.2 秒发送全部；展开工具层的纸飞机也可发送全部。有未决组字的 Return 只收束为块，同一物理按键绝不顺带投递。缓冲关闭时的普通 Rime commit，以及配对设备的既有直通收字，是明确例外。
 - **secure input 激活时投递路径整体禁用**。
 
 ---
@@ -134,6 +138,7 @@ struct TransformJob: Identifiable {
 struct DeliveryRecord {
     let id: UUID
     let blocks: [Block]
+    let originalOrder: [UUID]
     let targetBundleID: String
     let targetName: String
     let sentAt: Date
@@ -162,7 +167,7 @@ struct DeliveryRecord {
  [计划]服务器 ─SSE────▶ SSEProvider ──┤                    │ 接受         │
  [计划]远程主机 ─SSH──▶ SSHProvider ──┘                    ▼              │
  Marine(兼容期) ─轮询─▶ MarineBridge ───────────────▶ BufferModel         │
-                       │                                  │ Enter/发送    │
+                       │                           │ Enter手势/显式纸飞机 │
                        │                                  ▼               │
                        │                       BufferDeliveryCoordinator  │
                        │                                  │               │
@@ -180,7 +185,7 @@ struct DeliveryRecord {
 
 | 模块 | 新/改 | 文件 | 职责 |
 |---|---|---|---|
-| BufferModel | 已实现 | `BufferModel.swift` | blocks 存储、插入点、发送标记、内存历史、撤销清空 |
+| BufferModel | 已实现 | `BufferModel.swift` | live blocks、插入点、成功消费、内存历史、撤销清空 |
 | InboundBus | 已实现 | `Inbound/InboundBus.swift` | 汇聚当前 MCP/HTTP，执行固定门控，产出 InboundItem |
 | SourceProvider 协议 | [计划] | `Inbound/SourceProvider.swift` | 未来 provider 的 `start()/stop()`、事件回调、健康状态 |
 | LocalGateway + MCP | 已实现 | `Inbound/LocalGateway.swift` | 本地 HTTP 服务器；stateless MCP POST + HTTP push + health |
@@ -193,10 +198,10 @@ struct DeliveryRecord {
 | TranslationProcessor | [计划 M3] | `Processors/TranslationProcessor.swift` | Apple Translation（macOS 15+，见 §5.2 风险） |
 | AIProcessor | [计划 M4] | `Processors/AIProcessor.swift` | OpenAI 兼容 chat/completions，SSE 流式 |
 | FocusCoordinator | 新（已实现） | `InputFocusCoordinator.swift` | FocusToken、client 租约、前台与对象身份校验 |
-| BufferDeliveryCoordinator | 新（已实现） | `BufferDeliveryCoordinator.swift` | 逐块复核目标、保留块、写内存发送历史 |
+| BufferDeliveryCoordinator | 新（已实现） | `BufferDeliveryCoordinator.swift` | 逐块复核目标、成功块消费、失败后缀保留、写内存发送历史 |
 | DeliveryRouter | 后续 | `Delivery.swift` → `Delivery/DeliveryRouter.swift` | 多目标、远端 ACK、持久账本 |
-| 独立工作台 | 新（已实现） | `BufferWindowController.swift` + `BufferInlineView.swift` | 被动窗口、候选投影、编辑/历史/多屏/隐私 |
-| 候选状态机 | 改（已实现） | `CandidateWindow.swift` | caret 呈现与 token 化工作台投影共用状态 |
+| 独立工作台 | 新（已实现） | `BufferWindowController.swift` + `BufferInlineView.swift` | 44pt 单行主条、向上展开至 78pt、编辑/历史菜单/多屏/隐私 |
+| 候选状态机 | 改（已实现） | `CandidateWindow.swift` | 同一个常规 panel 锚定 caret 或缓冲条下方 |
 | 设置窗 | 六页已实现，后续再拆 | `SettingsWindow.swift` | 当前 IA 见 §8；来源信任/投递页仍属路线图 |
 
 ### 3.2 并发模型（现有代码最硬的墙，正面拆）
@@ -323,8 +328,8 @@ protocol Processor {
 ### 6.2 当前本地投递基线与后续 Router
 
 - 当前本地投递由 `BufferDeliveryCoordinator` 负责：每块发送前重验同一 token；焦点变化立即停止。
-- `Delivery.insert` 调用成功只表示 IMKit 接受调用，不是宿主 ACK。因此块保留并标记 `lastSentAt`，局部失败重试跳过已尝试前缀。
-- 最近 50 条发送快照只在当前进程内，可从工作台历史下拉列表选择并恢复为待发送；显式清空也可撤销一次。跨 app 隐私清理则不可撤销，并同时删除内存历史。
+- `Delivery.insert` 调用成功只表示 IMKit 接受调用，不是宿主 ACK；当前产品仍在成功返回后立即把该 block 从 live buffer 消费并记入历史。局部失败立即停止，失败 block 和尚未发送后缀原位保留。
+- 最近 50 条发送快照只在当前进程内，可从工作台历史菜单显式恢复为待发送，并依靠 `originalOrder` 回到仍存活块之间的原相对位置；显式清空也可撤销一次。跨 app 隐私清理则不可撤销，并同时删除内存历史。
 - 多目标、远端 ACK、失败状态与持久账本仍属于后续 M5，不把未来能力写成当前保证。
 
 ### 6.3 Echo 防回环
@@ -363,12 +368,12 @@ protocol Processor {
 
 ```
 输入法                 工作台
-├─ 输入（现状+并击间隔） ├─ 缓冲区   捕获、窗口显隐/pin、候选位置、移屏、切app清理
+├─ 输入（现状+并击间隔） ├─ 缓冲区   捕获、窗口显隐/pin、候选锚点、移屏、切app清理
 ├─ 候选窗（现状）        ├─ 连接     配对设备、网关启停/端口/配置复制；SSE/SSH 未来标签
 └─ 维护（现状）          └─ 处理器   当前为未来能力说明
 ```
 
-缓冲页明确展示：关闭窗口会收束组字、暂停捕获并保留内容；清空是另一动作。候选默认固定在工作台，可切回跟随 caret；菜单也提供显隐、pin 与移到当前屏幕。「安全」不单设页，安全项就近放在语义所属页。
+缓冲页明确展示：关闭窗口会收束组字、暂停捕获并保留内容；清空是另一动作。候选默认使用常规面板锚定在细条下方，可切回跟随 caret；菜单也提供显隐、pin 与移到当前屏幕。「安全」不单设页，安全项就近放在语义所属页。
 
 **[后续路线图]** 等按来源信任和多目标投递真正实现后，可把「连接」拆成独立「来源」与「投递」页，形成原方案中的 8 页 IA；当前不得把该拆分写成已完成。
 
@@ -413,9 +418,9 @@ protocol Processor {
 | 9 | 候选窗/维护页去向 | 保留，归「输入法」组（§8） |
 | 10 | 隔空传字页去向 | [路线图] 来源/投递能力成熟后再拆页；当前仍在「连接」页（§8） |
 | 11 | 无条件镜像 | v1 保持既有隔空传字设置；自身窗口永不镜像，`.remotePeer` 来源永不回镜（§6.3） |
-| 12 | 按住 1.2s 发送 | 保留（§1.1） |
+| 12 | 按住 1.2s 发送 | 已实现；无未决组字时轻按发下一块、按住约 1.2 秒发全部。有未决组字时本次按键只收束，不发送（§1.1） |
 | 13 | 清空按钮 | 保留，与停止并存（§1.1） |
-| 14 | 紧凑面板两轨还是三轨 | 三层目标；当前已实现缓冲轨+候选投影，传入轨仍待嵌入 |
+| 14 | 紧凑面板两轨还是三轨 | 三层仍是历史路线目标；当前运行时采用 44pt 单行缓冲条 + 向上工具层（总高 78pt）+ 条下方常规候选窗，传入轨仍待嵌入 |
 | 15 | 「远端」语义 | 本方案中远端=配对设备（出入站同一对端）；「远端算力」概念废弃，算力即处理器 |
 | 16 | 分期 | §9 |
 | 17 | 路线图还是草稿 | 草稿；本文档为收敛后的路线图 |
@@ -447,7 +452,7 @@ protocol Processor {
   - ⏸ **传入轨 UI**：M2 网关前置条件已经满足；当前仍使用 `InboundToast` + `InboundTrayWindow`，嵌入独立工作台的传入轨尚未实现。配对设备继续直通不入轨，Marine 现状直接进 buffer。
   - ⏹ **远端改道 + 协议 v2**：按 §12.1 决策**作废**。
 - **M2 网关+MCP** — ✅ 主干已实现：`LocalGateway`、MCP tools、`InboundBus`、token 与收件箱可用；传入轨嵌入工作台仍后续。
-- **稳定缓冲窗口** — ✅ 2026-07-17：FocusToken、独立工作台、候选投影、块编辑防回灌、50 条内存发送历史、清空撤销、多屏/常显/隐私控制已实现；待安装后真机验收。
+- **稳定缓冲窗口** — ✅ 2026-07-17：FocusToken、Return 轻按逐块/长按全部手势、Return/Backspace 宿主隔离、44pt 单行条/78pt 向上工具层、条下方常规候选窗、成功块即时消费、块编辑防回灌、50 条内存发送历史、清空撤销、多屏/常显/隐私控制已实现；待重新安装后的真实宿主输入交互验收。
 
 ### 12.3 下一步真实工作量
 

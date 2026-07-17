@@ -2,22 +2,46 @@ import Cocoa
 import QuartzCore
 
 /// Compact block rail used by the independent workbench window. It never holds
-/// an IMK client: sending goes through BufferDeliveryCoordinator, while clear
-/// and block selection are explicit callbacks owned by the window controller.
+/// an IMK client or action buttons: delivery/clear live in the expandable
+/// controller shelf, while this view only renders and selects staged blocks.
 final class BufferInlineView: NSView {
+    private struct RenderedBlock: Equatable {
+        let id: UUID
+        let text: String
+        let origin: Origin
+    }
+
+    private struct RenderSignature: Equatable {
+        let blocks: [RenderedBlock]
+        let insertionIndex: Int
+        let active: Bool
+        let preedit: String
+        let loadingMessage: String?
+        let shielded: Bool
+        let selectedBlockID: UUID?
+        let isNight: Bool
+    }
+
     private let chipScroll = NSScrollView()
     private let chipRow = NSStackView()
     private let leadingSpacer = NSView()
     private let caretView = NSView()
     private let emptyLabel = NSTextField(labelWithString: "等待暂存内容")
-    private let flushButton = HoldProgressButton(title: "", target: nil, action: nil)
-    private let clearButton = FirstMouseButton(title: "", target: nil, action: nil)
+    private let enterHoldProgressLayer = CALayer()
     private var renderedBlockIDs: [UUID] = []
+    private var lastRenderSignature: RenderSignature?
+    private var contentShielded = false
+    private var enterHoldProgress: CGFloat?
     private(set) var selectedBlockID: UUID?
+    private(set) var renderPassCount = 0
     var onSelectionChange: ((UUID?) -> Void)?
-    var onClear: (() -> Void)?
     var renderedBlockCount: Int { renderedBlockIDs.count }
-    var canClearContent: Bool { clearButton.isEnabled }
+    var isEnterHoldProgressVisible: Bool { enterHoldProgress != nil }
+    var canClearContent: Bool {
+        !contentShielded
+            && (!BufferModel.shared.blocks.isEmpty
+                || BufferModel.shared.loadingMessage != nil)
+    }
 
     var preferredHeight: CGFloat {
         34
@@ -28,24 +52,15 @@ final class BufferInlineView: NSView {
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
         layer?.cornerRadius = 6
-        layer?.borderWidth = 1
         layer?.masksToBounds = true
+        enterHoldProgressLayer.cornerRadius = 1
+        enterHoldProgressLayer.zPosition = 50
+        enterHoldProgressLayer.opacity = 0
+        layer?.addSublayer(enterHoldProgressLayer)
+        updateHairlineWidth()
 
         emptyLabel.font = .systemFont(ofSize: 12)
         emptyLabel.lineBreakMode = .byTruncatingTail
-
-        configureIconButton(flushButton,
-                            symbolName: "paperplane.fill",
-                            toolTip: "按住 1.2 秒发送")
-        flushButton.holdDuration = 1.2
-        flushButton.target = self
-        flushButton.action = #selector(flushTapped)
-
-        configureIconButton(clearButton,
-                            symbolName: "trash",
-                            toolTip: "清空缓冲区")
-        clearButton.target = self
-        clearButton.action = #selector(clearTapped)
 
         chipRow.orientation = .horizontal
         chipRow.spacing = 5
@@ -70,17 +85,10 @@ final class BufferInlineView: NSView {
         chipScroll.setContentHuggingPriority(.defaultLow, for: .horizontal)
         chipScroll.heightAnchor.constraint(equalToConstant: 24).isActive = true
 
-        let controls = NSStackView(views: [flushButton, clearButton])
-        controls.orientation = .horizontal
-        controls.alignment = .centerY
-        controls.spacing = 4
-        controls.setContentHuggingPriority(.required, for: .horizontal)
-
-        let row = NSStackView(views: [chipScroll, controls])
+        let row = NSStackView(views: [chipScroll])
         row.orientation = .horizontal
         row.alignment = .centerY
-        row.spacing = 7
-        row.edgeInsets = NSEdgeInsets(top: 5, left: 8, bottom: 5, right: 7)
+        row.edgeInsets = NSEdgeInsets(top: 5, left: 8, bottom: 5, right: 8)
         row.translatesAutoresizingMaskIntoConstraints = false
         addSubview(row)
         NSLayoutConstraint.activate([
@@ -95,11 +103,72 @@ final class BufferInlineView: NSView {
 
     required init?(coder: NSCoder) { fatalError() }
 
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        updateHairlineWidth()
+    }
+
+    override func layout() {
+        super.layout()
+        updateHairlineWidth()
+        updateEnterHoldProgressLayer()
+    }
+
+    private func updateHairlineWidth() {
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+        layer?.borderWidth = 1 / max(scale, 1)
+    }
+
+    func setEnterHoldProgress(_ progress: Double?) {
+        enterHoldProgress = progress.map { CGFloat(min(max($0, 0), 1)) }
+        updateEnterHoldProgressLayer()
+    }
+
+    private func updateEnterHoldProgressLayer() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if let enterHoldProgress {
+            enterHoldProgressLayer.opacity = 1
+            enterHoldProgressLayer.frame = NSRect(
+                x: 0,
+                y: 0,
+                width: bounds.width * enterHoldProgress,
+                height: 2
+            )
+        } else {
+            enterHoldProgressLayer.opacity = 0
+            enterHoldProgressLayer.frame = .zero
+        }
+        CATransaction.commit()
+    }
+
     @discardableResult
     func refresh(preedit: String = "", shielded: Bool = false) -> Bool {
         let model = BufferModel.shared
         let preeditText = preedit.trimmingCharacters(in: .whitespacesAndNewlines)
         let active = model.active
+        contentShielded = shielded
+        if shielded {
+            setEnterHoldProgress(nil)
+        }
+
+        let signature = RenderSignature(
+            blocks: model.blocks.map { RenderedBlock(id: $0.id, text: $0.text, origin: $0.origin) },
+            insertionIndex: min(max(model.insertionIndex, 0), model.blocks.count),
+            active: active,
+            preedit: preeditText,
+            loadingMessage: model.loadingMessage,
+            shielded: shielded,
+            selectedBlockID: selectedBlockID,
+            isNight: RimeUI.isNight
+        )
+        if signature == lastRenderSignature {
+            isHidden = shielded
+            applyAppearance()
+            return false
+        }
+        lastRenderSignature = signature
+        renderPassCount += 1
 
         chipRow.arrangedSubviews.forEach {
             chipRow.removeArrangedSubview($0)
@@ -111,15 +180,13 @@ final class BufferInlineView: NSView {
         if shielded {
             emptyLabel.stringValue = "内容已隐藏"
             chipRow.addArrangedSubview(emptyLabel)
-            flushButton.isEnabled = false
-            clearButton.isEnabled = false
             stopCaretBlinking()
             isHidden = true
             applyAppearance()
             return true
         }
 
-        let insertionIndex = min(max(model.insertionIndex, 0), model.blocks.count)
+        let insertionIndex = signature.insertionIndex
         if model.blocks.isEmpty, preeditText.isEmpty {
             emptyLabel.stringValue = model.loadingMessage ?? "等待暂存内容"
             chipRow.addArrangedSubview(emptyLabel)
@@ -153,21 +220,12 @@ final class BufferInlineView: NSView {
             self.selectedBlockID = nil
             onSelectionChange?(nil)
         }
-        let availability = BufferDeliveryCoordinator.shared.availability()
-        flushButton.isEnabled = model.pendingDeliveryCount > 0 && availability.canSend
-        flushButton.toolTip = availability.canSend ? "按住 1.2 秒发送全部未发送块" : availability.label
-        clearButton.isEnabled = !model.blocks.isEmpty || model.loadingMessage != nil
-
         applyAppearance()
         layoutSubtreeIfNeeded()
         updateChipDocumentSize()
         scrollChipsToInsertionPoint()
         isHidden = false
         return true
-    }
-
-    func setFlushProgress(_ progress: Double?) {
-        flushButton.setExternalProgress(progress)
     }
 
     /// Colored provenance dot for a non-local block. Rime commits (local typing)
@@ -206,15 +264,7 @@ final class BufferInlineView: NSView {
         label.maximumNumberOfLines = 1
         label.toolTip = block.text
 
-        var rowViews: [NSView] = [label]
-        if block.lastSentAt != nil {
-            let sent = NSTextField(labelWithString: "✓")
-            sent.font = .systemFont(ofSize: 10, weight: .semibold)
-            sent.textColor = RimeUI.textMuted
-            sent.toolTip = "已尝试发送；内容仍保留在缓冲区"
-            rowViews.append(sent)
-        }
-        let row = NSStackView(views: rowViews)
+        let row = NSStackView(views: [label])
         if let badge = originBadge(for: block.origin) {
             row.insertArrangedSubview(badge, at: 0)
             row.setCustomSpacing(5, after: badge)
@@ -337,9 +387,8 @@ final class BufferInlineView: NSView {
         layer?.backgroundColor = RimeUI.candidateBackgroundColor.cgColor
         layer?.borderColor = RimeUI.borderStrong.cgColor
         caretView.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
+        enterHoldProgressLayer.backgroundColor = NSColor.controlAccentColor.cgColor
         emptyLabel.textColor = RimeUI.isNight ? RimeUI.textSecondary : RimeUI.textMuted
-        flushButton.contentTintColor = flushButton.isEnabled ? RimeUI.textSecondary : RimeUI.textMuted
-        clearButton.contentTintColor = clearButton.isEnabled ? RimeUI.textSecondary : RimeUI.textMuted
     }
 
     private func startCaretBlinking() {
@@ -358,18 +407,6 @@ final class BufferInlineView: NSView {
     private func stopCaretBlinking() {
         caretView.layer?.removeAnimation(forKey: "bufferCaretBlink")
         caretView.layer?.opacity = 1
-    }
-
-    @objc private func flushTapped() {
-        _ = BufferDeliveryCoordinator.shared.sendAll(resolveCompositionIfNeeded: true)
-    }
-
-    @objc private func clearTapped() {
-        if let onClear {
-            onClear()
-        } else {
-            BufferModel.shared.clear()
-        }
     }
 
     @objc private func blockTapped(_ sender: NSButton) {

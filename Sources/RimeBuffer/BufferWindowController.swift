@@ -1,5 +1,6 @@
 import Cocoa
 import Carbon.HIToolbox
+import QuartzCore
 
 enum BufferCandidatePlacement: String, CaseIterable {
     case workbench
@@ -7,7 +8,7 @@ enum BufferCandidatePlacement: String, CaseIterable {
 
     var title: String {
         switch self {
-        case .workbench: return "固定在缓冲窗口"
+        case .workbench: return "显示在缓冲条下方"
         case .caret: return "跟随输入光标"
         }
     }
@@ -16,9 +17,18 @@ enum BufferCandidatePlacement: String, CaseIterable {
 /// Pure frame math shared by runtime restoration and the CLI smoke test.
 enum BufferWindowGeometry {
     static let standardMinimumWidth: CGFloat = 520
-    static let standardMinimumHeight: CGFloat = 340
+    static let standardMaximumWidth: CGFloat = 1100
+    static let collapsedHeight: CGFloat = 44
+    static let expandedHeight: CGFloat = 78
+    static let standardMinimumHeight = collapsedHeight
+    static let screenSafetyMargin: CGFloat = 8
+
+    static func height(expanded: Bool) -> CGFloat {
+        expanded ? expandedHeight : collapsedHeight
+    }
 
     static func clampedFrame(_ proposed: NSRect,
+                             expanded: Bool = false,
                              visibleFrames: [NSRect],
                              fallback: NSRect) -> NSRect {
         let screens = visibleFrames.isEmpty ? [fallback] : visibleFrames
@@ -26,19 +36,45 @@ enum BufferWindowGeometry {
             intersectionArea(proposed, lhs) < intersectionArea(proposed, rhs)
         }.flatMap { intersectionArea(proposed, $0) > 0 ? $0 : nil } ?? fallback
 
-        let minimumWidth = min(standardMinimumWidth, target.width)
-        let minimumHeight = min(standardMinimumHeight, target.height)
-        let width = min(max(proposed.width, minimumWidth), target.width)
-        let height = min(max(proposed.height, minimumHeight), target.height)
-        var x = proposed.minX
-        var y = proposed.minY
+        let horizontalMargin = min(screenSafetyMargin, max(0, (target.width - 1) / 2))
+        let verticalMargin = min(screenSafetyMargin, max(0, (target.height - 1) / 2))
+        let safeTarget = target.insetBy(dx: horizontalMargin, dy: verticalMargin)
+        let minimumWidth = min(standardMinimumWidth, safeTarget.width)
+        let maximumWidth = min(standardMaximumWidth, safeTarget.width)
+        let width = min(max(proposed.width, minimumWidth), maximumWidth)
+        let height = min(height(expanded: expanded), safeTarget.height)
+        var x = proposed.width == width ? proposed.minX : proposed.midX - width / 2
+        // The 52pt predecessor and both current states preserve their bottom
+        // edge, keeping the candidate panel stationary. Only the legacy 340pt
+        // workbench migrates by preserving its old top edge.
+        var y = proposed.height <= expandedHeight + 1
+            ? proposed.minY
+            : proposed.maxY - height
         if proposed == .zero || intersectionArea(proposed, target) == 0 {
-            x = target.midX - width / 2
-            y = target.midY - height / 2
+            x = safeTarget.midX - width / 2
+            y = safeTarget.midY - height / 2
         }
-        x = min(max(x, target.minX), max(target.minX, target.maxX - width))
-        y = min(max(y, target.minY), max(target.minY, target.maxY - height))
+        x = min(max(x, safeTarget.minX), max(safeTarget.minX, safeTarget.maxX - width))
+        y = min(max(y, safeTarget.minY), max(safeTarget.minY, safeTarget.maxY - height))
         return NSRect(x: x, y: y, width: width, height: height)
+    }
+
+    static func candidateAnchor(for frame: NSRect) -> NSRect {
+        NSRect(x: frame.minX + 8,
+               y: frame.minY,
+               width: max(4, frame.width - 16),
+               height: frame.height)
+    }
+
+    static func pixelAligned(_ frame: NSRect, scale: CGFloat) -> NSRect {
+        guard scale > 0 else { return frame }
+        func aligned(_ value: CGFloat) -> CGFloat {
+            (value * scale).rounded() / scale
+        }
+        return NSRect(x: aligned(frame.minX),
+                      y: aligned(frame.minY),
+                      width: aligned(frame.width),
+                      height: aligned(frame.height))
     }
 
     private static func intersectionArea(_ lhs: NSRect, _ rhs: NSRect) -> CGFloat {
@@ -63,15 +99,57 @@ private final class BufferPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
-private final class FirstMousePopUpButton: NSPopUpButton {
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-}
-
 private final class BufferDragHandleView: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func mouseDown(with event: NSEvent) {
         window?.performDrag(with: event)
+    }
+}
+
+/// The material clips to a continuous rounded rect while a separate inset
+/// hairline remains fully inside the backing pixels. Keeping the stroke away
+/// from the window boundary prevents the half-clipped fringe seen on Retina.
+private final class BufferChromeView: NSVisualEffectView {
+    private let strokeLayer = CAShapeLayer()
+    var strokeColor: NSColor = .separatorColor {
+        didSet { strokeLayer.strokeColor = strokeColor.cgColor }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        configureLayer()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configureLayer()
+    }
+
+    private func configureLayer() {
+        wantsLayer = true
+        layer?.cornerRadius = 9
+        layer?.cornerCurve = .continuous
+        layer?.masksToBounds = true
+        strokeLayer.fillColor = NSColor.clear.cgColor
+        strokeLayer.strokeColor = strokeColor.cgColor
+        strokeLayer.zPosition = 100
+        layer?.addSublayer(strokeLayer)
+    }
+
+    override func layout() {
+        super.layout()
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+        let lineWidth = 1 / max(scale, 1)
+        strokeLayer.contentsScale = scale
+        strokeLayer.frame = bounds
+        strokeLayer.lineWidth = lineWidth
+        strokeLayer.path = CGPath(
+            roundedRect: bounds.insetBy(dx: lineWidth / 2, dy: lineWidth / 2),
+            cornerWidth: max(0, 9 - lineWidth / 2),
+            cornerHeight: max(0, 9 - lineWidth / 2),
+            transform: nil
+        )
     }
 }
 
@@ -82,38 +160,39 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
 
     private enum Key {
         static let visible = "bufferWindow.visible.v1"
-        static let frame = "bufferWindow.frame.v1"
+        static let frame = "bufferWindow.frame.v2"
+        static let legacyFrame = "bufferWindow.frame.v1"
         static let pinned = "bufferWindow.pinned.v1"
         static let placement = "bufferWindow.candidatePlacement.v1"
+        static let controlsExpanded = "bufferWindow.controlsExpanded.v1"
     }
 
     private let panel: BufferPanel
-    private let visual = NSVisualEffectView()
+    private let outerContainer = NSView()
+    private let visual = BufferChromeView()
     private let bufferRail = BufferInlineView()
-    private let candidateView = CandidateProjectionView()
-    private let previewText = NSTextView()
+    private let utilityShelf = NSStackView()
+    private let shelfDivider = NSView()
     private let targetLabel = NSTextField(labelWithString: "")
     private let countLabel = NSTextField(labelWithString: "")
+    private let disclosureButton = FirstMouseButton(title: "", target: nil, action: nil)
+    private let sendButton = FirstMouseButton(title: "", target: nil, action: nil)
+    private let clearButton = FirstMouseButton(title: "", target: nil, action: nil)
     private let captureButton = FirstMouseButton(title: "缓冲", target: nil, action: nil)
     private let pinButton = FirstMouseButton(title: "", target: nil, action: nil)
     private let privacyButton = FirstMouseButton(title: "", target: nil, action: nil)
     private let editButton = FirstMouseButton(title: "", target: nil, action: nil)
+    private let historyButton = FirstMouseButton(title: "", target: nil, action: nil)
     private let moveButton = FirstMouseButton(title: "", target: nil, action: nil)
     private let closeButton = FirstMouseButton(title: "", target: nil, action: nil)
-    private let restoreButton = FirstMouseButton(title: "恢复所选记录", target: nil, action: nil)
-    private let undoClearButton = FirstMouseButton(title: "撤销清空", target: nil, action: nil)
-    private let historyLabel = NSTextField(labelWithString: "")
-    private let historyPopUp = FirstMousePopUpButton()
-    private var renderedHistoryIDs: [UUID]?
-    private var candidateHeightConstraint: NSLayoutConstraint!
     private var selectedBlockID: UUID?
-    private var projection: CandidateProjection?
     private var privacyShielded = false
     private var hiddenForSession = false
     private var sessionInactive = false
     private var screenLocked = false
     private var sleeping = false
     private var adjustingFrame = false
+    private var controlsExpanded = false
     private var observers: [NSObjectProtocol] = []
     private var secureInputPollTimer: Timer?
     private var lastSecureInputState = IsSecureEventInputEnabled()
@@ -151,13 +230,23 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
     var shouldProjectCandidates: Bool {
         isVisible && !hiddenForSession && candidatePlacement == .workbench
     }
+    var candidateAnchorRect: NSRect? {
+        guard shouldProjectCandidates,
+              !privacyShielded,
+              !IsSecureEventInputEnabled(),
+              !sessionProtectionActive else { return nil }
+        return BufferWindowGeometry.candidateAnchor(for: panel.frame)
+    }
 
     private override init() {
-        panel = BufferPanel(contentRect: NSRect(x: 0, y: 0, width: 680, height: 340),
+        let expanded = UserDefaults.standard.bool(forKey: Key.controlsExpanded)
+        panel = BufferPanel(contentRect: NSRect(x: 0, y: 0, width: 760,
+                                                height: BufferWindowGeometry.height(expanded: expanded)),
                             styleMask: [.borderless, .nonactivatingPanel, .resizable],
                             backing: .buffered,
                             defer: false)
         super.init()
+        controlsExpanded = expanded
         buildWindow()
         restoreFrame()
         installObservers()
@@ -195,8 +284,6 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         BufferBlockEditor.shared.saveAndCloseForWorkbenchHide()
         UserDefaults.standard.set(false, forKey: Key.visible)
         panel.orderOut(nil)
-        projection = nil
-        candidateView.update(nil)
         RimeBufferController.refreshActiveUI()
     }
 
@@ -236,15 +323,50 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
                           fallback: target,
                           display: true)
         saveFrame()
+        candidateWindow.syncWorkbenchAnchor(candidateAnchorRect)
     }
 
-    func setFlushProgress(_ progress: Double?) {
-        bufferRail.setFlushProgress(progress)
+    func setEnterHoldProgress(_ progress: Double?) {
+        bufferRail.setEnterHoldProgress(progress)
     }
 
-    func updateCandidateProjection(_ projection: CandidateProjection?) {
-        self.projection = projection
+    /// Dev-only visual regression hook used by `panel-render`. Rendering the
+    /// real controller prevents the preview and shipped workbench from drifting
+    /// into two unrelated designs again.
+    @discardableResult
+    func renderForPreview(to path: String,
+                          expanded: Bool = false,
+                          scale: CGFloat = 2) -> Bool {
+        controlsExpanded = expanded
+        applyExpandedPresentation()
+        adjustingFrame = true
+        panel.setFrame(NSRect(x: 0, y: 0, width: 760,
+                              height: BufferWindowGeometry.height(expanded: expanded)),
+                       display: false)
+        adjustingFrame = false
         refresh()
+        guard let contentView = panel.contentView else { return false }
+        contentView.layoutSubtreeIfNeeded()
+        let bounds = contentView.bounds
+        let renderScale = max(1, scale)
+        guard let bitmap = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: Int((bounds.width * renderScale).rounded()),
+            pixelsHigh: Int((bounds.height * renderScale).rounded()),
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else { return false }
+        bitmap.size = bounds.size
+        contentView.cacheDisplay(in: bounds, to: bitmap)
+        guard let png = bitmap.representation(using: .png, properties: [:]) else {
+            return false
+        }
+        return (try? png.write(to: URL(fileURLWithPath: path), options: .atomic)) != nil
     }
 
     func refresh() {
@@ -252,16 +374,12 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
             DispatchQueue.main.async { [weak self] in self?.refresh() }
             return
         }
-        if let projection,
-           InputFocusCoordinator.shared.interactionTarget(expected: projection.owner) == nil {
-            self.projection = nil
-            candidateView.update(nil)
-        }
         captureButton.state = BufferModel.shared.enabled ? .on : .off
         pinButton.contentTintColor = pinned ? NSColor.controlAccentColor : RimeUI.textSecondary
 
         let availability = BufferDeliveryCoordinator.shared.availability()
-        targetLabel.stringValue = availability.label
+        targetLabel.stringValue = compactTargetLabel(availability)
+        targetLabel.toolTip = availability.label
         targetLabel.textColor = availability.canSend ? RimeUI.textSecondary : RimeUI.textMuted
 
         let model = BufferModel.shared
@@ -275,25 +393,20 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         }
         countLabel.stringValue = shouldShield
             ? "内容已隐藏"
-            : "\(model.blocks.count) 块 · \(model.stagedCharacterCount) 字 · 待发送 \(model.pendingDeliveryCount)"
-        previewText.string = shouldShield
-            ? "内容已隐藏"
-            : (model.stagedText.isEmpty ? "暂无缓冲内容" : model.stagedText)
-        previewText.textColor = model.stagedText.isEmpty || shouldShield
-            ? RimeUI.textMuted
-            : RimeUI.textPrimary
-        candidateView.update(shouldShield ? nil : projection)
-        candidateView.isHidden = shouldShield || projection == nil
-        candidateHeightConstraint.constant = shouldShield ? 0 : candidateView.preferredHeight
-        _ = bufferRail.refresh(preedit: shouldShield ? "" : (projection?.preedit ?? ""),
-                               shielded: shouldShield)
-        assert(!shouldShield || (bufferRail.isHidden && candidateView.isHidden),
-               "privacy shield must leave every text-bearing rail hidden")
+            : "\(model.blocks.count) 块 · \(model.stagedCharacterCount) 字"
+        _ = bufferRail.refresh(shielded: shouldShield)
+        assert(!shouldShield || bufferRail.isHidden,
+               "privacy shield must leave the text-bearing rail hidden")
 
         editButton.isEnabled = !model.blocks.isEmpty && !shouldShield
-        refreshHistoryControls(model: model, shielded: shouldShield)
+        historyButton.isEnabled = (!model.sentHistory.isEmpty || model.canUndoClear) && !shouldShield
+        sendButton.isEnabled = model.pendingDeliveryCount > 0
+            && availability.canSend
+            && !shouldShield
+        sendButton.toolTip = availability.canSend ? "发送全部缓冲块" : availability.label
+        clearButton.isEnabled = (!model.blocks.isEmpty || model.loadingMessage != nil)
+            && !shouldShield
         applyAppearance()
-        panel.contentView?.layoutSubtreeIfNeeded()
     }
 
     /// Every ETInput-owned text field is an internal UI surface, not a draft
@@ -315,10 +428,30 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
             }
         }
         saveFrame()
+        candidateWindow.syncWorkbenchAnchor(candidateAnchorRect)
     }
     func windowDidResize(_ notification: Notification) {
         guard !adjustingFrame else { return }
         clampFrameToScreens()
+        candidateWindow.syncWorkbenchAnchor(candidateAnchorRect)
+    }
+
+    func windowDidChangeBackingProperties(_ notification: Notification) {
+        guard !adjustingFrame else { return }
+        let aligned = BufferWindowGeometry.pixelAligned(
+            panel.frame,
+            scale: panel.backingScaleFactor
+        )
+        if aligned != panel.frame {
+            adjustingFrame = true
+            panel.setFrame(aligned, display: true)
+            adjustingFrame = false
+        }
+        visual.needsLayout = true
+        bufferRail.needsLayout = true
+        panel.invalidateShadow()
+        saveFrame()
+        candidateWindow.syncWorkbenchAnchor(candidateAnchorRect)
     }
 
     // MARK: - Construction
@@ -330,32 +463,39 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         panel.hasShadow = true
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
-        panel.isMovableByWindowBackground = true
+        panel.isMovableByWindowBackground = false
         panel.minSize = NSSize(width: BufferWindowGeometry.standardMinimumWidth,
-                               height: BufferWindowGeometry.standardMinimumHeight)
-        panel.maxSize = NSSize(width: 1100, height: 520)
+                               height: BufferWindowGeometry.height(expanded: controlsExpanded))
+        panel.maxSize = NSSize(width: BufferWindowGeometry.standardMaximumWidth,
+                               height: BufferWindowGeometry.height(expanded: controlsExpanded))
         panel.delegate = self
         applyCollectionBehavior()
 
+        outerContainer.wantsLayer = true
+        outerContainer.layer?.backgroundColor = NSColor.clear.cgColor
         visual.state = .active
         visual.blendingMode = .behindWindow
-        visual.wantsLayer = true
-        visual.layer?.cornerRadius = 10
-        visual.layer?.borderWidth = 1
-        visual.layer?.masksToBounds = true
-        panel.contentView = visual
+        visual.translatesAutoresizingMaskIntoConstraints = false
+        outerContainer.addSubview(visual)
+        NSLayoutConstraint.activate([
+            visual.leadingAnchor.constraint(equalTo: outerContainer.leadingAnchor, constant: 2),
+            visual.trailingAnchor.constraint(equalTo: outerContainer.trailingAnchor, constant: -2),
+            visual.topAnchor.constraint(equalTo: outerContainer.topAnchor, constant: 2),
+            visual.bottomAnchor.constraint(equalTo: outerContainer.bottomAnchor, constant: -2),
+        ])
+        panel.contentView = outerContainer
 
-        let title = NSTextField(labelWithString: "缓冲工作台")
-        title.font = .systemFont(ofSize: 12, weight: .semibold)
+        let title = NSTextField(labelWithString: "缓冲")
+        title.font = .systemFont(ofSize: 11, weight: .semibold)
         title.textColor = RimeUI.textPrimary
-        countLabel.font = .monospacedDigitSystemFont(ofSize: 10, weight: .regular)
+        countLabel.font = .monospacedDigitSystemFont(ofSize: 9, weight: .regular)
         countLabel.textColor = RimeUI.textMuted
 
         let drag = BufferDragHandleView()
         let dragLabels = NSStackView(views: [title, countLabel])
-        dragLabels.orientation = .vertical
-        dragLabels.alignment = .leading
-        dragLabels.spacing = 1
+        dragLabels.orientation = .horizontal
+        dragLabels.alignment = .centerY
+        dragLabels.spacing = 5
         dragLabels.translatesAutoresizingMaskIntoConstraints = false
         drag.addSubview(dragLabels)
         NSLayoutConstraint.activate([
@@ -363,95 +503,56 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
             dragLabels.trailingAnchor.constraint(equalTo: drag.trailingAnchor),
             dragLabels.centerYAnchor.constraint(equalTo: drag.centerYAnchor),
         ])
-        drag.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        drag.setContentHuggingPriority(.required, for: .horizontal)
+        drag.toolTip = "拖动缓冲条"
 
-        captureButton.setButtonType(.switch)
-        captureButton.target = self
-        captureButton.action = #selector(captureToggled)
-        captureButton.font = .systemFont(ofSize: 11, weight: .medium)
+        configureIconButton(disclosureButton,
+                            controlsExpanded ? "chevron.down" : "chevron.up",
+                            controlsExpanded ? "收起功能" : "向上展开功能",
+                            #selector(disclosureTapped))
+        configureIconButton(sendButton, "paperplane.fill", "发送全部缓冲块", #selector(sendTapped))
+        configureIconButton(clearButton, "trash", "清空缓冲区", #selector(clearTapped))
+        configureIconButton(captureButton, "tray.full", "启用或暂停缓冲捕获", #selector(captureToggled))
+        captureButton.setButtonType(.toggle)
         configureIconButton(pinButton, "pin", "常显于所有桌面与全屏空间", #selector(pinTapped))
         configureIconButton(privacyButton, "eye.slash", "临时隐藏缓冲内容", #selector(privacyTapped))
         configureIconButton(editButton, "pencil", "编辑选中的块", #selector(editTapped))
+        configureIconButton(historyButton, "clock.arrow.circlepath", "发送历史与撤销清空", #selector(historyTapped))
         configureIconButton(moveButton, "rectangle.on.rectangle", "移到鼠标所在屏幕", #selector(moveTapped))
         configureIconButton(closeButton, "xmark", "关闭并暂停缓冲（保留内容）", #selector(closeTapped))
 
-        let header = NSStackView(views: [drag, targetLabel, captureButton,
-                                         pinButton, privacyButton, editButton,
-                                         moveButton, closeButton])
-        header.orientation = .horizontal
-        header.alignment = .centerY
-        header.spacing = 7
-        header.heightAnchor.constraint(equalToConstant: 30).isActive = true
         targetLabel.font = .systemFont(ofSize: 10)
         targetLabel.lineBreakMode = .byTruncatingMiddle
         targetLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-
-        candidateView.onAction = { action, owner in
-            candidateWindow.performProjectedAction(action, owner: owner)
-        }
-        candidateView.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
-        candidateHeightConstraint = candidateView.heightAnchor.constraint(equalToConstant: 0)
-        candidateHeightConstraint.priority = .defaultHigh
-        candidateHeightConstraint.isActive = true
-
-        previewText.isEditable = false
-        previewText.isSelectable = true
-        previewText.drawsBackground = false
-        previewText.font = .systemFont(ofSize: 14)
-        previewText.textContainerInset = NSSize(width: 8, height: 6)
-        let previewScroll = NSScrollView()
-        previewScroll.drawsBackground = false
-        previewScroll.hasVerticalScroller = true
-        previewScroll.documentView = previewText
-        previewScroll.wantsLayer = true
-        previewScroll.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
-        previewScroll.layer?.cornerRadius = 6
-        previewScroll.layer?.borderWidth = 1
-        let previewMinimumHeight = previewScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 54)
-        previewMinimumHeight.priority = .defaultHigh
-        previewMinimumHeight.isActive = true
+        targetLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
         bufferRail.onSelectionChange = { [weak self] id in
             self?.selectedBlockID = id
             self?.refresh()
         }
-        bufferRail.onClear = { [weak self] in
-            BufferModel.shared.clear()
-            self?.selectedBlockID = nil
+
+        utilityShelf.orientation = .horizontal
+        utilityShelf.alignment = .centerY
+        utilityShelf.spacing = 5
+        utilityShelf.edgeInsets = NSEdgeInsets(top: 4, left: 9, bottom: 4, right: 8)
+        [targetLabel, sendButton, clearButton, captureButton, pinButton,
+         privacyButton, editButton, historyButton, moveButton, closeButton].forEach {
+            utilityShelf.addArrangedSubview($0)
         }
 
-        historyLabel.font = .systemFont(ofSize: 10)
-        historyLabel.textColor = RimeUI.textMuted
-        historyPopUp.controlSize = .small
-        historyPopUp.bezelStyle = .inline
-        historyPopUp.toolTip = "选择最近 50 条内存发送记录"
-        historyPopUp.translatesAutoresizingMaskIntoConstraints = false
-        historyPopUp.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        historyPopUp.widthAnchor.constraint(lessThanOrEqualToConstant: 230).isActive = true
-        let historyMinimumWidth = historyPopUp.widthAnchor.constraint(greaterThanOrEqualToConstant: 120)
-        historyMinimumWidth.priority = .defaultHigh
-        historyMinimumWidth.isActive = true
-        let footerSpacer = NSView()
-        footerSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        restoreButton.target = self
-        restoreButton.action = #selector(restoreSelectedDelivery)
-        restoreButton.bezelStyle = .inline
-        restoreButton.controlSize = .small
-        undoClearButton.target = self
-        undoClearButton.action = #selector(undoClear)
-        undoClearButton.bezelStyle = .inline
-        undoClearButton.controlSize = .small
-        let footer = NSStackView(views: [historyLabel, historyPopUp, footerSpacer,
-                                         restoreButton, undoClearButton])
-        footer.orientation = .horizontal
-        footer.alignment = .centerY
-        footer.spacing = 8
+        shelfDivider.wantsLayer = true
+        shelfDivider.layer?.backgroundColor = RimeUI.borderStrong.withAlphaComponent(0.55).cgColor
 
-        let root = NSStackView(views: [header, candidateView, previewScroll, bufferRail, footer])
+        let mainBar = NSStackView(views: [drag, bufferRail, disclosureButton])
+        mainBar.orientation = .horizontal
+        mainBar.alignment = .centerY
+        mainBar.spacing = 6
+        mainBar.edgeInsets = NSEdgeInsets(top: 3, left: 8, bottom: 3, right: 7)
+
+        let root = NSStackView(views: [utilityShelf, shelfDivider, mainBar])
         root.orientation = .vertical
-        root.alignment = .leading
-        root.spacing = 7
-        root.edgeInsets = NSEdgeInsets(top: 8, left: 10, bottom: 8, right: 10)
+        root.alignment = .width
+        root.spacing = 0
         root.translatesAutoresizingMaskIntoConstraints = false
         visual.addSubview(root)
         NSLayoutConstraint.activate([
@@ -459,52 +560,14 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
             root.trailingAnchor.constraint(equalTo: visual.trailingAnchor),
             root.topAnchor.constraint(equalTo: visual.topAnchor),
             root.bottomAnchor.constraint(equalTo: visual.bottomAnchor),
-            header.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            header.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            candidateView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            candidateView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            previewScroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            previewScroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            bufferRail.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            bufferRail.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            footer.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            footer.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            utilityShelf.heightAnchor.constraint(equalToConstant: 33),
+            shelfDivider.heightAnchor.constraint(equalToConstant: 1),
+            mainBar.heightAnchor.constraint(equalToConstant: 40),
+            bufferRail.widthAnchor.constraint(greaterThanOrEqualToConstant: 190),
+            bufferRail.heightAnchor.constraint(equalToConstant: bufferRail.preferredHeight),
         ])
+        applyExpandedPresentation()
         applyAppearance()
-    }
-
-    private func refreshHistoryControls(model: BufferModel, shielded: Bool) {
-        let records = Array(model.sentHistory.reversed())
-        let recordIDs = records.map(\.id)
-        if recordIDs != renderedHistoryIDs {
-            let selectedID = (historyPopUp.selectedItem?.representedObject as? String)
-                .flatMap(UUID.init(uuidString:))
-            historyPopUp.removeAllItems()
-            for record in records {
-                let time = historyTimeFormatter.string(from: record.sentAt)
-                historyPopUp.addItem(
-                    withTitle: "\(time) · \(record.targetName) · \(record.blocks.count) 块 · \(record.characterCount) 字"
-                )
-                historyPopUp.lastItem?.representedObject = record.id.uuidString
-            }
-            if records.isEmpty {
-                historyPopUp.addItem(withTitle: "无发送记录")
-            } else if let selectedID,
-                      let index = recordIDs.firstIndex(of: selectedID) {
-                historyPopUp.selectItem(at: index)
-            }
-            renderedHistoryIDs = recordIDs
-        }
-
-        historyLabel.stringValue = shielded
-            ? "发送历史已隐藏"
-            : "发送历史（内存 \(records.count)/50）"
-        historyPopUp.isEnabled = !records.isEmpty && !shielded
-        historyPopUp.isHidden = shielded
-        restoreButton.isEnabled = !records.isEmpty && !shielded
-        restoreButton.isHidden = shielded
-        undoClearButton.isEnabled = model.canUndoClear && !shielded
-        undoClearButton.isHidden = shielded
     }
 
     private func configureIconButton(_ button: FirstMouseButton,
@@ -524,17 +587,49 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         button.heightAnchor.constraint(equalToConstant: 25).isActive = true
     }
 
+    private func compactTargetLabel(_ availability: BufferDeliveryCoordinator.Availability) -> String {
+        switch availability {
+        case let .ready(appName, _):
+            return "→ \(appName)"
+        case let .blocked(reason):
+            switch reason {
+            case .noFocusedField: return "未聚焦"
+            case .composing: return "组字中"
+            case .secureInput: return "安全输入"
+            case .nothingPending: return "等待内容"
+            case .targetChanged: return "焦点变化"
+            case .deliveryRejected: return "发送失败"
+            }
+        }
+    }
+
     private func applyAppearance() {
         visual.material = RimeUI.isNight ? .hudWindow : .popover
-        visual.layer?.borderColor = RimeUI.borderStrong.cgColor
-        previewText.enclosingScrollView?.layer?.borderColor = RimeUI.border.cgColor
+        visual.strokeColor = RimeUI.borderStrong
+        shelfDivider.layer?.backgroundColor = RimeUI.borderStrong.withAlphaComponent(0.55).cgColor
+        captureButton.contentTintColor = BufferModel.shared.enabled
+            ? NSColor.controlAccentColor
+            : RimeUI.textMuted
         pinButton.contentTintColor = pinned ? NSColor.controlAccentColor : RimeUI.textSecondary
         privacyButton.contentTintColor = privacyShielded
             ? NSColor.controlAccentColor
             : RimeUI.textSecondary
-        [editButton, moveButton, closeButton].forEach {
+        [editButton, historyButton, moveButton, closeButton,
+         sendButton, clearButton, disclosureButton].forEach {
             $0.contentTintColor = RimeUI.textSecondary
         }
+    }
+
+    private func applyExpandedPresentation() {
+        utilityShelf.isHidden = !controlsExpanded
+        shelfDivider.isHidden = !controlsExpanded
+        disclosureButton.image = RimeUI.symbol(
+            controlsExpanded ? "chevron.down" : "chevron.up",
+            pointSize: 12,
+            weight: .semibold
+        )
+        disclosureButton.image?.isTemplate = true
+        disclosureButton.toolTip = controlsExpanded ? "收起功能" : "向上展开功能"
     }
 
     private func applyCollectionBehavior() {
@@ -549,6 +644,7 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
                                             object: nil,
                                             queue: .main) { [weak self] _ in
             self?.clampFrameToScreens()
+            candidateWindow.syncWorkbenchAnchor(self?.candidateAnchorRect)
         })
         observers.append(center.addObserver(forName: .rimeAppearanceDidChange,
                                             object: nil,
@@ -610,6 +706,7 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
             guard current != self.lastSecureInputState else { return }
             self.lastSecureInputState = current
             self.refresh()
+            RimeBufferController.refreshActiveUI()
         }
         if let secureInputPollTimer {
             RunLoop.main.add(secureInputPollTimer, forMode: .common)
@@ -637,13 +734,19 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         hiddenForSession = false
         refresh()
         panel.orderFrontRegardless()
+        RimeBufferController.refreshActiveUI()
     }
 
     private func restoreFrame() {
         let fallback = NSScreen.main?.visibleFrame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let stored = UserDefaults.standard.string(forKey: Key.frame).map(NSRectFromString)
-            ?? NSRect(x: fallback.midX - 340, y: fallback.midY - 170, width: 680, height: 340)
+        let defaults = UserDefaults.standard
+        let stored = defaults.string(forKey: Key.frame).map(NSRectFromString)
+            ?? defaults.string(forKey: Key.legacyFrame).map(NSRectFromString)
+            ?? NSRect(x: fallback.midX - 340,
+                      y: fallback.midY - BufferWindowGeometry.collapsedHeight / 2,
+                      width: 680,
+                      height: BufferWindowGeometry.collapsedHeight)
         applyClampedFrame(stored,
                           visibleFrames: NSScreen.screens.map(\.visibleFrame),
                           fallback: fallback,
@@ -664,25 +767,37 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
                                    visibleFrames: [NSRect],
                                    fallback: NSRect,
                                    display: Bool) {
-        let frame = BufferWindowGeometry.clampedFrame(proposed,
-                                                      visibleFrames: visibleFrames,
-                                                      fallback: fallback)
+        let clamped = BufferWindowGeometry.clampedFrame(
+            proposed,
+            expanded: controlsExpanded,
+            visibleFrames: visibleFrames,
+            fallback: fallback
+        )
+        let frame = BufferWindowGeometry.pixelAligned(
+            clamped,
+            scale: panel.backingScaleFactor
+        )
         let center = NSPoint(x: frame.midX, y: frame.midY)
         let visibleFrame = visibleFrames.first { $0.contains(center) } ?? fallback
         syncMinimumSize(to: visibleFrame)
         adjustingFrame = true
         panel.setFrame(frame, display: display)
         adjustingFrame = false
+        visual.needsLayout = true
+        panel.invalidateShadow()
     }
 
     private func syncMinimumSize(to visibleFrame: NSRect) {
+        let usableWidth = max(1, visibleFrame.width - BufferWindowGeometry.screenSafetyMargin * 2)
+        let targetHeight = min(BufferWindowGeometry.height(expanded: controlsExpanded),
+                               visibleFrame.height)
         panel.minSize = NSSize(
-            width: min(BufferWindowGeometry.standardMinimumWidth, visibleFrame.width),
-            height: min(BufferWindowGeometry.standardMinimumHeight, visibleFrame.height)
+            width: min(BufferWindowGeometry.standardMinimumWidth, usableWidth),
+            height: targetHeight
         )
         panel.maxSize = NSSize(
-            width: min(1100, visibleFrame.width),
-            height: min(520, visibleFrame.height)
+            width: min(BufferWindowGeometry.standardMaximumWidth, usableWidth),
+            height: targetHeight
         )
     }
 
@@ -691,10 +806,39 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
     }
 
     private func saveFrame() {
-        UserDefaults.standard.set(NSStringFromRect(panel.frame), forKey: Key.frame)
+        var canonical = panel.frame
+        canonical.size.height = BufferWindowGeometry.collapsedHeight
+        UserDefaults.standard.set(NSStringFromRect(canonical), forKey: Key.frame)
     }
 
     // MARK: - Actions
+
+    @objc private func disclosureTapped() {
+        controlsExpanded.toggle()
+        UserDefaults.standard.set(controlsExpanded, forKey: Key.controlsExpanded)
+        applyExpandedPresentation()
+        var proposed = panel.frame
+        proposed.size.height = BufferWindowGeometry.height(expanded: controlsExpanded)
+        let fallback = panel.screen?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        applyClampedFrame(proposed,
+                          visibleFrames: NSScreen.screens.map(\.visibleFrame),
+                          fallback: fallback,
+                          display: true)
+        saveFrame()
+        refresh()
+        candidateWindow.syncWorkbenchAnchor(candidateAnchorRect)
+    }
+
+    @objc private func sendTapped() {
+        _ = BufferDeliveryCoordinator.shared.sendAll(resolveCompositionIfNeeded: true)
+    }
+
+    @objc private func clearTapped() {
+        BufferModel.shared.clear()
+        selectedBlockID = nil
+    }
 
     @objc private func captureToggled() {
         BufferModel.shared.enabled = captureButton.state == .on
@@ -709,6 +853,7 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
             BufferBlockEditor.shared.protectAndClose(reason: "privacy shield")
         }
         refresh()
+        RimeBufferController.refreshActiveUI()
     }
     @objc private func moveTapped() { moveToCurrentScreen() }
     @objc private func closeTapped() { closeAndPause() }
@@ -725,112 +870,49 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         BufferBlockEditor.shared.show(block: block)
     }
 
-    @objc private func restoreSelectedDelivery() {
-        guard let raw = historyPopUp.selectedItem?.representedObject as? String,
+    @objc private func historyTapped() {
+        guard !privacyShielded,
+              !hiddenForSession,
+              !IsSecureEventInputEnabled() else { return }
+        let model = BufferModel.shared
+        let menu = NSMenu(title: "缓冲历史")
+        if model.canUndoClear {
+            let undo = NSMenuItem(title: "撤销上次清空", action: #selector(undoClear), keyEquivalent: "")
+            undo.target = self
+            menu.addItem(undo)
+        }
+        if model.canUndoClear, !model.sentHistory.isEmpty {
+            menu.addItem(.separator())
+        }
+        for record in model.sentHistory.reversed() {
+            let time = historyTimeFormatter.string(from: record.sentAt)
+            let item = NSMenuItem(
+                title: "恢复 \(time) · \(record.targetName) · \(record.blocks.count) 块 · \(record.characterCount) 字",
+                action: #selector(restoreDeliveryRecord(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = record.id.uuidString
+            menu.addItem(item)
+        }
+        if menu.items.isEmpty {
+            let empty = NSMenuItem(title: "暂无发送历史", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            menu.addItem(empty)
+        }
+        menu.popUp(positioning: nil,
+                   at: NSPoint(x: 0, y: historyButton.bounds.minY - 4),
+                   in: historyButton)
+    }
+
+    @objc private func restoreDeliveryRecord(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
               let recordID = UUID(uuidString: raw) else { return }
         _ = BufferModel.shared.restoreDelivery(recordID: recordID)
     }
 
     @objc private func undoClear() {
         _ = BufferModel.shared.undoLastClear()
-    }
-}
-
-private final class CandidateProjectionView: NSView {
-    private let preedit = NSTextField(labelWithString: "")
-    private let rows = NSStackView()
-    private var actions: [CandidateProjectionAction] = []
-    private var owner: FocusToken?
-    var onAction: ((CandidateProjectionAction, FocusToken) -> Void)?
-    private(set) var preferredHeight: CGFloat = 0
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        translatesAutoresizingMaskIntoConstraints = false
-        wantsLayer = true
-        layer?.cornerRadius = 6
-        layer?.borderWidth = 1
-        rows.orientation = .vertical
-        rows.alignment = .width
-        rows.spacing = 4
-        preedit.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        preedit.textColor = RimeUI.textSecondary
-        let root = NSStackView(views: [preedit, rows])
-        root.orientation = .vertical
-        root.alignment = .leading
-        root.spacing = 4
-        root.edgeInsets = NSEdgeInsets(top: 5, left: 6, bottom: 5, right: 6)
-        root.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(root)
-        NSLayoutConstraint.activate([
-            root.leadingAnchor.constraint(equalTo: leadingAnchor),
-            root.trailingAnchor.constraint(equalTo: trailingAnchor),
-            root.topAnchor.constraint(equalTo: topAnchor),
-            root.bottomAnchor.constraint(equalTo: bottomAnchor),
-        ])
-        update(nil)
-    }
-
-    required init?(coder: NSCoder) { fatalError() }
-
-    func update(_ projection: CandidateProjection?) {
-        actions.removeAll()
-        rows.arrangedSubviews.forEach {
-            rows.removeArrangedSubview($0)
-            $0.removeFromSuperview()
-        }
-        guard let projection else {
-            owner = nil
-            preedit.stringValue = ""
-            preferredHeight = 0
-            isHidden = true
-            return
-        }
-        owner = projection.owner
-        preedit.stringValue = projection.preedit
-        preedit.isHidden = projection.preedit.isEmpty
-        for rowItems in projection.rows.prefix(3) {
-            let row = NSStackView()
-            row.orientation = .horizontal
-            row.alignment = .centerY
-            row.distribution = .fillProportionally
-            row.spacing = 4
-            row.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-            for item in rowItems {
-                let button = FirstMouseButton(title: "\(item.label) \(item.text)",
-                                              target: self,
-                                              action: #selector(tapped(_:)))
-                button.tag = actions.count
-                actions.append(item.action)
-                button.isBordered = false
-                button.focusRingType = .none
-                button.cell?.lineBreakMode = .byTruncatingTail
-                button.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-                button.font = .systemFont(ofSize: 13,
-                                          weight: item.highlighted ? .semibold : .regular)
-                button.contentTintColor = item.highlighted ? RimeUI.candidateBackgroundColor : RimeUI.textPrimary
-                button.wantsLayer = true
-                button.layer?.cornerRadius = 5
-                button.layer?.backgroundColor = item.highlighted
-                    ? RimeUI.selectedCandidateColor.cgColor
-                    : NSColor.clear.cgColor
-                button.toolTip = item.comment.isEmpty ? item.text : "\(item.text) · \(item.comment)"
-                row.addArrangedSubview(button)
-            }
-            rows.addArrangedSubview(row)
-        }
-        let rowCount = min(3, projection.rows.count)
-        preferredHeight = CGFloat(rowCount) * 29
-            + CGFloat(max(0, rowCount - 1)) * 4
-            + (projection.preedit.isEmpty ? 10 : 31)
-        isHidden = false
-        layer?.borderColor = RimeUI.border.cgColor
-        layer?.backgroundColor = RimeUI.candidateBackgroundColor.withAlphaComponent(0.72).cgColor
-    }
-
-    @objc private func tapped(_ sender: NSButton) {
-        guard actions.indices.contains(sender.tag), let owner else { return }
-        onAction?(actions[sender.tag], owner)
     }
 }
 

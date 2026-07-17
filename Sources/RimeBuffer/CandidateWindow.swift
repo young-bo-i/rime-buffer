@@ -259,23 +259,19 @@ enum CandidatePresentationMode {
     case workbench
 }
 
-enum CandidateProjectionAction {
-    case candidate(CandidateSelection)
-    case singleCharacter(index: Int)
-}
-
-struct CandidateProjectionItem {
-    let label: String
-    let text: String
-    let comment: String
-    let highlighted: Bool
-    let action: CandidateProjectionAction
-}
-
-struct CandidateProjection {
-    let owner: FocusToken
-    let preedit: String
-    let rows: [[CandidateProjectionItem]]
+enum CandidatePanelGeometry {
+    static func origin(anchor: NSRect, panelSize: NSSize, visibleFrame: NSRect) -> NSPoint {
+        var x = anchor.minX
+        var y = anchor.minY - panelSize.height - 6
+        if y < visibleFrame.minY {
+            y = anchor.maxY + 6
+        }
+        x = min(max(x, visibleFrame.minX + 6),
+                visibleFrame.maxX - panelSize.width - 6)
+        y = min(max(y, visibleFrame.minY + 6),
+                visibleFrame.maxY - panelSize.height - 6)
+        return NSPoint(x: x, y: y)
+    }
 }
 
 /// In-process candidate window. Candidates default to a compact one-line strip
@@ -339,8 +335,6 @@ final class CandidateWindow {
 
     var onSelect: ((FocusToken, CandidateSelection) -> Void)?
     var onSettings: (() -> Void)?
-    var onProjectionChange: ((CandidateProjection?) -> Void)?
-    var onBufferFlushProgress: ((Double?) -> Void)?
 
     var hasCandidates: Bool {
         guard let ownerToken,
@@ -500,7 +494,7 @@ final class CandidateWindow {
         ) { [weak self] _ in
             self?.applyAppearance()
             self?.renderCandidates()
-            self?.publishProjection()
+            self?.layoutAndShowAccordingToPresentation()
         }
         NotificationCenter.default.addObserver(
             forName: .candidateWindowMetricsDidChange,
@@ -509,7 +503,7 @@ final class CandidateWindow {
         ) { [weak self] _ in
             self?.applyMetrics()
             self?.renderCandidates()
-            self?.publishProjection()
+            self?.layoutAndShowAccordingToPresentation()
         }
     }
 
@@ -561,19 +555,12 @@ final class CandidateWindow {
         preeditLabel.isHidden = preeditLabel.stringValue.isEmpty
         applyAppearance()
         renderCandidates()
-        publishProjection()
-        if presentation == .workbench {
-            panel.orderOut(nil)
-        } else {
-            layoutPanel(caretRect: caretRect, bundleId: bundleId)
-            panel.orderFrontRegardless()
-        }
+        layoutAndShowAccordingToPresentation()
     }
 
     func hide(owner: FocusToken) {
         guard let ownerToken else {
             panel.orderOut(nil)
-            onProjectionChange?(nil)
             return
         }
         guard ownerToken == owner else {
@@ -582,13 +569,11 @@ final class CandidateWindow {
         }
         resetPresentationState()
         panel.orderOut(nil)
-        onProjectionChange?(nil)
     }
 
     func hideAll() {
         resetPresentationState()
         panel.orderOut(nil)
-        onProjectionChange?(nil)
     }
 
     private func resetPresentationState() {
@@ -605,8 +590,13 @@ final class CandidateWindow {
         strip.isHidden = false
     }
 
-    func setBufferFlushProgress(_ progress: Double?) {
-        onBufferFlushProgress?(progress)
+    /// Moving/resizing the passive workbench must not re-read Rime or rebuild
+    /// every candidate button for each drag event. Only the panel origin (and
+    /// its screen-constrained width) depends on this anchor.
+    func syncWorkbenchAnchor(_ anchor: NSRect?) {
+        guard presentationMode == .workbench else { return }
+        lastCaretRect = anchor ?? .zero
+        layoutAndShowAccordingToPresentation()
     }
 
     @discardableResult
@@ -617,9 +607,7 @@ final class CandidateWindow {
         characterSelectionText = candidateText
         characterSelectionIndex = 0
         renderCandidates()
-        publishProjection()
-        layoutPanel(caretRect: lastCaretRect, bundleId: lastBundleId)
-        showAccordingToPresentation()
+        layoutAndShowAccordingToPresentation()
         return true
     }
 
@@ -641,9 +629,7 @@ final class CandidateWindow {
         selectedIndex = clamp(selectedIndex, count: currentContext.candidates.count)
         visualPageIndex = pageIndex(containing: selectedIndex, panelWidth: activePanelWidth())
         renderCandidates()
-        publishProjection()
-        layoutPanel(caretRect: lastCaretRect, bundleId: lastBundleId)
-        showAccordingToPresentation()
+        layoutAndShowAccordingToPresentation()
     }
 
     @discardableResult
@@ -695,9 +681,7 @@ final class CandidateWindow {
         clampExpandedSelectionToVisiblePrefix()
         renderCandidates()
         logExpandedVisiblePrefix(reason: "expand")
-        publishProjection()
-        layoutPanel(caretRect: lastCaretRect, bundleId: lastBundleId)
-        showAccordingToPresentation()
+        layoutAndShowAccordingToPresentation()
         return true
     }
 
@@ -756,9 +740,7 @@ final class CandidateWindow {
         selectedIndex = clamp(selectedIndex, count: currentContext.candidates.count)
         visualPageIndex = pageIndex(containing: selectedIndex, panelWidth: activePanelWidth())
         renderCandidates()
-        publishProjection()
-        layoutPanel(caretRect: lastCaretRect, bundleId: lastBundleId)
-        showAccordingToPresentation()
+        layoutAndShowAccordingToPresentation()
         return true
     }
 
@@ -870,12 +852,9 @@ final class CandidateWindow {
 
         let screen = screen(containing: anchor)
         let vf = screen?.visibleFrame ?? .zero
-        var x = anchor.minX
-        var y = anchor.minY - panel.frame.height - 6
-        if y < vf.minY { y = anchor.maxY + 6 }
-        x = min(max(x, vf.minX + 6), vf.maxX - panel.frame.width - 6)
-        y = min(max(y, vf.minY + 6), vf.maxY - panel.frame.height - 6)
-        return NSPoint(x: x, y: y)
+        return CandidatePanelGeometry.origin(anchor: anchor,
+                                             panelSize: panel.frame.size,
+                                             visibleFrame: vf)
     }
 
     private func isPlausible(_ r: NSRect) -> Bool {
@@ -894,91 +873,23 @@ final class CandidateWindow {
         return min(max(metrics.baseWidth, 360), max(360, visibleWidth))
     }
 
-    private func showAccordingToPresentation() {
-        if presentationMode == .workbench {
+    private func layoutAndShowAccordingToPresentation() {
+        guard let ownerToken,
+              InputFocusCoordinator.shared.interactionTarget(expected: ownerToken) != nil,
+              !currentContext.candidates.isEmpty || !projectionPreedit.isEmpty else {
             panel.orderOut(nil)
-        } else {
-            panel.orderFrontRegardless()
-        }
-    }
-
-    private func publishProjection() {
-        guard presentationMode == .workbench,
-              let ownerToken,
-              InputFocusCoordinator.shared.interactionTarget(expected: ownerToken) != nil else {
-            onProjectionChange?(nil)
             return
         }
-
-        let rows: [[CandidateProjectionItem]]
-        if isSingleCharacterSelectionActive {
-            rows = [Array(characterSelectionText).enumerated().map { index, character in
-                CandidateProjectionItem(
-                    label: "\(index + 1)",
-                    text: String(character),
-                    comment: "",
-                    highlighted: index == characterSelectionIndex,
-                    action: .singleCharacter(index: index)
-                )
-            }]
-        } else if isExpanded {
-            rows = expandedWindowRange().map { pageOffset in
-                expandedPages[pageOffset].candidates.enumerated().map { index, candidate in
-                    CandidateProjectionItem(
-                        label: candidate.label.isEmpty ? "\(index + 1)" : candidate.label,
-                        text: candidate.text,
-                        comment: candidate.comment,
-                        highlighted: pageOffset == expandedSelectionPageOffset && index == selectedIndex,
-                        action: .candidate(CandidateSelection(pageOffset: pageOffset, index: index))
-                    )
-                }
-            }
-        } else {
-            rows = [currentContext.candidates.enumerated().map { index, candidate in
-                CandidateProjectionItem(
-                    label: candidate.label.isEmpty ? "\(index + 1)" : candidate.label,
-                    text: candidate.text,
-                    comment: candidate.comment,
-                    highlighted: index == selectedIndex,
-                    action: .candidate(CandidateSelection(pageOffset: 0, index: index))
-                )
-            }]
-        }
-
-        let nonemptyRows = rows.filter { !$0.isEmpty }
-        guard !nonemptyRows.isEmpty || !projectionPreedit.isEmpty else {
-            onProjectionChange?(nil)
+        // A missing workbench anchor means the bar is privacy-shielded,
+        // protected by Secure Input, or no longer visible on this Space.
+        // Never fall back to a caret location in that case: doing so would
+        // expose the same candidate text the shield is meant to hide.
+        if presentationMode == .workbench, !isPlausible(lastCaretRect) {
+            panel.orderOut(nil)
             return
         }
-        onProjectionChange?(CandidateProjection(owner: ownerToken,
-                                                preedit: projectionPreedit,
-                                                rows: nonemptyRows))
-    }
-
-    func performProjectedAction(_ action: CandidateProjectionAction, owner: FocusToken) {
-        guard ownerToken == owner,
-              InputFocusCoordinator.shared.interactionTarget(expected: owner) != nil else {
-            IMELog.write("candidate stale projected action ignored owner=\(owner)")
-            return
-        }
-        switch action {
-        case let .singleCharacter(index):
-            let chars = Array(characterSelectionText)
-            guard chars.indices.contains(index) else { return }
-            characterSelectionIndex = index
-            renderCandidates()
-        case let .candidate(selection):
-            if isExpanded {
-                guard expandedPages.indices.contains(selection.pageOffset) else { return }
-                expandedSelectionPageOffset = selection.pageOffset
-                selectedIndex = clamp(selection.index,
-                                      count: expandedPages[selection.pageOffset].candidates.count)
-            } else {
-                selectedIndex = clamp(selection.index, count: currentContext.candidates.count)
-                visualPageIndex = pageIndex(containing: selectedIndex, panelWidth: activePanelWidth())
-            }
-            onSelect?(owner, CandidateSelection(pageOffset: selection.pageOffset, index: selectedIndex))
-        }
+        layoutPanel(caretRect: lastCaretRect, bundleId: lastBundleId)
+        panel.orderFrontRegardless()
     }
 
     // MARK: Rendering
@@ -1012,7 +923,6 @@ final class CandidateWindow {
         }
         applyAppearance()
         updateCandidateDocumentSize()
-        publishProjection()
     }
 
     private func renderCompactRow() {

@@ -177,7 +177,7 @@ final class StatusMenu {
 
         let command = [
             "cd \(shellQuote(script.deletingLastPathComponent().path))",
-            "nohup /bin/bash ./build_install.sh > \(shellQuote(installLogURL.path)) 2>&1 &",
+            "nohup env RB_KEEP_USERDB=1 /bin/bash ./build_install.sh > \(shellQuote(installLogURL.path)) 2>&1 &",
         ].joined(separator: " && ")
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
@@ -200,6 +200,7 @@ final class StatusMenu {
     private func installScriptURL() -> URL? {
         let home = URL(fileURLWithPath: NSHomeDirectory())
         let candidates = [
+            home.appendingPathComponent("Documents/DEV/rime-buffer-1/build_install.sh"),
             home.appendingPathComponent("Documents/05-dev/apps/rime-buffer-1/build_install.sh"),
             home.appendingPathComponent("Documents/DEV/rime-buffer/build_install.sh"),
             home.appendingPathComponent("Documents/05-dev/apps/rime-buffer/build_install.sh"),

@@ -89,15 +89,32 @@ if let i = CommandLine.arguments.firstIndex(of: "settings-render"),
     print("rendered settings pages to \(dir)")
     exit(0)
 }
-// Dev-only: `ETInput panel-render <path>` writes the three-layer workbench bar.
+// Dev-only: `ETInput panel-render <path>` renders the actual compact workbench.
 if let i = CommandLine.arguments.firstIndex(of: "panel-render"),
    i + 1 < CommandLine.arguments.count {
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
     app.finishLaunching()
-    WorkbenchBarView.renderDemo(to: CommandLine.arguments[i + 1])
-    print("rendered workbench bar")
-    exit(0)
+    let model = BufferModel.shared
+    model.onChange = nil
+    model.discardForPrivacy()
+    model.stageExternal("这次", origin: .rime)
+    model.append("做了", origin: .mcp(client: "preview"))
+    model.append("缓冲工作台", origin: .remotePeer(deviceID: "preview"))
+    let expanded = i + 2 < CommandLine.arguments.count
+        && CommandLine.arguments[i + 2] == "expanded"
+    let scale: CGFloat = i + 3 < CommandLine.arguments.count
+        ? CGFloat(Double(CommandLine.arguments[i + 3]) ?? 2)
+        : 2
+    let rendered = BufferWindowController.shared.renderForPreview(
+        to: CommandLine.arguments[i + 1],
+        expanded: expanded,
+        scale: scale
+    )
+    print(rendered
+        ? "rendered \(expanded ? "expanded" : "collapsed") workbench @\(scale)x"
+        : "failed to render workbench")
+    exit(rendered ? 0 : 1)
 }
 // Dev-only: `ETInput gateway-serve` runs the local gateway + a runloop and prints
 // each inbound event, so the productized HTTP/MCP path can be exercised by curl
@@ -145,13 +162,6 @@ candidateWindow.onSelect = { owner, selection in
 candidateWindow.onSettings = {
     SettingsWindowController.shared.show()
 }
-candidateWindow.onProjectionChange = { projection in
-    BufferWindowController.shared.updateCandidateProjection(projection)
-}
-candidateWindow.onBufferFlushProgress = { progress in
-    BufferWindowController.shared.setFlushProgress(progress)
-}
-
 // Buffer presentation is independent from the caret-owned candidate panel.
 BufferModel.shared.onChange = {
     BufferWindowController.shared.refresh()
@@ -1052,7 +1062,7 @@ func runBufferSmokeTest() -> Bool {
     let oldEnabled = model.enabled
     let oldOnChange = model.onChange
     defer {
-        model.clear()
+        model.discardForPrivacy()
         model.enabled = oldEnabled
         model.onChange = oldOnChange
     }
@@ -1061,9 +1071,8 @@ func runBufferSmokeTest() -> Bool {
     model.enabled = true
     model.clear()
 
-    // Accepted delivery attempts remain visible, but are no longer pending.
-    // This is the no-ACK safety rule and also prevents retrying an accepted
-    // prefix after a later block failed.
+    // Accepted delivery attempts disappear from the live workbench while an
+    // in-memory history snapshot remains available for deliberate restoration.
     model.append("你")
     model.append("好")
     let firstID = model.blocks[0].id
@@ -1077,21 +1086,25 @@ func runBufferSmokeTest() -> Bool {
         print("FAILED: delivery record was not appended")
         return false
     }
-    guard model.blocks.map(\.text) == ["你", "好"],
+    guard model.blocks.map(\.text) == ["好"],
           model.pendingDeliveryBlocks.map(\.id) == [secondID],
+          model.insertionIndex == 1,
+          firstRecord.originalOrder == [firstID, secondID],
+          firstRecord.blocks.map(\.id) == [firstID],
+          firstRecord.blocks[0].lastSentAt != nil,
           model.enabled else {
-        print("FAILED: delivery record must retain blocks and skip accepted prefix")
+        print("FAILED: accepted delivery must consume only the accepted block")
         return false
     }
     guard model.restoreDelivery(recordID: firstRecord.id),
-          Set(model.pendingDeliveryBlocks.map(\.id)) == Set([firstID, secondID]) else {
-        print("FAILED: delivery history restore should mark blocks pending")
+          model.blocks.map(\.id) == [firstID, secondID],
+          model.pendingDeliveryBlocks.map(\.id) == [firstID, secondID] else {
+        print("FAILED: delivery history restore should recover the consumed prefix")
         return false
     }
 
-    // A delivery snapshot can rebuild blocks after the user explicitly clears
-    // the visible workbench; restoring is deliberate and marks every block as
-    // pending rather than claiming to undo text in the destination app.
+    // A full accepted delivery leaves an empty live workbench. Its snapshot can
+    // still rebuild the blocks for a deliberate re-send/edit action.
     model.recordDelivery(blockIDs: [firstID, secondID],
                          targetBundleID: "com.example.target",
                          targetName: "Target")
@@ -1099,11 +1112,13 @@ func runBufferSmokeTest() -> Bool {
         print("FAILED: missing recovery delivery record")
         return false
     }
-    model.clear()
-    guard model.restoreDelivery(recordID: recoveryRecord.id),
+    guard model.blocks.isEmpty,
+          model.pendingDeliveryBlocks.isEmpty,
+          model.insertionIndex == 0,
+          model.restoreDelivery(recordID: recoveryRecord.id),
           model.blocks.map(\.text) == ["你", "好"],
           model.pendingDeliveryBlocks.map(\.id) == [firstID, secondID] else {
-        print("FAILED: cleared delivery history recovery")
+        print("FAILED: full delivery history recovery")
         return false
     }
 
@@ -1122,6 +1137,26 @@ func runBufferSmokeTest() -> Bool {
     guard model.blocks.isEmpty, model.enabled, model.canUndoClear,
           model.undoLastClear(), model.blocks.map(\.text) == ["你", "好"] else {
         print("FAILED: clear/undo semantics")
+        return false
+    }
+
+    // Non-adjacent accepted blocks must return to their exact relative slots,
+    // using unsent neighbours from the complete pre-delivery order as anchors.
+    model.clear()
+    model.append("甲")
+    model.append("乙")
+    model.append("丙")
+    model.append("丁")
+    let originalOrder = model.blocks.map(\.id)
+    model.recordDelivery(blockIDs: [originalOrder[1], originalOrder[3]],
+                         targetBundleID: "com.example.target",
+                         targetName: "Target")
+    guard let interleavedRecord = model.sentHistory.last,
+          model.blocks.map(\.id) == [originalOrder[0], originalOrder[2]],
+          model.insertionIndex == 2,
+          model.restoreDelivery(recordID: interleavedRecord.id),
+          model.blocks.map(\.id) == originalOrder else {
+        print("FAILED: non-adjacent delivery restore order")
         return false
     }
 
@@ -1168,13 +1203,16 @@ func runBufferSmokeTest() -> Bool {
         return false
     }
 
-    // Per-block editing preserves provenance/identity/time and invalidates a
-    // previous sent mark.
+    // A consumed block can be restored and edited while preserving its stable
+    // provenance/identity/time. Restored live blocks never carry sent markers.
     let editedBefore = model.blocks[1]
     model.recordDelivery(blockIDs: [editedBefore.id],
                          targetBundleID: "com.example.target",
                          targetName: "Target")
-    guard model.updateBlock(id: editedBefore.id, text: "二改"),
+    guard let editRecord = model.sentHistory.last,
+          !model.blocks.contains(where: { $0.id == editedBefore.id }),
+          model.restoreDelivery(recordID: editRecord.id),
+          model.updateBlock(id: editedBefore.id, text: "二改"),
           let edited = model.blocks.first(where: { $0.id == editedBefore.id }),
           edited.origin == editedBefore.origin,
           edited.createdAt == editedBefore.createdAt,
@@ -1190,14 +1228,19 @@ func runBufferSmokeTest() -> Bool {
         return false
     }
 
-    if let blockID = model.blocks.first?.id {
-        for _ in 0..<55 {
-            model.recordDelivery(blockIDs: [blockID],
-                                 targetBundleID: "com.example.target",
-                                 targetName: "Target")
+    for index in 0..<55 {
+        let text = "历史\(index)"
+        model.append(text)
+        guard let blockID = model.blocks.first(where: { $0.text == text })?.id else {
+            print("FAILED: history-cap setup could not find appended block")
+            return false
         }
+        model.recordDelivery(blockIDs: [blockID],
+                             targetBundleID: "com.example.target",
+                             targetName: "Target")
     }
-    guard model.sentHistory.count == 50 else {
+    guard model.sentHistory.count == 50,
+          model.sentHistory.last?.blocks.first?.text == "历史54" else {
         print("FAILED: delivery history must retain exactly the latest 50 records")
         return false
     }
@@ -1216,6 +1259,137 @@ func runBufferSmokeTest() -> Bool {
 
 func runBufferWindowSmokeTest() -> Bool {
     print("== RimeBuffer buffer window smoke test ==")
+
+    guard BufferControlRoutingRules.disposition(
+            bufferActive: false, ownClient: false, exactFocus: true
+          ) == .passThrough,
+          BufferControlRoutingRules.disposition(
+            bufferActive: true, ownClient: true, exactFocus: true
+          ) == .passThrough,
+          BufferControlRoutingRules.disposition(
+            bufferActive: true, ownClient: false, exactFocus: true
+          ) == .executeBufferAction,
+          BufferControlRoutingRules.disposition(
+            bufferActive: true, ownClient: false, exactFocus: false
+          ) == .consumeOnly else {
+        print("FAILED: buffer Return/Backspace isolation disposition")
+        return false
+    }
+
+    let halfHoldDecision = BufferEnterGestureRules.pollDecision(
+        isPhysicalDown: true,
+        elapsed: 0.6,
+        holdDelay: 1.2
+    )
+    let halfHoldProgress: Double
+    if case let .wait(progress) = halfHoldDecision {
+        halfHoldProgress = progress
+    } else {
+        halfHoldProgress = -1
+    }
+    guard BufferEnterGestureRules.pollDecision(
+            isPhysicalDown: false,
+            elapsed: 0.2,
+            holdDelay: 1.2
+          ) == .sendNext,
+          // A delayed poll after a quick release must remain a tap, never an
+          // accidental send-all just because wall time crossed the threshold.
+          BufferEnterGestureRules.pollDecision(
+            isPhysicalDown: false,
+            elapsed: 2.0,
+            holdDelay: 1.2
+          ) == .sendNext,
+          abs(halfHoldProgress - 0.5) < 0.000_001,
+          BufferEnterGestureRules.pollDecision(
+            isPhysicalDown: true,
+            elapsed: 1.2,
+            holdDelay: 1.2
+          ) == .sendAll else {
+        print("FAILED: buffer Enter tap/hold poll decision")
+        return false
+    }
+
+    // Sending the final transient block makes buffer routing pass-through
+    // immediately, but the keyUp and newline command from that already-owned
+    // physical press must remain consumed independently of model state.
+    var lateCommandOwnership = BufferEnterCallbackOwnership()
+    lateCommandOwnership.claimPress()
+    let inactiveAfterFinalBlock = BufferControlRoutingRules.disposition(
+        bufferActive: false,
+        ownClient: false,
+        exactFocus: true
+    )
+    guard inactiveAfterFinalBlock == .passThrough,
+          lateCommandOwnership.consumeKeyUp() == .consumeOwned,
+          lateCommandOwnership.suppressesNewlineCommand,
+          lateCommandOwnership.routeNewlineCommand() == .consumeOwned,
+          // Duplicate/stale callbacks from the same generation remain hidden;
+          // command delivery itself must not consume the protection.
+          lateCommandOwnership.routeNewlineCommand() == .consumeOwned,
+          lateCommandOwnership.prepareForKeyDown(isRepeat: false) == .routeFresh,
+          !lateCommandOwnership.ownsCallbacks else {
+        print("FAILED: final-block Enter callbacks must stay owned after buffer deactivation")
+        return false
+    }
+
+    // Some hosts deliver insertNewline: before keyUp. Consuming the command
+    // must retain both keyUp ownership and duplicate-command suppression until
+    // a definite fresh press starts.
+    var commandFirstOwnership = BufferEnterCallbackOwnership()
+    commandFirstOwnership.claimPress()
+    guard commandFirstOwnership.routeNewlineCommand() == .consumeOwned,
+          commandFirstOwnership.suppressesKeyUp,
+          commandFirstOwnership.suppressesNewlineCommand,
+          commandFirstOwnership.consumeKeyUp() == .consumeOwned,
+          commandFirstOwnership.ownsCallbacks,
+          commandFirstOwnership.prepareForKeyDown(isRepeat: false) == .routeFresh,
+          !commandFirstOwnership.ownsCallbacks else {
+        print("FAILED: command-before-keyUp Enter ownership")
+        return false
+    }
+
+    // A host may omit didCommand entirely. The next real non-repeat keyDown
+    // retires that old debt and routes the same new press immediately. Repeats
+    // from a still-owned press remain consumed.
+    var nextPressOwnership = BufferEnterCallbackOwnership()
+    nextPressOwnership.claimPress()
+    _ = nextPressOwnership.consumeKeyUp()
+    guard nextPressOwnership.prepareForKeyDown(isRepeat: false) == .routeFresh,
+          !nextPressOwnership.ownsCallbacks else {
+        print("FAILED: fresh Enter must retire omitted-command debt without press-twice")
+        return false
+    }
+    var repeatOwnership = BufferEnterCallbackOwnership()
+    repeatOwnership.claimPress()
+    guard repeatOwnership.prepareForKeyDown(isRepeat: true) == .consumeOwned,
+          repeatOwnership.suppressesKeyUp,
+          repeatOwnership.suppressesNewlineCommand else {
+        print("FAILED: Enter auto-repeat must remain attached to owned press")
+        return false
+    }
+    var duplicateKeyUpOwnership = BufferEnterCallbackOwnership()
+    duplicateKeyUpOwnership.claimPress()
+    guard duplicateKeyUpOwnership.consumeKeyUp() == .consumeOwned,
+          duplicateKeyUpOwnership.suppressesKeyUp,
+          duplicateKeyUpOwnership.consumeKeyUp() == .consumeOwned,
+          duplicateKeyUpOwnership.prepareForKeyDown(isRepeat: false) == .routeFresh,
+          !duplicateKeyUpOwnership.ownsCallbacks else {
+        print("FAILED: duplicate/late keyUp suppression must survive until fresh press")
+        return false
+    }
+
+    // A defensive didCommand callback never retires a generation, even if a
+    // newer Return is physically down. Only the authoritative NSEvent keyDown
+    // may declare and route a fresh press.
+    var commandDuringNextPress = BufferEnterCallbackOwnership()
+    commandDuringNextPress.claimPress()
+    _ = commandDuringNextPress.consumeKeyUp()
+    guard commandDuringNextPress.routeNewlineCommand() == .consumeOwned,
+          commandDuringNextPress.prepareForKeyDown(isRepeat: false) == .routeFresh,
+          !commandDuringNextPress.ownsCallbacks else {
+        print("FAILED: didCommand must not retire Enter ownership")
+        return false
+    }
 
     guard BufferWindowVisibilityRules.isVisibleOnActiveSpace(
             isOrdered: true,
@@ -1423,6 +1597,7 @@ func runBufferWindowSmokeTest() -> Bool {
             hasEvent: true,
             reusesExactOwner: true,
             compositionActive: true,
+            markedRangeReliable: true,
             markedRangeWasObservable: true,
             markedRangeIsMissing: true
           ),
@@ -1430,7 +1605,16 @@ func runBufferWindowSmokeTest() -> Bool {
             hasEvent: true,
             reusesExactOwner: true,
             compositionActive: true,
+            markedRangeReliable: true,
             markedRangeWasObservable: false,
+            markedRangeIsMissing: true
+          ),
+          !FocusActivationRules.eventRevealsFieldChange(
+            hasEvent: true,
+            reusesExactOwner: true,
+            compositionActive: true,
+            markedRangeReliable: false,
+            markedRangeWasObservable: true,
             markedRangeIsMissing: true
           ) else {
         print("FAILED: provisional/lifecycle focus rules")
@@ -1570,8 +1754,15 @@ func runBufferWindowSmokeTest() -> Bool {
     let rail = BufferInlineView()
     _ = rail.refresh()
     let renderedBeforeShield = !rail.isHidden && rail.renderedBlockCount == 1
+    let stableRenderPass = rail.renderPassCount
+    let rebuiltUnchangedRail = rail.refresh()
+    let skippedUnchangedRail = !rebuiltUnchangedRail && rail.renderPassCount == stableRenderPass
+    rail.setEnterHoldProgress(0.6)
+    let showedEnterHoldProgress = rail.isEnterHoldProgressVisible
     _ = rail.refresh(shielded: true)
-    let scrubbedByShield = rail.isHidden && rail.renderedBlockCount == 0
+    let scrubbedByShield = rail.isHidden
+        && rail.renderedBlockCount == 0
+        && !rail.isEnterHoldProgressVisible
     model.discardForPrivacy()
     model.beginTransientLoading(requestId: "clear-loading-smoke",
                                 message: "loading")
@@ -1580,7 +1771,8 @@ func runBufferWindowSmokeTest() -> Bool {
     model.enabled = oldEnabled
     model.clear()
     model.onChange = oldOnChange
-    guard renderedBeforeShield, scrubbedByShield, canClearLoadingOnlyState else {
+    guard renderedBeforeShield, skippedUnchangedRail, showedEnterHoldProgress,
+          scrubbedByShield, canClearLoadingOnlyState else {
         print("FAILED: buffer rail privacy or loading-clear behavior")
         return false
     }
@@ -1593,8 +1785,74 @@ func runBufferWindowSmokeTest() -> Bool {
                                                      fallback: primary)
     guard primary.contains(restored),
           restored.width >= BufferWindowGeometry.standardMinimumWidth,
-          restored.height >= BufferWindowGeometry.standardMinimumHeight else {
+          restored.height == BufferWindowGeometry.collapsedHeight else {
         print("FAILED: offscreen frame was not restored to fallback screen", restored)
+        return false
+    }
+
+    let legacyWorkbench = NSRect(x: 120, y: 220, width: 680, height: 340)
+    let migrated = BufferWindowGeometry.clampedFrame(legacyWorkbench,
+                                                      visibleFrames: [primary],
+                                                      fallback: primary)
+    let anchor = BufferWindowGeometry.candidateAnchor(for: migrated)
+    let candidateSize = NSSize(width: 420, height: 60)
+    let belowBar = CandidatePanelGeometry.origin(anchor: anchor,
+                                                  panelSize: candidateSize,
+                                                  visibleFrame: primary)
+    let bottomPanel = BufferWindowGeometry.clampedFrame(
+        NSRect(x: 120, y: 8, width: 600,
+               height: BufferWindowGeometry.collapsedHeight),
+        expanded: true,
+        visibleFrames: [primary],
+        fallback: primary
+    )
+    let bottomAnchor = BufferWindowGeometry.candidateAnchor(for: bottomPanel)
+    let flippedAbove = CandidatePanelGeometry.origin(anchor: bottomAnchor,
+                                                      panelSize: candidateSize,
+                                                      visibleFrame: primary)
+    let rightEdgeAnchor = NSRect(x: 1430, y: 400, width: 4, height: 4)
+    let clampedCandidate = CandidatePanelGeometry.origin(anchor: rightEdgeAnchor,
+                                                         panelSize: candidateSize,
+                                                         visibleFrame: primary)
+    let oldCompact = NSRect(x: 180, y: 240, width: 680, height: 52)
+    let migratedOldCompact = BufferWindowGeometry.clampedFrame(
+        oldCompact,
+        visibleFrames: [primary],
+        fallback: primary
+    )
+    let expanded = BufferWindowGeometry.clampedFrame(
+        migratedOldCompact,
+        expanded: true,
+        visibleFrames: [primary],
+        fallback: primary
+    )
+    let collapsedAgain = BufferWindowGeometry.clampedFrame(
+        expanded,
+        expanded: false,
+        visibleFrames: [primary],
+        fallback: primary
+    )
+    let aligned = BufferWindowGeometry.pixelAligned(
+        NSRect(x: 10.24, y: 20.26, width: 680.24, height: 44),
+        scale: 2
+    )
+    guard migrated.height == BufferWindowGeometry.collapsedHeight,
+          migrated.maxY == legacyWorkbench.maxY,
+          migratedOldCompact.minY == oldCompact.minY,
+          expanded.height == BufferWindowGeometry.expandedHeight,
+          expanded.minY == migratedOldCompact.minY,
+          collapsedAgain.height == BufferWindowGeometry.collapsedHeight,
+          collapsedAgain.minY == expanded.minY,
+          anchor.minY == migrated.minY,
+          anchor.maxY == migrated.maxY,
+          anchor.minX > migrated.minX,
+          anchor.maxX < migrated.maxX,
+          belowBar.y + candidateSize.height < anchor.minY,
+          flippedAbove.y > bottomAnchor.maxY,
+          clampedCandidate.x + candidateSize.width <= primary.maxX - 6,
+          aligned.minX * 2 == (aligned.minX * 2).rounded(),
+          aligned.minY * 2 == (aligned.minY * 2).rounded() else {
+        print("FAILED: legacy workbench did not migrate to a compact anchored bar", migrated, anchor)
         return false
     }
 
@@ -1603,7 +1861,7 @@ func runBufferWindowSmokeTest() -> Bool {
                                                    visibleFrames: [primary, secondary],
                                                    fallback: primary)
     guard fitted.width <= secondary.width,
-          fitted.height <= secondary.height,
+          fitted.height == BufferWindowGeometry.collapsedHeight,
           secondary.contains(fitted) else {
         print("FAILED: oversized frame was not clamped to its screen", fitted)
         return false

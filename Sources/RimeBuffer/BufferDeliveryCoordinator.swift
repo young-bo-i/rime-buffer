@@ -3,7 +3,7 @@ import Carbon.HIToolbox
 
 /// The only coordinator allowed to turn staged blocks into Delivery.insert
 /// calls. It validates one live focus lease, resolves composition deliberately,
-/// and records accepted attempts without deleting the user's draft.
+/// and consumes only the blocks whose insert attempts were accepted.
 final class BufferDeliveryCoordinator {
     static let shared = BufferDeliveryCoordinator()
 
@@ -20,9 +20,9 @@ final class BufferDeliveryCoordinator {
             case .noFocusedField: return "请先点选要接收文字的外部文本框"
             case .composing: return "正在组字，结束组字后才能发送"
             case .secureInput: return "安全输入已开启，发送被保护性禁用"
-            case .nothingPending: return "所有块都已尝试发送；可从历史恢复后重发"
+            case .nothingPending: return "缓冲区没有待发送内容"
             case .targetChanged: return "输入焦点已经变化，发送已停止"
-            case .deliveryRejected: return "目标拒绝了发送，缓冲内容仍然保留"
+            case .deliveryRejected: return "目标拒绝了发送，未发送内容仍然保留"
             }
         }
     }
@@ -70,20 +70,32 @@ final class BufferDeliveryCoordinator {
     }
 
     @discardableResult
-    func sendNext(resolveCompositionIfNeeded: Bool = true) -> SendResult {
-        send(all: false, resolveCompositionIfNeeded: resolveCompositionIfNeeded)
+    func sendNext(resolveCompositionIfNeeded: Bool = true,
+                  expectedToken: FocusToken? = nil) -> SendResult {
+        send(all: false,
+             resolveCompositionIfNeeded: resolveCompositionIfNeeded,
+             expectedToken: expectedToken)
     }
 
     @discardableResult
-    func sendAll(resolveCompositionIfNeeded: Bool = true) -> SendResult {
-        send(all: true, resolveCompositionIfNeeded: resolveCompositionIfNeeded)
+    func sendAll(resolveCompositionIfNeeded: Bool = true,
+                 expectedToken: FocusToken? = nil) -> SendResult {
+        send(all: true,
+             resolveCompositionIfNeeded: resolveCompositionIfNeeded,
+             expectedToken: expectedToken)
     }
 
-    private func send(all: Bool, resolveCompositionIfNeeded: Bool) -> SendResult {
+    private func send(all: Bool,
+                      resolveCompositionIfNeeded: Bool,
+                      expectedToken: FocusToken?) -> SendResult {
         dispatchPrecondition(condition: .onQueue(.main))
-        guard var target = InputFocusCoordinator.shared.liveTarget() else {
-            IMELog.write("buffer send blocked: no live target")
-            return SendResult(sentCount: 0, blockedReason: .noFocusedField)
+        let initialTarget = expectedToken.flatMap {
+            InputFocusCoordinator.shared.liveTarget(expected: $0)
+        } ?? (expectedToken == nil ? InputFocusCoordinator.shared.liveTarget() : nil)
+        guard var target = initialTarget else {
+            let reason: BlockedReason = expectedToken == nil ? .noFocusedField : .targetChanged
+            IMELog.write("buffer send blocked: \(reason.message)")
+            return SendResult(sentCount: 0, blockedReason: reason)
         }
 
         if target.compositionActive {

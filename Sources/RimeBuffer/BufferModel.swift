@@ -67,9 +67,9 @@ enum BufferPrivacyTransitionRules {
     }
 }
 
-/// Append-only staging buffer. Rime commits establish block boundaries before
-/// they enter this model, so editing can preserve identity/provenance without
-/// reviving the old diff/reconcile machinery.
+/// Ordered staging buffer. Rime commits establish block boundaries before they
+/// enter this model, so editing and delivery can preserve identity/provenance
+/// without reviving the old diff/reconcile machinery.
 final class BufferModel {
     static let shared = BufferModel()
 
@@ -101,6 +101,11 @@ final class BufferModel {
     struct DeliveryRecord {
         let id = UUID()
         let blocks: [Block]
+        /// Complete live ordering immediately before this delivery. Keeping
+        /// the surrounding block IDs lets a later restore recover the exact
+        /// relative position of blocks that disappeared after a successful
+        /// insert attempt.
+        let originalOrder: [UUID]
         let targetBundleID: String
         let targetName: String
         let sentAt = Date()
@@ -284,65 +289,89 @@ final class BufferModel {
         return true
     }
 
-    /// Retain successfully attempted blocks in the workbench but mark them so a
-    /// retry after a partial send skips the accepted prefix.
+    /// Record accepted delivery attempts and consume those blocks from the live
+    /// workbench in one model mutation. The history snapshot remains available
+    /// for an explicit restore, but accepted blocks disappear immediately and
+    /// cannot be retried accidentally.
     func recordDelivery(blockIDs: [UUID], targetBundleID: String, targetName: String) {
         guard !blockIDs.isEmpty else { return }
         let ids = Set(blockIDs)
         let sentAt = Date()
-        var snapshots: [Block] = []
-        for index in blocks.indices where ids.contains(blocks[index].id) {
-            blocks[index].lastSentAt = sentAt
-            blocks[index].lastSentTargetBundleID = targetBundleID
-            snapshots.append(blocks[index])
+        let originalOrder = blocks.map(\.id)
+        let deliveredIndexes = blocks.indices.filter { ids.contains(blocks[$0].id) }
+        let snapshots = deliveredIndexes.map { index -> Block in
+            var snapshot = blocks[index]
+            snapshot.lastSentAt = sentAt
+            snapshot.lastSentTargetBundleID = targetBundleID
+            return snapshot
         }
         guard !snapshots.isEmpty else { return }
+
+        let removedBeforeInsertion = deliveredIndexes.reduce(into: 0) { count, index in
+            if index < insertionIndex { count += 1 }
+        }
+        blocks.removeAll { ids.contains($0.id) }
+        insertionIndex -= removedBeforeInsertion
+        clampInsertionIndexInPlace()
+        settleTransientIfIdle()
+
         sentHistory.append(DeliveryRecord(blocks: snapshots,
+                                          originalOrder: originalOrder,
                                           targetBundleID: targetBundleID,
                                           targetName: targetName))
         if sentHistory.count > 50 {
             sentHistory.removeFirst(sentHistory.count - 50)
         }
-        IMELog.write("buffer delivery recorded blocks=\(snapshots.count) target=\(targetBundleID)")
+        IMELog.write("buffer delivery consumed blocks=\(snapshots.count) remaining=\(blocks.count) target=\(targetBundleID)")
         notifyChange()
     }
 
-    /// Restore a delivery record for deliberate re-send/edit. Existing blocks
-    /// are marked pending; explicitly cleared blocks are recovered from the
-    /// in-memory snapshot. This does not claim to remove text from the host app.
+    /// Restore a delivery record for deliberate re-send/edit. Missing blocks
+    /// are placed relative to every surviving block from the original live
+    /// order, rather than merely appended in delivery-history order. This does
+    /// not claim to remove text from the host app.
     @discardableResult
     func restoreDelivery(recordID: UUID) -> Bool {
         guard let record = sentHistory.first(where: { $0.id == recordID }) else { return false }
         var changed = false
-        for (recordIndex, snapshot) in record.blocks.enumerated() {
+        let originalIndexes = Dictionary(uniqueKeysWithValues: record.originalOrder.enumerated().map {
+            ($0.element, $0.offset)
+        })
+        let orderedSnapshots = record.blocks.sorted {
+            (originalIndexes[$0.id] ?? Int.max) < (originalIndexes[$1.id] ?? Int.max)
+        }
+
+        for snapshot in orderedSnapshots {
             if let index = blocks.firstIndex(where: { $0.id == snapshot.id }) {
-                blocks[index].lastSentAt = nil
-                blocks[index].lastSentTargetBundleID = nil
+                if blocks[index].lastSentAt != nil || blocks[index].lastSentTargetBundleID != nil {
+                    blocks[index].lastSentAt = nil
+                    blocks[index].lastSentTargetBundleID = nil
+                    changed = true
+                }
             } else {
-                // Reinsert before the next surviving snapshot, or immediately
-                // after the nearest prior snapshot. This recovers [A, B] from
-                // [B] as [A, B] without reordering unrelated/current blocks.
-                let laterSnapshots = record.blocks.dropFirst(recordIndex + 1)
-                let nextIndex = laterSnapshots.compactMap { later in
-                    blocks.firstIndex(where: { $0.id == later.id })
+                let originalIndex = originalIndexes[snapshot.id] ?? record.originalOrder.count
+                let laterIDs = record.originalOrder.dropFirst(min(originalIndex + 1,
+                                                                   record.originalOrder.count))
+                let nextIndex = laterIDs.compactMap { laterID in
+                    blocks.firstIndex(where: { $0.id == laterID })
                 }.first
-                let earlierSnapshots = record.blocks.prefix(recordIndex).reversed()
-                let previousIndex = earlierSnapshots.compactMap { earlier in
-                    blocks.firstIndex(where: { $0.id == earlier.id })
+                let earlierIDs = record.originalOrder.prefix(min(originalIndex,
+                                                                  record.originalOrder.count)).reversed()
+                let previousIndex = earlierIDs.compactMap { earlierID in
+                    blocks.firstIndex(where: { $0.id == earlierID })
                 }.first
                 let insertionIndex = nextIndex
                     ?? previousIndex.map { min($0 + 1, blocks.count) }
-                    ?? blocks.count
-                blocks.insert(Block(id: snapshot.id,
-                                    text: snapshot.text,
-                                    origin: snapshot.origin,
-                                    createdAt: snapshot.createdAt),
-                              at: insertionIndex)
+                    ?? min(originalIndex, blocks.count)
+                var restored = snapshot
+                restored.lastSentAt = nil
+                restored.lastSentTargetBundleID = nil
+                blocks.insert(restored, at: insertionIndex)
+                changed = true
             }
-            changed = true
         }
-        insertionIndex = blocks.count
         if changed {
+            insertionIndex = blocks.count
             IMELog.write("buffer delivery restored record=\(recordID) blocks=\(record.blocks.count)")
             notifyChange()
         }

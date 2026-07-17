@@ -145,11 +145,13 @@ enum FocusActivationRules {
     static func eventRevealsFieldChange(hasEvent: Bool,
                                         reusesExactOwner: Bool,
                                         compositionActive: Bool,
+                                        markedRangeReliable: Bool,
                                         markedRangeWasObservable: Bool,
                                         markedRangeIsMissing: Bool) -> Bool {
         hasEvent
             && reusesExactOwner
             && compositionActive
+            && markedRangeReliable
             && markedRangeWasObservable
             && markedRangeIsMissing
     }
@@ -174,6 +176,7 @@ final class FocusLease {
     let clientIdentityWasReused: Bool
     var deliverySuspended = false
     var compositionActive = false
+    var markedRangeReliable = true
     var markedRangeWasObservable = false
 
     init(token: FocusToken,
@@ -386,6 +389,7 @@ final class InputFocusCoordinator {
         let shouldInspectMarkedRange = eventTimestamp != nil
             && reusesExactOwner
             && owner?.compositionActive == true
+            && owner?.markedRangeReliable == true
             && owner?.markedRangeWasObservable == true
         let markedRangeIsMissing = shouldInspectMarkedRange
             && client.markedRange().location == NSNotFound
@@ -393,6 +397,7 @@ final class InputFocusCoordinator {
             hasEvent: eventTimestamp != nil,
             reusesExactOwner: reusesExactOwner,
             compositionActive: owner?.compositionActive == true,
+            markedRangeReliable: owner?.markedRangeReliable == true,
             markedRangeWasObservable: owner?.markedRangeWasObservable == true,
             markedRangeIsMissing: markedRangeIsMissing
         )
@@ -518,14 +523,23 @@ final class InputFocusCoordinator {
         return owner
     }
 
-    func setCompositionActive(_ active: Bool, token: FocusToken) {
+    /// `markedRangeReliable` is false while the buffer keeps IMK alive with an
+    /// invisible zero-width placeholder: hosts report that placeholder's marked
+    /// range inconsistently (NSNotFound during fast chords / in terminals /
+    /// Electron), so arming the marked-range field-change detector on it makes
+    /// activate() spuriously fresh-epoch a valid key and drop it — the user then
+    /// has to press again (broken 并击, F4 "select twice"). Identity + bundle +
+    /// PID still guard delivery; only this one unreliable signal is skipped.
+    func setCompositionActive(_ active: Bool, token: FocusToken, markedRangeReliable: Bool = true) {
         guard let owner, owner.token == token, epochs.isCurrent(token) else { return }
+        owner.markedRangeReliable = markedRangeReliable
         if active,
+           markedRangeReliable,
            !owner.markedRangeWasObservable,
            let client = owner.client,
            client.markedRange().location != NSNotFound {
             owner.markedRangeWasObservable = true
-        } else if !active {
+        } else if !active || !markedRangeReliable {
             owner.markedRangeWasObservable = false
         }
         guard owner.compositionActive != active else { return }
