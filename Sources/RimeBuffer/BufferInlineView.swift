@@ -2,8 +2,7 @@ import Cocoa
 import QuartzCore
 
 /// Compact block rail used by the independent workbench window. It never holds
-/// an IMK client or action buttons: delivery/clear live in the expandable
-/// controller shelf, while this view only renders and selects staged blocks.
+/// an IMK client or action buttons; it only renders and selects staged blocks.
 final class BufferInlineView: NSView {
     private struct RenderedBlock: Equatable {
         let id: UUID
@@ -37,11 +36,6 @@ final class BufferInlineView: NSView {
     var onSelectionChange: ((UUID?) -> Void)?
     var renderedBlockCount: Int { renderedBlockIDs.count }
     var isEnterHoldProgressVisible: Bool { enterHoldProgress != nil }
-    var canClearContent: Bool {
-        !contentShielded
-            && (!BufferModel.shared.blocks.isEmpty
-                || BufferModel.shared.loadingMessage != nil)
-    }
 
     var preferredHeight: CGFloat {
         34
@@ -278,12 +272,12 @@ final class BufferInlineView: NSView {
         box.focusRingType = .none
         box.setButtonType(.momentaryChange)
         box.wantsLayer = true
-        box.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(
+        box.layer?.backgroundColor = RimeUI.accentBlue.withAlphaComponent(
             RimeUI.isNight ? 0.22 : 0.14
         ).cgColor
         box.layer?.cornerRadius = 6
         box.layer?.borderWidth = selectedBlockID == block.id ? 1 : 0
-        box.layer?.borderColor = NSColor.controlAccentColor.cgColor
+        box.layer?.borderColor = RimeUI.accentBlue.cgColor
         box.toolTip = block.text
         row.translatesAutoresizingMaskIntoConstraints = false
         box.addSubview(row)
@@ -312,11 +306,11 @@ final class BufferInlineView: NSView {
 
         let box = NSView()
         box.wantsLayer = true
-        box.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(
+        box.layer?.backgroundColor = RimeUI.accentBlue.withAlphaComponent(
             RimeUI.isNight ? 0.34 : 0.22
         ).cgColor
         box.layer?.borderWidth = 1
-        box.layer?.borderColor = NSColor.controlAccentColor.withAlphaComponent(0.45).cgColor
+        box.layer?.borderColor = RimeUI.accentBlue.withAlphaComponent(0.45).cgColor
         box.layer?.cornerRadius = 6
         box.toolTip = text
         row.translatesAutoresizingMaskIntoConstraints = false
@@ -386,8 +380,8 @@ final class BufferInlineView: NSView {
     private func applyAppearance() {
         layer?.backgroundColor = RimeUI.candidateBackgroundColor.cgColor
         layer?.borderColor = RimeUI.borderStrong.cgColor
-        caretView.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
-        enterHoldProgressLayer.backgroundColor = NSColor.controlAccentColor.cgColor
+        caretView.layer?.backgroundColor = RimeUI.accentBlue.cgColor
+        enterHoldProgressLayer.backgroundColor = RimeUI.accentBlue.cgColor
         emptyLabel.textColor = RimeUI.isNight ? RimeUI.textSecondary : RimeUI.textMuted
     }
 
@@ -549,7 +543,7 @@ final class HoldProgressButton: FirstMouseButton {
         guard progressVisible,
               progressAmount > 0,
               let symbol = image,
-              let tinted = tintedSymbolImage(symbol, color: NSColor.controlAccentColor) else {
+              let tinted = tintedSymbolImage(symbol, color: RimeUI.accentBlue) else {
             return
         }
 

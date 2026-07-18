@@ -1,6 +1,6 @@
 # Enter输入法 (ETInput) · 系统架构
 
-版本：2026-07-17 · 权威全局架构文档
+版本：2026-07-18 · 权威全局架构文档
 关系：本文档描述**整个系统**（既有输入核心 + 缓冲工作台）。`WORKBENCH-DESIGN.md` 是工作台的产品方案与决策记录；`ARCHITECTURE.md` 是 P1 时代的交接文档（已滞后，仅存档）。三者冲突时以本文档为准。
 
 代码规模：约 14000 行（Swift + 一层 C++ librime 桥）。单进程、后台 agent（`LSUIElement`）。
@@ -9,7 +9,7 @@
 
 ## 0. 一句话
 
-Enter输入法是一个 **macOS 中文输入法**（IMKit + 自包含 librime），并在其上叠加了一个**独立、常驻、上屏前的文本工作台**：本地打字与已接受的外部文字汇入同一个缓冲区，经人工确认后投递到一个经过实时焦点校验的输入框。工作台折叠为 44pt 单行细条，全部功能向上展开后总高 78pt；底边与候选锚点不随展开移动。候选与 preedit 继续由常规 `CandidateWindow` 呈现，缓冲模式下默认锚定在细条下方。
+Enter输入法是一个 **macOS 中文输入法**（IMKit + 自包含 librime），并在其上叠加了一个**独立、常驻、上屏前的文本工作台**：本地打字与已接受的外部文字汇入同一个缓冲区，经人工确认后投递到一个经过实时焦点校验的输入框。工作台折叠为 44pt 单行细条，主条是拖拽、展开、缓冲块与发送；向上展开后总高 78pt，仅显示状态、编辑、缓冲开关和关闭。底边与候选锚点不随展开移动。候选与 preedit 继续由常规 `CandidateWindow` 呈现，缓冲模式下默认锚定在细条下方。
 
 ---
 
@@ -25,7 +25,7 @@ Enter输入法是一个 **macOS 中文输入法**（IMKit + 自包含 librime）
  [计划]远程主机 ───SSH─────┤─▶ SSHProvider ──┘                         ▼                 │
  Marine(兼容)────轮询─────┤─▶ MarineBridge ───────────────────▶ BufferModel ◀─ Rime   │
                           │                                      (blocks)     commit  │
-                          │                                Return 手势 / 显式纸飞机       │
+                          │                                Return 手势 / 主条纸飞机       │
                           │                                         ▼                  │
                           │                              BufferDeliveryCoordinator     │
                           │                                         │                  │
@@ -73,7 +73,7 @@ Enter输入法是一个 **macOS 中文输入法**（IMKit + 自包含 librime）
   │            BufferModel  (blocks: [Block])             │  ← 枢纽：每个块带 Origin
   │   缓冲模式 OFF → 直接上屏；ON → 暂存为块，等确认        │
   └──────────────────────────────┬───────────────────────┘
-                                 │ Return 轻按/长按或点击展开层纸飞机
+                                 │ Return 轻按/长按或点击主条右侧纸飞机
                                  ▼
                      BufferDeliveryCoordinator
                     ┌──── FocusToken/controller/client 身份、bundle 与前台 bundle/PID 精确匹配
@@ -88,7 +88,7 @@ Enter输入法是一个 **macOS 中文输入法**（IMKit + 自包含 librime）
 2. **处理器结果永不直接上屏**——先回缓冲成结果块。
 3. **secure input（密码框）激活时，投递整体禁用**。
 4. **缓冲投递不保存“最近输入框”兜底**：只有当前 `FocusToken` 的外部文本框能接收，且租约记录的 bundle 与进程 PID 必须同时匹配当前前台应用；切 app、切文本框、同 bundle 应用重启或打开块编辑器都会令旧目标失效。
-5. **手动投递不等于目标已确认收到**：当前产品在 `Delivery.insert` 成功返回后立即消费 live block，并把快照写进最多 50 条进程内历史；失败的块和后续尚未发送的块原位保留，历史恢复必须由用户显式触发。
+5. **手动投递不等于目标已确认收到**：当前产品在 `Delivery.insert` 成功返回后立即消费 live block，不保留明文发送历史；失败的块和后续尚未发送的块原位保留。
 6. **配对设备是来源侧唯一直通例外**：收到的文字沿既有实时传字路径直接上屏，不进入缓冲工作台。
 7. **缓冲按键与宿主隔离**：缓冲模式下普通/Shift+Return 与 Backspace 总是被输入法消费。有未决 Rime/并击/raw 输入时，本次 Return 只收束成缓冲块并抑制同一物理按键余下事件；没有未决组字时，轻按发送下一块，按住约 1.2 秒发送全部。Backspace 只在精确焦点下编辑 Rime/并击状态或删除缓冲块。焦点不可信时始终吞键且不投递；引擎故障时，无法安全收束的未决组字只吞不发，但无未决组字的已有块仍可发送。宿主绝不会收到换行或删除。
 
@@ -106,7 +106,7 @@ Origin ──────── 文本从哪来。驱动三件事：UI 来源徽
   [计划] case processor(kind, jobID) 翻译/AI 结果块
 
 Block (BufferModel 内) ── 缓冲区的一个块；live blocks 均为待发送
-  id / text / origin / createdAt / lastSentAt? / lastSentTargetBundleID?
+  id / text / origin / createdAt
   [计划] role: ordinary | result(jobID, delivered)
 
 InboundItem (InboundBus 内) ── 传入轨上的待决条目
@@ -115,8 +115,6 @@ InboundItem (InboundBus 内) ── 传入轨上的待决条目
 [计划] TransformJob ── 一次处理器运行
   id / processor / inputSnapshot(冻结的输入快照) / sourceChunkIDs / state
 
-DeliveryRecord ── 当前进程内的轻量投递历史（最多 50 条）
-  id / blocks(snapshot) / originalOrder / targetBundleID / targetName / sentAt
 ```
 
 设计要点：
@@ -142,7 +140,7 @@ DeliveryRecord ── 当前进程内的轻量投递历史（最多 50 条）
 ```
 
 - **RimeEngine / CRimeBridge**：手写声明整个 `RimeApi` 结构体，`dlopen` 优先加载自带 librime，失败回退系统 Squirrel。首启 `start_maintenance` 自部署，自包含无需装 Squirrel。
-- **RimeBufferController 按键隔离与 Enter 手势**：缓冲模式在最外层吞掉普通/Shift+Return 与 Backspace。Return keyDown 绑定当时的 `FocusToken`；有未决组字时只收束并抑制到物理抬起，否则 keyUp 或物理轮询检测到抬起时请求 `sendNext`，持续物理按住到 1.2 秒时请求 `sendAll`。发送动作与 callback ownership 独立：每次被接管的物理按键持有 sticky keyUp / `didCommand(insertNewline:)` suppression，发送最后一个 transient block 令 buffer inactive、动作 reset 或失焦都不能把迟到/重复回调放给宿主；旧字段的 stale callback 不改变当前按压状态，下一次确认的 non-repeat keyDown 才退休旧代并立即按新状态路由。`handle(_:client:)` 是 Return 唯一动作入口，`didCommand` 仅防御性吞命令，不形成第二条发送路径。Backspace 仅在精确租约下改 Rime/缓冲。隔离分支先于 raw fallback，故引擎失败和不可信焦点也不会把这两个键交给宿主。
+- **RimeBufferController 按键隔离与 Enter 手势**：缓冲模式在最外层吞掉普通/Shift+Return 与 Backspace。精确外部租约持有缓冲控制期间，`CompositionSession` 会常驻一次不可见 U+200B marked-text guard（包括 Rime 空闲和引擎不可用阶段），防止 Chromium/ProseMirror 在 IMK handled 结果之外观察 raw Return 并提交；guard 生命周期与真实组字状态分离，空闲 guard 不会把 `composition.composing` / lease `compositionActive` 置真，且 marked range 标为不可靠。Return keyDown 绑定当时的 `FocusToken`；有未决组字时只收束并抑制到物理抬起，否则 keyUp 或物理轮询检测到抬起时请求 `sendNext`，持续物理按住到 1.2 秒时请求 `sendAll`。发送动作与 callback ownership 独立：每次被接管的物理按键持有 sticky keyUp / `didCommand(insertNewline:)` suppression，发送最后一个 transient block 令 buffer inactive、动作 reset 或失焦都不能把迟到/重复回调放给宿主；旧字段的 stale callback 不改变当前按压状态，下一次确认的 non-repeat keyDown 才退休旧代并立即按新状态路由。`handle(_:client:)` 是 Return 唯一动作入口，`didCommand` 仅防御性吞命令，不形成第二条发送路径。Backspace 仅在精确租约下改 Rime/缓冲。隔离分支先于 raw fallback，故引擎失败和不可信焦点也不会把这两个键交给宿主。
 - **CandidateWindow**：候选交互与显示的唯一状态机。普通模式锚定 caret；缓冲模式默认把同一个 `nonactivatingPanel` 锚定在缓冲条下方，因此主题、尺寸、翻页、单字选择和 token 化点击行为与常规候选完全一致。工作台不再维护 `CandidateProjection` 或第二份候选视图。
 - **InputFocusCoordinator**：把 controller、租约 `IMKTextInput`、`controller.client()` 当前对象身份、bundle id、前台应用 PID 与单调 token 绑定；`liveTarget` 同时重验全部身份与前台 PID，防止同 bundle 应用重启或文本框切换后复用旧租约。事件时间戳必须晚于 activation floor/最近已接受事件；先于 activate 的首键只建立短期 provisional 租约。explicit/implicit lifecycle callback 都必须与当前 client 一致；同一 proxy 跨字段或跨 controller 复用、异步 chord 回放失配、弱 client 过期时，旧 session 只在 Rime 内回收/丢弃，不调用已移动或释放的 proxy。
 - **ChordController + ChordSettings**：并击 release-replay；时长现在是 UI 可配置项（`ChordSettings`，默认 0.10s，UserDefaults + 通知）。
@@ -157,18 +155,19 @@ BufferModel (单例)
   resetOnAppSwitch         切换应用清空（显式隐私选项，默认关）
   transient 三件套         异步产出→加载态→落缓冲→可失败（Marine/未来处理器复用）
   append(text, origin)     每次进块记来源
-  update/remove/clear      显式块编辑、删除与清空；身份和来源不变
-  sentHistory              最近 50 次进程内发送快照；可显式恢复为待发送
+  update/remove            显式块编辑与删除；身份和来源不变
+  consumeDelivered         成功块原子离开 live blocks，不留明文历史
+  clear/discardForPrivacy  仅供内部重置与不可恢复安全清理
 
 BufferDeliveryCoordinator (单例)
   availability             当前精确目标 / 组字 / secure input / 待发送状态
-  sendNext / sendAll       由 Return 手势或展开层纸飞机触发；每块重验 FocusToken、client 身份、前台 bundle/PID，经 Delivery.insert 投递
+  sendNext / sendAll       由 Return 手势或主条纸飞机触发；每块重验 FocusToken、client 身份、前台 bundle/PID，经 Delivery.insert 投递
 ```
 
 - **枢纽地位**：Rime commit、外部来源接受、处理器结果，三路最终都进 `blocks`。
 - **来源徽标**：非 rime 块在 BufferInlineView 里带彩色点（远端紫/agent 琥珀/网络蓝），rime 块保持干净。
-- **消费语义**：`Delivery.insert` 成功返回后，成功块会原子地进入 `sentHistory` 并从 live `blocks` 删除；失败时立即停止，失败块和未发送后缀保持原顺序。历史快照保留 `originalOrder`，显式恢复时能回到仍存活块之间的原相对位置。
-- **编辑语义**：编辑器是独立 key window；进入时旧外部焦点租约失效，输入法对自身编辑器绕过缓冲捕获。保存只改目标块的文字并重新标记待发送，不改变 id、origin、createdAt。
+- **消费语义**：`Delivery.insert` 成功返回后，成功块会原子地从 live `blocks` 删除且不保留明文发送历史；失败时立即停止，失败块和未发送后缀保持原顺序。
+- **编辑语义**：编辑器是独立 key window；进入时旧外部焦点租约失效，输入法对自身编辑器绕过缓冲捕获。保存只改目标块的文字并重新标记待发送，不改变 id、origin、createdAt。编辑窗跟随强制日/夜外观，重开时进入当前 Space/指针屏幕；空缓冲点击编辑会在状态栏说明没有可编辑内容。
 
 ### 4.3 来源层
 
@@ -231,8 +230,8 @@ InputFocusCoordinator.liveTarget(expected: token)
                          │
                          ▼
 BufferDeliveryCoordinator.sendNext/sendAll
-  · 接受 Return 轻按/长按与展开工具层纸飞机的显式动作；键盘路径固定使用 keyDown token，每个块前重验 token 与 secure input
-  · 调用成功后从 live buffer 消费块，并写入最多 50 条内存历史
+  · 接受 Return 轻按/长按与主条纸飞机的显式动作；键盘路径固定使用 keyDown token，每个块前重验 token 与 secure input
+  · 调用成功后从 live buffer 消费块，不保留明文发送历史
   · 调用失败即停止，失败块与尚未发送块原位保留
                          │
                          ▼
@@ -260,11 +259,11 @@ Delivery.insert(_ text, into: client)
                                └─────────────────────────────────────┘
 ```
 
-- **缓冲工作台是独立 `NSPanel`**：默认 nonactivating，不抢目标输入框焦点；折叠态固定为 44pt 单行细条，只显示缓冲轨与展开入口。目标状态、发送、清空及其余功能统一向上展开，展开后总高 78pt；切换时底边不动，所以条下方候选锚点不跳。窗口可拖动并调整宽度，frame/展开态持久化并在屏幕拓扑变化后夹回可见区域。原来的大预览区、内嵌候选区和底部历史栏已移除，历史改从展开工具层显式恢复。
-- **边缘绘制**：圆角材质层内缩到透明窗口边距；边框按 backing scale 以路径内 hairline 绘制，避免把居中 border 压在窗口 bounds 上造成圆角或边缘裁剪毛边。
-- **关闭不是清空**：先显式收束当前组字，保存并擦净已打开的块编辑器，暂停捕获，保留全部模型块与历史，再隐藏；secure/隐私/锁屏路径不保存编辑中明文。手动清空有独立按钮并支持一次撤销；隐私选项触发的跨 app 清理不可撤销，并同时删除内存发送历史。
+- **缓冲工作台是独立 `NSPanel`**：默认 nonactivating，不抢目标输入框焦点；折叠态固定为 44pt 单行细条，严格按拖拽图标、展开箭头、缓冲轨、发送按钮排列。向上展开后总高 78pt，只含不显示应用去向的状态文字、编辑、缓冲 `NSSwitch` 与关闭；切换时底边不动，所以条下方候选锚点不跳。仅拖拽图标能移动窗口，背景与其他控件不能拖；窗口仍可调整宽度，frame/展开态持久化并在屏幕拓扑变化后夹回可见区域。原来的标题/字数、手动遮蔽、历史、清空和工具层发送入口均已移除。
+- **边缘绘制**：圆角层内缩到透明窗口边距，并覆盖固定的日/夜工作台背景 token，避免 HUD 背景采样破坏对比度；边框按 backing scale 以路径内 hairline 绘制，避免把居中 border 压在窗口 bounds 上造成圆角或边缘裁剪毛边。
+- **关闭不会删除已有块**：先显式收束当前组字，保存并擦净已打开的块编辑器，暂停捕获，结束 transient 加载/错误状态并保留已有模型块，再隐藏；secure/锁屏路径不保存编辑中明文。工作台没有手动清空或撤销入口；隐私选项触发的跨 app 清理仍是不可恢复的安全操作。
 - **常显与多屏**：pin 开启时加入所有桌面与全屏辅助空间；关闭时只属于一个 Space。工作台位于当前 Space 时，常规候选面板使用细条下沿作为锚点；需要时仍可跟随 caret。菜单“显示”会把仍留在旧 Space 的面板重新带到当前 Space，菜单和设置都能把窗口移到鼠标所在屏幕。
-- **隐私**：眼睛按钮可临时遮蔽；secure input 隐藏正文、字数与历史控件，并立即关闭、擦净已打开编辑器的隐藏控件。锁屏、睡眠或会话切出会撤销 FocusToken，只在 Rime 内回收/丢弃组字并隐藏窗口；恢复后等待新焦点租约。可选的切 app 清理只认真实外部 A→B，A→本应用窗口→A 不清理；触发时也关闭并擦净编辑器，混有任一外部来源块时则整体保留。
+- **隐私**：工作台不再维护手动遮蔽状态；secure input 会隐藏正文、禁用发送与编辑，并立即关闭、擦净已打开编辑器的隐藏控件。锁屏、睡眠或会话切出会撤销 FocusToken，只在 Rime 内回收/丢弃组字并隐藏窗口；恢复后等待新焦点租约。可选的切 app 清理只认真实外部 A→B，A→本应用窗口→A 不清理；触发时也关闭并擦净编辑器，混有任一外部来源块时则整体保留。
 - **候选呈现可配置**：默认把常规 `CandidateWindow` 放在缓冲条下方；用户可切回跟随 caret。两种位置只改变锚点，始终是同一个面板与 token 化选择动作，不存在投影视图或第二份候选状态。
 - **外部待决项**：当前仍由 `InboundTrayWindow` 接受/拒绝；异步来源只更新数据，不会自行拉起工作台。`WorkbenchBarView` 仅保留为历史三层方案素材；`panel-render` 已直接渲染真实 `BufferWindowController`，避免预览与运行时再次漂移。
 
@@ -314,9 +313,9 @@ Delivery.insert(_ text, into: client)
 | 措施 | 机制 | 状态 |
 |---|---|---|
 | 密码框保护 | `IsSecureEventInputEnabled()` 在投递动作时刻同步查；命中拒发 | ✅ M0（Delivery 唯一咽喉） |
-| 切换应用重置 | 默认跨应用保留；启用后，仅当整个缓冲不含外部来源块时不可撤销地丢弃 blocks、清空撤销快照和发送历史；只要含外部块就全部保留 | ✅ |
+| 切换应用重置 | 默认跨应用保留；启用后，仅当整个缓冲不含外部来源块时不可撤销地丢弃 blocks；只要含外部块就全部保留 | ✅ |
 | 焦点租约 | 单调 FocusToken + controller/client 对象身份 + client bundle + 前台 bundle/PID + 事件/生命周期归因；无 recent/last client 回退 | ✅ |
-| 工作台隐私 | 手动/secure-input 遮蔽正文并关闭编辑器；锁屏/睡眠/会话切出撤销租约且不回写旧 client；编辑器不成为缓冲捕获源 | ✅ |
+| 工作台隐私 | secure-input 自动遮蔽正文并关闭编辑器；锁屏/睡眠/会话切出撤销租约且不回写旧 client；编辑器不成为缓冲捕获源 | ✅ |
 | 日志脱敏 | 用户文本走 `IMELog.redact()` 只记长度；日志 0600；CI 断言禁 `'\(…)'` 明文 | ✅ M0 |
 | 本地端口鉴权 | 只绑 127.0.0.1 + Bearer token（0600）+ 常数时间比较 + 严格解析上限 | ✅ M2 |
 | 来源门控 | `SourceTrust` 有询问/信任/拦截三种类型；当前规则固定：Marine 信任，MCP/HTTP/SSE/SSH 询问，无按来源覆盖 UI | ✅ 固定规则；可配置化属后续 |
@@ -335,12 +334,12 @@ Delivery.insert(_ text, into: client)
 - **身份三元组冻结**：bundle id `com.isaac.inputmethod.RimeBuffer` + mode `.Hans` + 目录 `ETInput.app`，CI 断言钉死字面值（防重复注册鬼影）。
 - **持久化**：
   - UserDefaults：缓冲开关、工作台显隐/frame/常显/候选锚点、跨 app 清理选项、并击时长、候选窗尺寸、网关开关/端口、外观。按来源信任覆盖尚未实现，因此当前不在持久化项中。
-  - 仅进程内：缓冲 blocks、最近 50 条发送历史、撤销清空快照；输入法进程重启后不恢复。
+  - 仅进程内：缓冲 blocks；输入法进程重启后不恢复，发送历史与清空撤销不再保留。
   - 0600 文件：gateway-token、remote 身份私钥、（计划）AI 凭据。
   - JSON：按键统计（按日）、Rime 用户配置（`~/Library/RimeBuffer`）。
   - 日志：`~/rimebuffer.log`（0600，脱敏）。
 - **自更新**：UpdateManager 每小时查 GitHub Releases（这是隐私清单要计入的第 5 处出站）。
-- **发布链**：build_install.sh（dev→~/Library）/ scripts/make-pkg.sh（pkg→/Library）/ CI（编译 + plist 断言 + 日志断言 + 9 个 smoke）/ release.yml（通用二进制）。签名为 ad-hoc（Dev ID 未申请，是钥匙串决策的根因）。
+- **发布链**：build_install.sh（dev→~/Library）/ scripts/make-pkg.sh（pkg→/Library）/ CI（编译 + plist 断言 + 日志断言 + 10 个 smoke）/ release.yml（通用二进制）。签名为 ad-hoc（Dev ID 未申请，是钥匙串决策的根因）。
 
 ---
 
@@ -355,9 +354,9 @@ Sources/RimeBuffer/
   CompositionSession.swift      marked text / preedit
   CandidateWindow.swift         唯一候选状态机/NSPanel + caret/缓冲条锚点
   InputFocusCoordinator.swift   FocusToken / client+前台PID租约 / target-event-lifecycle 规则
-  BufferWindowController.swift  44pt 单行条/向上展开至 78pt + 显式块编辑器/历史菜单
+  BufferWindowController.swift  44pt 主条/向上展开至 78pt + Switch/状态/显式块编辑器
   BufferInlineView.swift        工作台待发送 chips（+来源徽标）
-  BufferModel.swift             缓冲枢纽（blocks / history / clear undo / transient）
+  BufferModel.swift             缓冲枢纽（blocks / 成功消费 / transient；无发送历史）
   BufferDeliveryCoordinator.swift 精确目标上的逐块投递与成功块消费
   Origin.swift                  来源溯源 + echo 守卫              [工作台新增]
   Delivery.swift                唯一上屏咽喉 + 密码框护栏
@@ -382,11 +381,11 @@ Sources/RimeBuffer/
   [计划] Delivery/DeliveryRouter 多目标投递 + 远端 ACK + 持久账本
 ```
 
-**测试**：无 XCTest target；9 个编进二进制的 smoke 子命令（schema / buffer / buffer-window / stats / matrix / candidate-metrics / origin / inbound / remote），CI 全跑。
+**测试**：无 XCTest target；10 个编进二进制的 smoke 子命令（schema / buffer / buffer-window / stats / matrix / candidate-metrics / theme / origin / inbound / remote），CI 全跑。
 
 - `buffer-window-smoke` 覆盖 focus epoch/弱 lease 清理、target 的 current/expected token 与双 client 身份、前台 bundle/PID、事件顺序、provisional 与 nil-bundle activation、lifecycle/chord 隔离、own-PID 排除，以及只在真实外部 A→B 触发的隐私清理。
-- 同一 smoke 还覆盖缓冲 Return 的纯轻按/长按轮询判定（包含轮询延迟但已经抬键时仍按轻按处理）、Return/Backspace 的纯路由 disposition，以及 callback ownership 的 final-block inactive、command-before-keyUp、auto-repeat、遗漏 command 后下一次 fresh press 和 command-only fresh press 转移；另覆盖长按进度状态在隐私遮蔽时清除、active-Space 可见性、loading-only 清空、工作台隐私轨（正常渲染一个块后，shielded refresh 必须擦掉 chip 并保持隐藏）与窗口 geometry：完全离屏时回到 fallback screen、超宽 frame 收进相交 screen、44pt/78pt 高度归一化与底边固定，以及可见区域窄于常规最小宽度时仍能完整放入。真实 IMK 回调顺序、宿主隔离与实际投递仍需安装后的交互回归。
-- `buffer-smoke` 覆盖成功块即时消费、局部失败保留、最近 50 条历史、恢复相对顺序、编辑元数据、插入点、清空撤销、暂停保留与不可恢复的隐私丢弃。真实窗口关闭/锁屏和 IMK 交互仍需安装后的真机验证。
+- 同一 smoke 还覆盖工作台布局契约（主条 drag/disclosure/rail/send、展开层 status/edit/switch/close、仅 drag handle 可移动、状态不泄露应用去向）、缓冲 Return 的纯轻按/长按轮询判定、Return/Backspace 路由与 callback ownership；另覆盖长按进度在 secure-input 遮蔽时清除、active-Space 可见性和窗口 geometry：完全离屏时回到 fallback screen、超宽 frame 收进相交 screen、44pt/78pt 高度归一化与底边固定，以及可见区域窄于常规最小宽度时仍能完整放入。真实 IMK 回调顺序、宿主隔离与实际投递仍需安装后的交互回归。
+- `buffer-smoke` 覆盖成功块即时消费且不留历史、未发送块顺序、编辑元数据、插入点、暂停保留、transient 状态清理与不可恢复的隐私丢弃。真实窗口关闭/锁屏和 IMK 交互仍需安装后的真机验证。
 
 ---
 
@@ -399,10 +398,10 @@ Sources/RimeBuffer/
 | **前端** | 设置两组六页 / 44pt 单行条+向上工具层 / 真实运行时预览入口 | ✅ 发布 0.4.6 |
 | **spike** | NWListener HTTP/SSE ✓ · MCP 真 Claude Code ✓ · Apple 翻译无头 ✓ | ✅ 全过 |
 | **M2** 网关+MCP | LocalGateway / MCP tools / InboundBus / token / 收件箱 | ✅ 主干+收件箱（0.4.7），传入轨嵌入独立工作台待做 |
-| **缓冲窗口** | FocusToken / Return+Backspace 隔离 / 44pt 单行条+78pt 上展 / 常规候选窗下挂 / 成功块消费 / 历史恢复 / 多屏与隐私 | ✅ 2026-07-17 已实现、安装并通过已安装二进制 smoke；待真实宿主输入交互验收 |
+| **缓冲窗口** | FocusToken / Return+Backspace 隔离 / 44pt 简化主条+78pt 上展 / 常规候选窗下挂 / 成功块无历史消费 / 多屏与隐私 | ✅ 2026-07-18 已实现并通过源码 smoke；待安装后真实宿主输入交互验收 |
 | **M3** 处理器+翻译 | JobRunner / Processor / TranslationProcessor / 处理胶囊 UI | 计划 |
 | **M4** AI | AIProcessor（SSE） / 凭据 / 通用端点 / 提示词模板 | 计划 |
-| **M5** 投递路由 | 本地精确焦点与 50 条内存历史已完成；多目标 / 远端 ACK / 持久账本 | 部分完成 |
+| **M5** 投递路由 | 本地精确焦点已完成；多目标 / 远端 ACK / 持久账本仍属后续，当前明确不保存发送历史 | 部分完成 |
 | **M6** SSE/SSH + 收尾 | SSE/SSH provider / 传入轨嵌入独立工作台 / 视觉对齐 | 计划 |
 
 **作废/推迟**（产品决策）：远端改道 + 协议 v2（配对走直通上屏）；剪贴板捕获；AirDrop。

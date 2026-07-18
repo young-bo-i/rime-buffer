@@ -1,10 +1,43 @@
 import Cocoa
 import InputMethodKit
 
+enum HostMarkedTextPresentation: Equatable {
+    case none
+    case normalPreedit
+    case bufferGuard(rimeComposing: Bool)
+}
+
+/// Host marked-text policy is deliberately separate from buffer delivery and
+/// from Rime's semantic composition state. Chromium-based editors can observe
+/// Return before/around IMK's handled result; an idle marked session is what
+/// tells those editors that the input method still owns the key.
+enum HostMarkedTextPresentationRules {
+    static func presentation(bufferControlsActive: Bool,
+                             capturesRimeCommits: Bool,
+                             rimeComposing: Bool,
+                             secureInput: Bool) -> HostMarkedTextPresentation {
+        guard !secureInput else { return .none }
+        guard bufferControlsActive else { return .normalPreedit }
+
+        // Persistent capture renders all preedit in our panel. A transient
+        // buffer keeps ordinary inline preedit while Rime is actually active,
+        // but still needs the invisible guard while idle so Return cannot leak.
+        if capturesRimeCommits || !rimeComposing {
+            return .bufferGuard(rimeComposing: rimeComposing)
+        }
+        return .normalPreedit
+    }
+
+    static func shouldRefreshForActiveChange(previous: Bool, current: Bool) -> Bool {
+        previous != current
+    }
+}
+
 /// The v2 composition protocol: a marked-text session ALWAYS exists while Rime
-/// is composing. Squirrel-proven — without a session, clients echo the raw
-/// keystrokes ("zuoye作业" leak, seen in WeChat) and the caret-rect API returns
-/// zero. The session's CONTENT is a policy:
+/// is composing, and an invisible session stays alive while exact external
+/// buffer controls are idle. Squirrel-proven — without a session, clients echo
+/// raw keystrokes ("zuoye作业" leak, seen in WeChat) and the caret-rect API
+/// returns zero. The session's CONTENT is a policy:
 ///   .inline       marked text = underlined preedit (matches the user's
 ///                 squirrel.yaml `inline_preedit: true`); default.
 ///   .placeholder  marked text = one full-width space "　" (Squirrel's trick to
@@ -55,17 +88,14 @@ final class CompositionSession {
         bufferGuardActive = false
     }
 
-    /// Keep the host field connected to IMK while buffer mode owns visible
-    /// editing. The marked text is intentionally invisible; buffer UI renders
-    /// the real preedit/caret.
-    func updateBufferGuard(active: Bool, client: IMKTextInput) {
-        guard active else {
-            clear(client: client)
-            return
-        }
+    /// Keep the host field connected to IMK for the full lifetime of exact
+    /// external buffer control, including Rime-idle periods. The guard's host
+    /// lifetime and Rime's semantic composing state must remain independent:
+    /// otherwise an idle Return would only "settle composition" forever.
+    func updateBufferGuard(rimeComposing: Bool, client: IMKTextInput) {
         // setMarkedText can synchronously enter the host and trigger expensive
-        // focus probes. Keep one guard for the whole composition/chord instead
-        // of replacing it after every physical key.
+        // focus probes. Keep one guard for the whole buffer-control lease
+        // instead of replacing it after every physical key.
         if !bufferGuardActive {
             client.setMarkedText(bufferGuardText as NSString,
                                  selectionRange: NSRange(location: (bufferGuardText as NSString).length,
@@ -74,7 +104,7 @@ final class CompositionSession {
             markedTextActive = true
             bufferGuardActive = true
         }
-        composing = true
+        composing = rimeComposing
     }
 
     /// End the session explicitly (escape / focus loss / commit without insert).

@@ -300,6 +300,7 @@ final class CandidateWindow {
     private let strip = NSView()
     private let candidateScroll = NSScrollView()
     private let candidateStack = NSStackView()
+    private let divider = NSView()
     private let settingsButton = CandidateActionButton(symbolName: "gearshape", title: "")
     private var stripHeightConstraint: NSLayoutConstraint!
     private var candidateHeightConstraint: NSLayoutConstraint!
@@ -433,7 +434,6 @@ final class CandidateWindow {
         candidateHeightConstraint = candidateScroll.heightAnchor.constraint(equalToConstant: metrics.compactCandidateHeight)
         candidateHeightConstraint.isActive = true
 
-        let divider = NSView()
         divider.wantsLayer = true
         divider.layer?.backgroundColor = RimeUI.borderStrong.cgColor
         divider.translatesAutoresizingMaskIntoConstraints = false
@@ -1366,10 +1366,12 @@ final class CandidateWindow {
     }
 
     private func applyAppearance() {
+        panel.appearance = RimeUI.appKitAppearance
         content.layer?.backgroundColor = RimeUI.candidateBackgroundColor.cgColor
         preeditLabel.textColor = RimeUI.textPrimary
         strip.layer?.backgroundColor = RimeUI.candidateBackgroundColor.cgColor
         strip.layer?.borderColor = RimeUI.borderStrong.cgColor
+        divider.layer?.backgroundColor = RimeUI.borderStrong.cgColor
         settingsButton.contentTintColor = RimeUI.textSecondary
     }
 
@@ -1710,6 +1712,7 @@ final class CandidatePreviewView: NSView {
         let m = metrics
 
         // Theme.
+        appearance = RimeUI.appKitAppearance
         backdrop.layer?.backgroundColor = RimeUI.surface3.cgColor
         windowMock.layer?.backgroundColor = NSColor.clear.cgColor
         strip.layer?.backgroundColor = RimeUI.candidateBackgroundColor.cgColor

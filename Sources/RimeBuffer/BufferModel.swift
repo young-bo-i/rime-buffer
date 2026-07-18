@@ -78,39 +78,16 @@ final class BufferModel {
         var text: String
         let origin: Origin
         let createdAt: Date
-        var lastSentAt: Date?
-        var lastSentTargetBundleID: String?
 
         init(id: UUID = UUID(),
              text: String,
              origin: Origin = .rime,
-             createdAt: Date = Date(),
-             lastSentAt: Date? = nil,
-             lastSentTargetBundleID: String? = nil) {
+             createdAt: Date = Date()) {
             self.id = id
             self.text = text
             self.origin = origin
             self.createdAt = createdAt
-            self.lastSentAt = lastSentAt
-            self.lastSentTargetBundleID = lastSentTargetBundleID
         }
-    }
-
-    /// In-memory delivery ledger. A record means IMK accepted the insert call;
-    /// it is not an acknowledgement from the destination application.
-    struct DeliveryRecord {
-        let id = UUID()
-        let blocks: [Block]
-        /// Complete live ordering immediately before this delivery. Keeping
-        /// the surrounding block IDs lets a later restore recover the exact
-        /// relative position of blocks that disappeared after a successful
-        /// insert attempt.
-        let originalOrder: [UUID]
-        let targetBundleID: String
-        let targetName: String
-        let sentAt = Date()
-
-        var characterCount: Int { blocks.reduce(0) { $0 + $1.text.count } }
     }
 
     private(set) var blocks: [Block] = []
@@ -118,14 +95,11 @@ final class BufferModel {
     private(set) var transientEnabled = false
     private(set) var loadingMessage: String?
     private(set) var loadingRequestId: String?
-    private(set) var sentHistory: [DeliveryRecord] = []
-    private(set) var lastClearedBlocks: [Block] = []
 
     var stagedText: String { blocks.map(\.text).joined() }
     var stagedCharacterCount: Int { stagedText.count }
-    var pendingDeliveryBlocks: [Block] { blocks.filter { $0.lastSentAt == nil } }
-    var pendingDeliveryCount: Int { pendingDeliveryBlocks.count }
-    var canUndoClear: Bool { !lastClearedBlocks.isEmpty }
+    var pendingDeliveryBlocks: [Block] { blocks }
+    var pendingDeliveryCount: Int { blocks.count }
 
     /// External content exists to be sent to another app, so an optional
     /// app-switch cleanup must never erase it automatically.
@@ -219,23 +193,15 @@ final class BufferModel {
         notifyChange()
     }
 
-    func cancelActiveMode() {
-        loadingRequestId = nil
-        loadingMessage = nil
-        if transientEnabled {
-            transientEnabled = false
-            notifyChange()
-        } else {
-            enabled = false
-        }
-    }
-
     /// Safe close-window behavior: stop invisible capture/interaction while
-    /// preserving every staged block and any loading message.
+    /// preserving every staged block. Transient loading/error state is dropped
+    /// because the simplified workbench intentionally has no manual Clear.
     func pauseCapturePreservingContent() {
         UserDefaults.standard.set(false, forKey: "bufferEnabled")
         transientEnabled = false
-        IMELog.write("buffer capture paused; preserved blocks=\(blocks.count)")
+        loadingRequestId = nil
+        loadingMessage = nil
+        IMELog.write("buffer capture paused; preserved blocks=\(blocks.count), cleared transient state")
         notifyChange()
     }
 
@@ -261,15 +227,12 @@ final class BufferModel {
         return true
     }
 
-    /// Explicit per-block editing preserves id, origin and createdAt. Edited
-    /// text becomes pending again even if the previous version was sent.
+    /// Explicit per-block editing preserves id, origin and createdAt.
     @discardableResult
     func updateBlock(id: UUID, text: String) -> Bool {
         guard let index = blocks.firstIndex(where: { $0.id == id }) else { return false }
         guard !text.isEmpty else { return removeBlock(id: id) }
         blocks[index].text = text
-        blocks[index].lastSentAt = nil
-        blocks[index].lastSentTargetBundleID = nil
         IMELog.write("buffer edit block id=\(id) chars=\(text.count) origin=\(blocks[index].origin.tag)")
         notifyChange()
         return true
@@ -289,23 +252,13 @@ final class BufferModel {
         return true
     }
 
-    /// Record accepted delivery attempts and consume those blocks from the live
-    /// workbench in one model mutation. The history snapshot remains available
-    /// for an explicit restore, but accepted blocks disappear immediately and
-    /// cannot be retried accidentally.
-    func recordDelivery(blockIDs: [UUID], targetBundleID: String, targetName: String) {
+    /// Consume accepted delivery attempts from the live workbench in one model
+    /// mutation. No plaintext delivery history is retained.
+    func consumeDelivered(blockIDs: [UUID]) {
         guard !blockIDs.isEmpty else { return }
         let ids = Set(blockIDs)
-        let sentAt = Date()
-        let originalOrder = blocks.map(\.id)
         let deliveredIndexes = blocks.indices.filter { ids.contains(blocks[$0].id) }
-        let snapshots = deliveredIndexes.map { index -> Block in
-            var snapshot = blocks[index]
-            snapshot.lastSentAt = sentAt
-            snapshot.lastSentTargetBundleID = targetBundleID
-            return snapshot
-        }
-        guard !snapshots.isEmpty else { return }
+        guard !deliveredIndexes.isEmpty else { return }
 
         let removedBeforeInsertion = deliveredIndexes.reduce(into: 0) { count, index in
             if index < insertionIndex { count += 1 }
@@ -314,111 +267,20 @@ final class BufferModel {
         insertionIndex -= removedBeforeInsertion
         clampInsertionIndexInPlace()
         settleTransientIfIdle()
-
-        sentHistory.append(DeliveryRecord(blocks: snapshots,
-                                          originalOrder: originalOrder,
-                                          targetBundleID: targetBundleID,
-                                          targetName: targetName))
-        if sentHistory.count > 50 {
-            sentHistory.removeFirst(sentHistory.count - 50)
-        }
-        IMELog.write("buffer delivery consumed blocks=\(snapshots.count) remaining=\(blocks.count) target=\(targetBundleID)")
+        IMELog.write("buffer delivery consumed blocks=\(deliveredIndexes.count) remaining=\(blocks.count)")
         notifyChange()
     }
 
-    /// Restore a delivery record for deliberate re-send/edit. Missing blocks
-    /// are placed relative to every surviving block from the original live
-    /// order, rather than merely appended in delivery-history order. This does
-    /// not claim to remove text from the host app.
-    @discardableResult
-    func restoreDelivery(recordID: UUID) -> Bool {
-        guard let record = sentHistory.first(where: { $0.id == recordID }) else { return false }
-        var changed = false
-        let originalIndexes = Dictionary(uniqueKeysWithValues: record.originalOrder.enumerated().map {
-            ($0.element, $0.offset)
-        })
-        let orderedSnapshots = record.blocks.sorted {
-            (originalIndexes[$0.id] ?? Int.max) < (originalIndexes[$1.id] ?? Int.max)
-        }
-
-        for snapshot in orderedSnapshots {
-            if let index = blocks.firstIndex(where: { $0.id == snapshot.id }) {
-                if blocks[index].lastSentAt != nil || blocks[index].lastSentTargetBundleID != nil {
-                    blocks[index].lastSentAt = nil
-                    blocks[index].lastSentTargetBundleID = nil
-                    changed = true
-                }
-            } else {
-                let originalIndex = originalIndexes[snapshot.id] ?? record.originalOrder.count
-                let laterIDs = record.originalOrder.dropFirst(min(originalIndex + 1,
-                                                                   record.originalOrder.count))
-                let nextIndex = laterIDs.compactMap { laterID in
-                    blocks.firstIndex(where: { $0.id == laterID })
-                }.first
-                let earlierIDs = record.originalOrder.prefix(min(originalIndex,
-                                                                  record.originalOrder.count)).reversed()
-                let previousIndex = earlierIDs.compactMap { earlierID in
-                    blocks.firstIndex(where: { $0.id == earlierID })
-                }.first
-                let insertionIndex = nextIndex
-                    ?? previousIndex.map { min($0 + 1, blocks.count) }
-                    ?? min(originalIndex, blocks.count)
-                var restored = snapshot
-                restored.lastSentAt = nil
-                restored.lastSentTargetBundleID = nil
-                blocks.insert(restored, at: insertionIndex)
-                changed = true
-            }
-        }
-        if changed {
-            insertionIndex = blocks.count
-            IMELog.write("buffer delivery restored record=\(recordID) blocks=\(record.blocks.count)")
-            notifyChange()
-        }
-        return changed
-    }
-
-    func clear() {
-        if !blocks.isEmpty {
-            IMELog.write("buffer clear dropped \(blocks.count) blocks chars=\(stagedCharacterCount)")
-            lastClearedBlocks = blocks
-        }
-        blocks.removeAll()
-        insertionIndex = 0
-        loadingRequestId = nil
-        loadingMessage = nil
-        transientEnabled = false
-        notifyChange()
-    }
-
-    /// Non-recoverable privacy cleanup. Unlike the user's Clear action, an
-    /// automatic app-switch purge must not leave the text recoverable through
-    /// undo or delivery-history snapshots in the destination application.
+    /// Non-recoverable privacy cleanup used by automatic safety transitions.
     func discardForPrivacy() {
         let blockCount = blocks.count
-        let historyCount = sentHistory.count
         blocks.removeAll()
         insertionIndex = 0
         loadingRequestId = nil
         loadingMessage = nil
         transientEnabled = false
-        lastClearedBlocks.removeAll()
-        sentHistory.removeAll()
-        IMELog.write("buffer privacy discard blocks=\(blockCount) history=\(historyCount)")
+        IMELog.write("buffer privacy discard blocks=\(blockCount)")
         notifyChange()
-    }
-
-    @discardableResult
-    func undoLastClear() -> Bool {
-        guard !lastClearedBlocks.isEmpty else { return false }
-        let restored = lastClearedBlocks
-        lastClearedBlocks = []
-        let existing = Set(blocks.map(\.id))
-        blocks.insert(contentsOf: restored.filter { !existing.contains($0.id) }, at: 0)
-        insertionIndex = blocks.count
-        IMELog.write("buffer undo clear restored=\(restored.count)")
-        notifyChange()
-        return true
     }
 
     private func clampedInsertionIndex() -> Int {

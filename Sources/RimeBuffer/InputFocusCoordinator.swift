@@ -205,13 +205,6 @@ final class FocusLease {
         self.lifecycleSuppressionUntilUptime = lifecycleSuppressionUntilUptime
         self.clientIdentityWasReused = clientIdentityWasReused
     }
-
-    var applicationName: String {
-        NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
-            .first?.localizedName
-            ?? bundleID.split(separator: ".").last.map(String.init)
-            ?? bundleID
-    }
 }
 
 /// Owns focus epochs and the one delivery lease that is allowed to receive

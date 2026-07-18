@@ -1,13 +1,13 @@
 # Enter输入法 · 缓冲工作台（Workbench）产品方案与架构设计
 
-版本：v0.2 决策更新 · 2026-07-17
+版本：v0.3 决策更新 · 2026-07-18
 状态：长期路线图；缓冲窗口部分已实现
 上游输入：`new-rime.pen` 七张探索稿（wBwdM/XKzFo/e9aJFL/FBS3A/rulod/BMbRV/S0d7w）+ 产品负责人 2026-07-16 口头需求收敛
 关系：本文档记录工作台路线与历史裁决；`new-rime.pen` 是视觉参考；`ARCHITECTURE.md` 是 P1 时代交接文档。运行时事实与本文冲突时以 `SYSTEM-ARCHITECTURE.md` 为准。
 
 > 2026-07-17 早期决策（已被下一条覆盖）：缓冲区从候选 panel 拆成独立工作台，曾采用内嵌候选投影、全文预览与发送后留块方案。
 >
-> **2026-07-17 紧凑条覆盖决策（当前）**：工作台折叠为 44pt 单行细条，全部功能（含发送、清空）从细条向上展开到总高 78pt，展开前后底边与候选锚点不动；圆角材质内缩并以 backing-scale hairline 避免边缘裁剪毛边。缓冲模式复用常规 `CandidateWindow` 面板与样式，默认锚定在细条下方。普通/Shift+Return 与 Backspace 在缓冲模式下永不落到宿主文本框；有未决组字时，本次 Return 只收束为块，否则轻按发送下一块、按住约 1.2 秒发送全部，2px 进度线沿细条底部显示按住状态。展开工具层的纸飞机保留为显式发送全部入口。成功发送的 block 立即从 live buffer 消失，同时进入最近 50 条进程内历史供显式恢复，失败和未发送 block 原位保留。本文后续若仍描述“候选投影 / 全文预览 / 已发送对号留块”，均视为历史方案。
+> **2026-07-18 简化工作台覆盖决策（当前）**：工作台折叠为 44pt 单行细条，主条严格为拖拽图标、展开箭头、缓冲块轨和右侧发送；向上展开到总高 78pt 后只保留无应用去向的状态、编辑、缓冲 `NSSwitch` 和关闭。只有拖拽图标可移动窗口；pin/移屏仍从设置或输入法菜单进入。手动眼睛遮蔽、历史/恢复、清空/撤销都从产品与模型移除。缓冲模式继续复用常规 `CandidateWindow`，普通/Shift+Return 与 Backspace 隔离和 2px 长按进度不变。成功发送的 block 立即从 live buffer 消失且不保留明文历史，失败和未发送 block 原位保留。本文后续若仍描述“候选投影 / 全文预览 / 已发送对号留块”，均视为历史方案。
 
 ---
 
@@ -53,20 +53,20 @@
 └────────────────────────────────────────────────┘
 ```
 
-实现载体：`BufferWindowController` 拥有独立 `nonactivatingPanel`。折叠态是 44pt 的 `BufferInlineView` 单行主条，只保留缓冲轨与展开入口；目标状态、发送、清空及其余按钮统一放在向上工具层，展开后总高 78pt。切换展开态时保持窗口底边不动，因此条下方候选锚点稳定；面板可拖动、调整宽度、关闭、固定到所有桌面/全屏空间，frame 与展开态持久化并在多屏变化后校正。圆角材质层内缩到透明窗口边距，边框按 backing scale 在路径内画 hairline，避免边缘/圆角裁剪毛边。`CandidateWindow` 继续独占候选状态、视觉与翻页逻辑：普通模式锚定 caret，缓冲模式默认把同一个 panel 锚定在细条下方。
+实现载体：`BufferWindowController` 拥有独立 `nonactivatingPanel`。折叠态是 44pt 单行主条：拖拽图标 → 展开箭头 → `BufferInlineView` → 发送；向上工具层只有状态 → 编辑 → 缓冲 `NSSwitch` → 关闭，展开后总高 78pt。切换展开态时保持窗口底边不动，因此条下方候选锚点稳定；只有 22pt 拖拽图标可移动面板，窗口仍可调整宽度、关闭、固定到所有桌面/全屏空间，frame 与展开态持久化并在多屏变化后校正。圆角层使用固定日/夜缓冲 palette，不依赖 HUD 背景采样，内缩到透明窗口边距并按 backing scale 在路径内画 hairline。`CandidateWindow` 继续独占候选状态、视觉与翻页逻辑：普通模式锚定 caret，缓冲模式默认把同一个 panel 锚定在细条下方。
 
 各层职责：
 
 - **① 传入轨（后续）**：当前外部待决项仍在 `InboundTrayWindow` 接受/拒绝，异步来源不得自行拉起工作台。未来可作为工作台内固定高度区域加入。
-- **② 缓冲轨（已实现基础）**：主条只显示待发送块 chips、来源徽标、插入点、Enter 长按进度与展开入口。清空、历史和纸飞机等显式功能收进向上工具层；轻按 Enter 发送下一块，按住约 1.2 秒或点击纸飞机发送全部。成功发送后 block 从 live rail 消失；失败和未发送 block 保留，历史菜单可显式恢复。
+- **② 缓冲轨（已实现基础）**：主条显示拖拽、展开、待发送块 chips、来源徽标、插入点、Enter 长按进度和右侧纸飞机；轻按 Enter 发送下一块，按住约 1.2 秒或点击纸飞机发送全部。成功发送后 block 从 live rail 消失且不保存历史；失败和未发送 block 保留。
 - **③ 候选区（已实现常规面板复用）**：候选、preedit、矩阵/单字选择始终由同一个 `CandidateWindow` 呈现；缓冲模式只把锚点移到细条下方，任何点击仍必须携带当前 `FocusToken`，过期动作无效。
-- **编辑与隐私（已实现）**：单块编辑使用独立 key window，输入法对自身编辑器绕过缓冲捕获；被动工作台不抢外部焦点。支持临时遮蔽、secure-input 遮蔽、会话锁定隐藏。
+- **编辑与隐私（已实现）**：单块编辑使用独立 key window，输入法对自身编辑器绕过缓冲捕获；被动工作台不抢外部焦点。编辑窗跟随日/夜 palette，并在重开时进入当前 Space/指针屏幕；空缓冲点击编辑会显示明确提示。工作台没有手动遮蔽，保留 secure-input 自动遮蔽与会话锁定隐藏。
 
 ### 1.2 用户故事（验收场景）
 
 1. **打字暂存**（现状不回归）：缓冲模式下打字 → 常规候选窗显示在细条下方 → commit 成块。有未决组字时，本次普通/Shift+Return 只收束为块；没有组字时轻按发送下一块、按住约 1.2 秒发送全部。Backspace 只编辑 Rime/缓冲；两个键在任何引擎/焦点状态下都绝不影响宿主文本框。焦点不可信时只吞不投递；引擎故障但没有未决组字时，已有块仍可发送。发送目标只认 Return keyDown 绑定且当前仍有效的精确焦点；成功块立即离开 live rail。
-2. **智能体推稿**：Claude Code / Codex 通过 MCP 调 `buffer_push` → 当前由专用 toast/`InboundTrayWindow` 显示「MCP · <来源名>」待决项 → 用户点接受 → 成为带来源徽标的块 → 轻按 Enter 逐块发送，或长按/点击纸飞机发送全部到微信输入框。传入轨嵌入工作台是后续 UI 路线图。
-3. **翻译**：选中/框选缓冲区里的块 → 点「翻译」→ 处理胶囊转圈计时 → 结果块出现（原块保留）→ 用户用 Enter 手势或展开层纸飞机发送结果块。
+2. **智能体推稿**：Claude Code / Codex 通过 MCP 调 `buffer_push` → 当前由专用 toast/`InboundTrayWindow` 显示「MCP · <来源名>」待决项 → 用户点接受 → 成为带来源徽标的块 → 轻按 Enter 逐块发送，或长按/点击主条纸飞机发送全部到微信输入框。传入轨嵌入工作台是后续 UI 路线图。
+3. **翻译**：选中/框选缓冲区里的块 → 点「翻译」→ 处理胶囊转圈计时 → 结果块出现（原块保留）→ 用户用 Enter 手势或主条纸飞机发送结果块。
 4. **AI 润色**：同上，处理器换成 AI；SSE 流式期间**只更新同一个结果块**的文字，不产生逐 token 的碎块。
 5. **隔空传字（收）**：配对 Mac 发来文字 → 沿既有加密直通路径上屏；若当前没有可用目标则累积到剪贴板。该产品例外不进入缓冲或传入轨（§12.1）。
 6. **安全底线**：焦点在密码框（系统 secure input 生效）时，工作台遮蔽且发送被 `Delivery.insert` 拒绝，缓冲区任何内容不会被投递。当前收件箱的「接受」只把条目放进缓冲，因此不禁用也不显示锁标。
@@ -75,7 +75,7 @@
 
 - **非配对外部文字按当前固定门控进入收件箱或缓冲**：MCP/HTTP/SSE/SSH 为「询问」，Marine 为「信任」；无论哪一种都**永不**自动上屏。按来源自定义信任是后续能力；配对设备维持直通例外。
 - **一切处理器结果先回缓冲区成为结果块**，绝不直接上屏。
-- **缓冲内容、非配对外部文字与未来处理器结果只由用户明确触发上屏**：没有未决组字时，普通/Shift+Return 轻按发送下一块、按住约 1.2 秒发送全部；展开工具层的纸飞机也可发送全部。有未决组字的 Return 只收束为块，同一物理按键绝不顺带投递。缓冲关闭时的普通 Rime commit，以及配对设备的既有直通收字，是明确例外。
+- **缓冲内容、非配对外部文字与未来处理器结果只由用户明确触发上屏**：没有未决组字时，普通/Shift+Return 轻按发送下一块、按住约 1.2 秒发送全部；主条右侧纸飞机也可发送全部。有未决组字的 Return 只收束为块，同一物理按键绝不顺带投递。缓冲关闭时的普通 Rime commit，以及配对设备的既有直通收字，是明确例外。
 - **secure input 激活时投递路径整体禁用**。
 
 ---
@@ -133,16 +133,8 @@ struct TransformJob: Identifiable {
                  case cancelled }
 }
 
-/// 当前实现：仅进程内的发送快照。记录表示 IMK 已接受 insertText 调用，
-/// 不表示宿主应用已经确认收到。
-struct DeliveryRecord {
-    let id: UUID
-    let blocks: [Block]
-    let originalOrder: [UUID]
-    let targetBundleID: String
-    let targetName: String
-    let sentAt: Date
-}
+/// 当前实现不定义 DeliveryRecord：IMK 接受 insertText 后，成功块立即从
+/// live buffer 消费，不保留可恢复的明文发送快照。
 
 // [M5 路线图，当前不存在]
 // messageID / DeliveryTarget / inserted|acked|failed / 远端 ACK / 持久账本
@@ -151,7 +143,7 @@ struct DeliveryRecord {
 设计要点：
 
 - **`Origin` 是这次重构的第一等公民**。它同时解决三件事：UI 来源徽标、echo 防回环（§6.3）、来源门控（§4.4）。探索稿里 Marine `Draft.kind` 在入口被丢弃的 bug 由 `InboundItem.title` 承接。
-- **结果块就是 Chunk**（`role: .result`），不另设 ArtifactStore。发送、删除、清空对它一视同仁——这是「交互用同一套 UI」在数据层的对应物。
+- **结果块就是 Chunk**（`role: .result`），不另设 ArtifactStore。发送与显式删除对它一视同仁——这是「交互用同一套 UI」在数据层的对应物。
 - **`inputSnapshot` 即轻量版「Turn 冻结」**：任务启动时拷贝文本快照，之后用户继续打字不影响在途任务。不引入显式 Turn 实体。
 
 ---
@@ -167,7 +159,7 @@ struct DeliveryRecord {
  [计划]服务器 ─SSE────▶ SSEProvider ──┤                    │ 接受         │
  [计划]远程主机 ─SSH──▶ SSHProvider ──┘                    ▼              │
  Marine(兼容期) ─轮询─▶ MarineBridge ───────────────▶ BufferModel         │
-                       │                           │ Enter手势/显式纸飞机 │
+                       │                           │ Enter手势/主条纸飞机 │
                        │                                  ▼               │
                        │                       BufferDeliveryCoordinator  │
                        │                                  │               │
@@ -185,7 +177,7 @@ struct DeliveryRecord {
 
 | 模块 | 新/改 | 文件 | 职责 |
 |---|---|---|---|
-| BufferModel | 已实现 | `BufferModel.swift` | live blocks、插入点、成功消费、内存历史、撤销清空 |
+| BufferModel | 已实现 | `BufferModel.swift` | live blocks、插入点、成功消费、transient 状态；不留发送历史 |
 | InboundBus | 已实现 | `Inbound/InboundBus.swift` | 汇聚当前 MCP/HTTP，执行固定门控，产出 InboundItem |
 | SourceProvider 协议 | [计划] | `Inbound/SourceProvider.swift` | 未来 provider 的 `start()/stop()`、事件回调、健康状态 |
 | LocalGateway + MCP | 已实现 | `Inbound/LocalGateway.swift` | 本地 HTTP 服务器；stateless MCP POST + HTTP push + health |
@@ -198,9 +190,9 @@ struct DeliveryRecord {
 | TranslationProcessor | [计划 M3] | `Processors/TranslationProcessor.swift` | Apple Translation（macOS 15+，见 §5.2 风险） |
 | AIProcessor | [计划 M4] | `Processors/AIProcessor.swift` | OpenAI 兼容 chat/completions，SSE 流式 |
 | FocusCoordinator | 新（已实现） | `InputFocusCoordinator.swift` | FocusToken、client 租约、前台与对象身份校验 |
-| BufferDeliveryCoordinator | 新（已实现） | `BufferDeliveryCoordinator.swift` | 逐块复核目标、成功块消费、失败后缀保留、写内存发送历史 |
+| BufferDeliveryCoordinator | 新（已实现） | `BufferDeliveryCoordinator.swift` | 逐块复核目标、成功块无历史消费、失败后缀保留 |
 | DeliveryRouter | 后续 | `Delivery.swift` → `Delivery/DeliveryRouter.swift` | 多目标、远端 ACK、持久账本 |
-| 独立工作台 | 新（已实现） | `BufferWindowController.swift` + `BufferInlineView.swift` | 44pt 单行主条、向上展开至 78pt、编辑/历史菜单/多屏/隐私 |
+| 独立工作台 | 新（已实现） | `BufferWindowController.swift` + `BufferInlineView.swift` | 44pt 简化主条、向上展开至 78pt、Switch/状态/编辑/多屏/安全遮蔽 |
 | 候选状态机 | 改（已实现） | `CandidateWindow.swift` | 同一个常规 panel 锚定 caret 或缓冲条下方 |
 | 设置窗 | 六页已实现，后续再拆 | `SettingsWindow.swift` | 当前 IA 见 §8；来源信任/投递页仍属路线图 |
 
@@ -328,8 +320,8 @@ protocol Processor {
 ### 6.2 当前本地投递基线与后续 Router
 
 - 当前本地投递由 `BufferDeliveryCoordinator` 负责：每块发送前重验同一 token；焦点变化立即停止。
-- `Delivery.insert` 调用成功只表示 IMKit 接受调用，不是宿主 ACK；当前产品仍在成功返回后立即把该 block 从 live buffer 消费并记入历史。局部失败立即停止，失败 block 和尚未发送后缀原位保留。
-- 最近 50 条发送快照只在当前进程内，可从工作台历史菜单显式恢复为待发送，并依靠 `originalOrder` 回到仍存活块之间的原相对位置；显式清空也可撤销一次。跨 app 隐私清理则不可撤销，并同时删除内存历史。
+- `Delivery.insert` 调用成功只表示 IMKit 接受调用，不是宿主 ACK；当前产品在成功返回后立即把该 block 从 live buffer 消费，且不保留明文历史。局部失败立即停止，失败 block 和尚未发送后缀原位保留。
+- 工作台不提供历史恢复或清空撤销。跨 app 隐私清理仍是不可恢复的安全操作。
 - 多目标、远端 ACK、失败状态与持久账本仍属于后续 M5，不把未来能力写成当前保证。
 
 ### 6.3 Echo 防回环
@@ -352,7 +344,7 @@ protocol Processor {
 | 措施 | 机制 | 备注 |
 |---|---|---|
 | 密码框保护 | `Delivery.insert` 在投递时同步检查 `IsSecureEventInputEnabled()` 并拒发；工作台遮蔽。当前收件箱「接受」只暂存到缓冲，不禁用也无锁标 | macOS secure input 本身已让第三方 IME 收不到密码键入；核心保证是已有缓冲内容不能被投进密码框 |
-| 切换应用时重置 | 显式设置，默认关；开启后仅当缓冲中没有任何外部来源块时不可撤销地清 blocks/undo/history | 常驻工作台默认跨 app 保留；外部待投递内容绝不因切目标而自动丢弃 |
+| 切换应用时重置 | 显式设置，默认关；开启后仅当缓冲中没有任何外部来源块时不可撤销地丢弃 live blocks 并收束瞬态状态 | 常驻工作台默认跨 app 保留；外部待投递内容绝不因切目标而自动丢弃 |
 | 焦点与自有窗口 | FocusToken 精确租约；自有设置/编辑文本框既不进缓冲，也不远端镜像 | 迟到 deactivate/command/candidate click 不能影响新目标 |
 | 本地端口鉴权 | 仅绑 127.0.0.1 + Bearer token（0600 文件）+ 常数时间比较 | 无 token 401，不产生任何 UI 痕迹 |
 | 来源门控 | §4.4 三档类型 + 当前硬编码规则；无按来源设置 | 可配置覆盖属后续路线图 |
@@ -373,7 +365,7 @@ protocol Processor {
 └─ 维护（现状）          └─ 处理器   当前为未来能力说明
 ```
 
-缓冲页明确展示：关闭窗口会收束组字、暂停捕获并保留内容；清空是另一动作。候选默认使用常规面板锚定在细条下方，可切回跟随 caret；菜单也提供显隐、pin 与移到当前屏幕。「安全」不单设页，安全项就近放在语义所属页。
+缓冲页明确展示：关闭窗口会收束组字、暂停捕获、结束未完成的瞬态状态并保留已有块。候选默认使用常规面板锚定在细条下方，可切回跟随 caret；菜单也提供显隐、pin 与移到当前屏幕。「安全」不单设页，安全项就近放在语义所属页。
 
 **[后续路线图]** 等按来源信任和多目标投递真正实现后，可把「连接」拆成独立「来源」与「投递」页，形成原方案中的 8 页 IA；当前不得把该拆分写成已完成。
 
@@ -390,7 +382,7 @@ protocol Processor {
 | **M2 网关** | LocalGateway、stateless MCP tools、HTTP push、token 与收件箱已完成；按来源信任设置尚未实现 | M1 | ✅ 主干完成 |
 | **M3 处理器框架+翻译** | JobRunner、Processor 协议、处理胶囊/结果块 UI、TranslationProcessor（含 spike）、处理器设置页 | M1 | ~800 行 |
 | **M4 AI** | AIProcessor(SSE)、凭据管理、提示词模板 | M3 | ~500 行 |
-| **M5 投递路由** | [计划] DeliveryRouter、多目标、远端 ack、失败状态与持久账本；当前仅有本地精确焦点投递和内存历史 | M1 | ~500 行 |
+| **M5 投递路由** | [计划] DeliveryRouter、多目标、远端 ack、失败状态与持久账本；当前仅有本地精确焦点投递且不保存发送历史 | M1 | ~500 行 |
 | **M6 收尾** | [计划] SSEClientProvider、SSHProvider、工作台内传入轨、设置窗 IA 再拆分与视觉对齐 | M2 | ~700 行 |
 
 原始未实现部分曾粗估约 4800 行；工程当前约 14000 行，该估算不再代表剩余工作量。后续每期验收仍对应 §1.2 用户故事，并为新增纯逻辑补 smoke；协议 v2 已推迟，不属于当前 CI 契约。
@@ -419,7 +411,7 @@ protocol Processor {
 | 10 | 隔空传字页去向 | [路线图] 来源/投递能力成熟后再拆页；当前仍在「连接」页（§8） |
 | 11 | 无条件镜像 | v1 保持既有隔空传字设置；自身窗口永不镜像，`.remotePeer` 来源永不回镜（§6.3） |
 | 12 | 按住 1.2s 发送 | 已实现；无未决组字时轻按发下一块、按住约 1.2 秒发全部。有未决组字时本次按键只收束，不发送（§1.1） |
-| 13 | 清空按钮 | 保留，与停止并存（§1.1） |
+| 13 | 清空按钮 | 2026-07-18 覆盖裁决：移除按钮、清空与撤销功能；只保留不可恢复的自动安全清理 |
 | 14 | 紧凑面板两轨还是三轨 | 三层仍是历史路线目标；当前运行时采用 44pt 单行缓冲条 + 向上工具层（总高 78pt）+ 条下方常规候选窗，传入轨仍待嵌入 |
 | 15 | 「远端」语义 | 本方案中远端=配对设备（出入站同一对端）；「远端算力」概念废弃，算力即处理器 |
 | 16 | 分期 | §9 |
@@ -429,7 +421,7 @@ protocol Processor {
 
 - Translation 可行性 spike 已通过，但模型下载、系统版本门控与 AppKit/SwiftUI 生命周期尚未集成到产品 Processor，仍需真机验证。
 - 焦点竞态：同一 app 多文本框可能复用 IMK client proxy；必须依靠每次 activation 新 epoch、事件顺序与迟到 callback 拒绝，真机覆盖 Safari/Electron/微信。
-- 常显隐私：工作台跨桌面/全屏可见，必须保持手动遮蔽、secure-input 低频检测与锁屏隐藏。
+- 常显隐私：工作台跨桌面/全屏可见，必须保持 secure-input 低频检测、自动隐私清理与锁屏隐藏；产品不再提供手动遮蔽状态。
 - 编辑器激活会主动让旧外部目标失效；保存后必须回到目标 app 并重新取得焦点，不能偷偷复用旧租约。
 - MCP 规范演进快，streamable HTTP transport 细节可能随客户端版本变动——spike 3 锁版本，README 注明测试过的客户端版本。
 - [未来条件风险] 若 M5 重新启动配对协议 v2/ACK 设计，必须先确定版本协商与兼容策略；当前版本未实现 v2，也不要求两台 Mac 同步升级。
@@ -452,7 +444,7 @@ protocol Processor {
   - ⏸ **传入轨 UI**：M2 网关前置条件已经满足；当前仍使用 `InboundToast` + `InboundTrayWindow`，嵌入独立工作台的传入轨尚未实现。配对设备继续直通不入轨，Marine 现状直接进 buffer。
   - ⏹ **远端改道 + 协议 v2**：按 §12.1 决策**作废**。
 - **M2 网关+MCP** — ✅ 主干已实现：`LocalGateway`、MCP tools、`InboundBus`、token 与收件箱可用；传入轨嵌入工作台仍后续。
-- **稳定缓冲窗口** — ✅ 2026-07-17：FocusToken、Return 轻按逐块/长按全部手势、Return/Backspace 宿主隔离、44pt 单行条/78pt 向上工具层、条下方常规候选窗、成功块即时消费、块编辑防回灌、50 条内存发送历史、清空撤销、多屏/常显/隐私控制已实现；待重新安装后的真实宿主输入交互验收。
+- **稳定缓冲窗口** — ✅ 2026-07-18：FocusToken、Return 轻按逐块/长按全部手势、Return/Backspace 宿主隔离、44pt 简化主条/78pt 向上功能层、条下方常规候选窗、成功块无历史消费、块编辑防回灌、多屏/常显与 secure-input 保护已实现；待重新安装后的真实宿主输入交互验收。
 
 ### 12.3 下一步真实工作量
 

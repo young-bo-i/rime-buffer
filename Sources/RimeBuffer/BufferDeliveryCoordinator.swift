@@ -28,7 +28,7 @@ final class BufferDeliveryCoordinator {
     }
 
     enum Availability: Equatable {
-        case ready(appName: String, bundleID: String)
+        case ready
         case blocked(BlockedReason)
 
         var canSend: Bool {
@@ -38,7 +38,7 @@ final class BufferDeliveryCoordinator {
 
         var label: String {
             switch self {
-            case let .ready(appName, _): return "发送到：\(appName) · 当前文本框"
+            case .ready: return "可发送"
             case let .blocked(reason): return reason.message
             }
         }
@@ -66,7 +66,7 @@ final class BufferDeliveryCoordinator {
         if BufferModel.shared.pendingDeliveryBlocks.isEmpty {
             return .blocked(.nothingPending)
         }
-        return .ready(appName: target.applicationName, bundleID: target.bundleID)
+        return .ready
     }
 
     @discardableResult
@@ -153,9 +153,7 @@ final class BufferDeliveryCoordinator {
         }
 
         if !deliveredIDs.isEmpty {
-            BufferModel.shared.recordDelivery(blockIDs: deliveredIDs,
-                                              targetBundleID: target.bundleID,
-                                              targetName: target.applicationName)
+            BufferModel.shared.consumeDelivered(blockIDs: deliveredIDs)
         }
         if let blockedReason {
             IMELog.write("buffer send stopped reason=\(blockedReason.message) sent=\(deliveredIDs.count)")

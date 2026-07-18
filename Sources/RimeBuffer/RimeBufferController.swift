@@ -361,10 +361,21 @@ final class RimeBufferController: IMKInputController {
         guard rimeEngine.start() else {
             StatusMenu.shared.setHealthy(false)
             IMELog.write("activate: engine down — raw passthrough mode")
+            // Buffer Return/Backspace isolation is a host contract, not a
+            // librime feature. Install the idle marked guard even with no
+            // healthy engine/session so Chromium cannot submit raw Return.
+            if let activeClient {
+                updateUI(client: activeClient)
+            }
             return
         }
         StatusMenu.shared.setHealthy(true)
-        ensureSessionReady(applyPreference: true)
+        _ = ensureSessionReady(applyPreference: true)
+        if let activeClient {
+            // Arm the idle guard during activation. Waiting for the first key
+            // is too late for a field whose first key is Return.
+            updateUI(client: activeClient)
+        }
         BufferWindowController.shared.refresh()
         MarineBridge.shared.checkForFocusedIntent()
     }
@@ -624,6 +635,11 @@ final class RimeBufferController: IMKInputController {
                                owner: lease.token,
                                externalTarget: lease.isExternalTarget)
         }
+        // Let the host finish the current command/blur first. If the exact
+        // external lease survives, restore its idle guard before another key.
+        DispatchQueue.main.async {
+            RimeBufferController.refreshActiveUI()
+        }
     }
 
     /// Safety net for paths that bypass IMK's callbacks (hostile apps on
@@ -643,6 +659,9 @@ final class RimeBufferController: IMKInputController {
         resolveComposition(client: client,
                            owner: lease.token,
                            externalTarget: lease.isExternalTarget)
+        if currentCallbackClient(client) != nil {
+            updateUI(client: client)
+        }
     }
 
     /// Commit-on-blur: flush the chord, commit what Rime holds, close the
@@ -659,7 +678,20 @@ final class RimeBufferController: IMKInputController {
         } else {
             chord.flush()
         }
-        guard session != 0 else { return }
+        guard session != 0 else {
+            // The buffer's idle marked guard can exist without librime. It
+            // still must be retired on an exact trusted blur/deactivation.
+            if let client {
+                composition.clear(client: client)
+            } else {
+                composition.markCleared()
+            }
+            if let owner {
+                InputFocusCoordinator.shared.setCompositionActive(false, token: owner)
+                candidateWindow.hide(owner: owner)
+            }
+            return
+        }
         if let client {
             _ = rimeEngine.commitComposition(session: session)
             drainCommit(client, externalTarget: externalTarget)
@@ -849,12 +881,6 @@ final class RimeBufferController: IMKInputController {
             if composition.composing || chord.hasPending { forceCommit() }
             return false
         }
-        if let shiftedText = shiftedDirectText(for: event) {
-            if rimeEngine.start(), ensureSessionReady() {
-                return insertDirectText(shiftedText, client: client, source: "shift")
-            }
-            return insertDirectText(shiftedText, client: client, source: "shift fallback")
-        }
 
         let routedKeycode = keysym(for: event)
         let routedMask = RimeKey.modifierMask(from: event.modifierFlags)
@@ -888,6 +914,14 @@ final class RimeBufferController: IMKInputController {
                                          client: client,
                                          hardwareKeyCode: event.keyCode)
             }
+        }
+        // Keep Shift+Return/Backspace inside the buffer-control contract even
+        // if a host reports a printable Unicode line/paragraph separator.
+        if let shiftedText = shiftedDirectText(for: event) {
+            if rimeEngine.start(), ensureSessionReady() {
+                return insertDirectText(shiftedText, client: client, source: "shift")
+            }
+            return insertDirectText(shiftedText, client: client, source: "shift fallback")
         }
         // Engine down → raw fallback so the user can still type latin.
         guard rimeEngine.start(), ensureSessionReady() else {
@@ -1622,11 +1656,11 @@ final class RimeBufferController: IMKInputController {
         }
         publishCompositionActive(false)
         BufferWindowController.shared.refresh()
-        if session != 0 {
-            updateUI(client: client)
-        } else if let focusToken {
-            candidateWindow.hide(owner: focusToken)
-        }
+        // Always refresh the exact lease after direct/fallback insertion.
+        // `updateUI` owns the sessionless path that reinstalls the invisible
+        // buffer guard; skipping it here lets Chromium/Codex observe the next
+        // raw Return after one engine-down character.
+        updateUI(client: client)
         return true
     }
 
@@ -2145,6 +2179,7 @@ final class RimeBufferController: IMKInputController {
               ObjectIdentifier(client as AnyObject) == target.clientIdentity,
               Delivery.insert(text, into: client) else { return false }
         composition.commitDidInsert()
+        updateUI(client: client)
         return true
     }
 
@@ -2160,11 +2195,40 @@ final class RimeBufferController: IMKInputController {
     }
 
     private func updateUI(client: IMKTextInput) {
-        guard session != 0, let focusToken else { return }
+        guard let focusToken else { return }
         guard let lease = InputFocusCoordinator.shared.interactionTarget(expected: focusToken),
               lease.controller === self,
               ObjectIdentifier(client as AnyObject) == lease.clientIdentity else {
             IMELog.write("updateUI ignored; client no longer owns token=\(focusToken)")
+            return
+        }
+
+        let bufferControlsActive = shouldUseBufferCommands(client: client)
+        let capturesRimeCommits = shouldCaptureCommit(from: client)
+        let secureInput = IsSecureEventInputEnabled()
+
+        // Host isolation cannot depend on a healthy Rime session. In fallback
+        // mode there is no semantic composition, but the exact external buffer
+        // lease still needs its idle U+200B guard before Return is pressed.
+        guard session != 0, rimeEngine.isHealthy else {
+            let presentation = HostMarkedTextPresentationRules.presentation(
+                bufferControlsActive: bufferControlsActive,
+                capturesRimeCommits: capturesRimeCommits,
+                rimeComposing: false,
+                secureInput: secureInput
+            )
+            let guardActive: Bool
+            switch presentation {
+            case .none, .normalPreedit:
+                composition.clear(client: client)
+                guardActive = false
+            case let .bufferGuard(rimeComposing):
+                composition.updateBufferGuard(rimeComposing: rimeComposing,
+                                              client: client)
+                guardActive = true
+            }
+            publishCompositionActive(false, markedRangeReliable: !guardActive)
+            candidateWindow.hide(owner: focusToken)
             return
         }
 
@@ -2184,22 +2248,40 @@ final class RimeBufferController: IMKInputController {
 
         let bid = bundleId(of: client)
         let mode = CompositionSession.mode(for: bid)
-        let bufferEnabled = shouldCaptureCommit(from: client)
         let compositionActive = chord.hasPending || ctx.active
             || !ctx.input.isEmpty || !ctx.preedit.isEmpty
-        if bufferEnabled {
-            composition.updateBufferGuard(active: compositionActive, client: client)
-        } else {
+        let presentation = HostMarkedTextPresentationRules.presentation(
+            bufferControlsActive: bufferControlsActive,
+            capturesRimeCommits: capturesRimeCommits,
+            rimeComposing: compositionActive,
+            secureInput: secureInput
+        )
+        let guardActive: Bool
+        switch presentation {
+        case .none:
+            composition.clear(client: client)
+            guardActive = false
+        case .normalPreedit:
             composition.update(preedit: ctx.preedit, cursorPosUTF8: ctx.cursorPos,
                                client: client, mode: mode)
+            guardActive = false
+        case let .bufferGuard(rimeComposing):
+            composition.updateBufferGuard(rimeComposing: rimeComposing,
+                                          client: client)
+            guardActive = true
         }
         // In buffer mode the marked text is our invisible zero-width guard, not
         // a real field marker; don't let its unreliable markedRange drive
         // field-change detection (would drop chord/F4 keys — press-twice bug).
         publishCompositionActive(compositionActive,
-            markedRangeReliable: !bufferEnabled)
+            markedRangeReliable: !guardActive)
 
-        let showPreeditInPanel = bufferEnabled || mode == .placeholder
+        if presentation == .none {
+            candidateWindow.hide(owner: focusToken)
+            return
+        }
+
+        let showPreeditInPanel = capturesRimeCommits || mode == .placeholder
         let wantsPanel = !ctx.candidates.isEmpty
             || (showPreeditInPanel && (!ctx.preedit.isEmpty || !ctx.input.isEmpty))
         if wantsPanel {

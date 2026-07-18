@@ -35,6 +35,9 @@ if CommandLine.arguments.contains("inbound-smoke") {
 if CommandLine.arguments.contains("candidate-metrics-smoke") {
     exit(runCandidateMetricsSmokeTest() ? 0 : 1)
 }
+if CommandLine.arguments.contains("theme-smoke") {
+    exit(runThemeSmokeTest() ? 0 : 1)
+}
 if CommandLine.arguments.contains("smoke") {
     exit(runEngineSmokeTest() ? 0 : 1)
 }
@@ -163,8 +166,21 @@ candidateWindow.onSettings = {
     SettingsWindowController.shared.show()
 }
 // Buffer presentation is independent from the caret-owned candidate panel.
+var lastBufferControlsActive = BufferModel.shared.active
 BufferModel.shared.onChange = {
     BufferWindowController.shared.refresh()
+    let active = BufferModel.shared.active
+    let shouldRefreshHostGuard = HostMarkedTextPresentationRules
+        .shouldRefreshForActiveChange(previous: lastBufferControlsActive,
+                                      current: active)
+    lastBufferControlsActive = active
+    if shouldRefreshHostGuard {
+        // Model mutations can occur inside a commit/drain callback. Defer the
+        // host-guard refresh to avoid re-entering getContext/setMarkedText.
+        DispatchQueue.main.async {
+            RimeBufferController.refreshActiveUI()
+        }
+    }
 }
 InputFocusCoordinator.shared.onChange = {
     BufferWindowController.shared.refresh()
@@ -914,9 +930,9 @@ func runInboundBusSmokeTest() -> Bool {
     let bus = InboundBus.shared
     let model = BufferModel.shared
     let oldEnabled = model.enabled
-    defer { model.clear(); bus.clear(); model.enabled = oldEnabled }
+    defer { model.discardForPrivacy(); bus.clear(); model.enabled = oldEnabled }
     model.enabled = true
-    model.clear(); bus.clear()
+    model.discardForPrivacy(); bus.clear()
 
     // Trust defaults: mcp/http = ask, marine = trusted.
     guard bus.trust(for: .mcp(client: "x")) == .ask,
@@ -961,7 +977,7 @@ func runInboundBusSmokeTest() -> Bool {
     }
 
     // Streaming: text updates in place, one pending item, endStream settles it.
-    model.clear(); bus.clear()
+    model.discardForPrivacy(); bus.clear()
     _ = bus.beginStream(origin: .mcp(client: "a"), streamID: "s1")
     bus.appendStream(streamID: "s1", delta: "部分")
     bus.appendStream(streamID: "s1", delta: "文本")
@@ -985,7 +1001,7 @@ func runInboundBusSmokeTest() -> Bool {
 
     // A purely locally-typed buffer must NOT count as external, so the switch-
     // app reset still clears normal typing.
-    model.clear(); bus.clear()
+    model.discardForPrivacy(); bus.clear()
     model.append("本地打字")   // origin defaults to .rime
     guard !model.holdsExternalContent else {
         print("FAILED: locally-typed buffer must not report holdsExternalContent")
@@ -1023,9 +1039,9 @@ func runOriginSmokeTest() -> Bool {
     // readable where the send path reads it.
     let model = BufferModel.shared
     let oldEnabled = model.enabled
-    defer { model.clear(); model.enabled = oldEnabled }
+    defer { model.discardForPrivacy(); model.enabled = oldEnabled }
     model.enabled = true
-    model.clear()
+    model.discardForPrivacy()
     model.append("你")
     model.append("hi", origin: .mcp(client: "codex"))
     guard model.blocks.count == 2,
@@ -1069,98 +1085,46 @@ func runBufferSmokeTest() -> Bool {
 
     model.onChange = nil
     model.enabled = true
-    model.clear()
+    model.discardForPrivacy()
 
-    // Accepted delivery attempts disappear from the live workbench while an
-    // in-memory history snapshot remains available for deliberate restoration.
+    // Accepted delivery attempts disappear from the live workbench without
+    // retaining a plaintext delivery history.
     model.append("你")
     model.append("好")
     let firstID = model.blocks[0].id
     let secondID = model.blocks[1].id
-    let previousRecordIDs = Set(model.sentHistory.map(\.id))
-    model.recordDelivery(blockIDs: [firstID],
-                         targetBundleID: "com.example.target",
-                         targetName: "Target")
-    guard let firstRecord = model.sentHistory.last,
-          !previousRecordIDs.contains(firstRecord.id) else {
-        print("FAILED: delivery record was not appended")
-        return false
-    }
+    model.consumeDelivered(blockIDs: [firstID])
     guard model.blocks.map(\.text) == ["好"],
           model.pendingDeliveryBlocks.map(\.id) == [secondID],
           model.insertionIndex == 1,
-          firstRecord.originalOrder == [firstID, secondID],
-          firstRecord.blocks.map(\.id) == [firstID],
-          firstRecord.blocks[0].lastSentAt != nil,
           model.enabled else {
         print("FAILED: accepted delivery must consume only the accepted block")
         return false
     }
-    guard model.restoreDelivery(recordID: firstRecord.id),
-          model.blocks.map(\.id) == [firstID, secondID],
-          model.pendingDeliveryBlocks.map(\.id) == [firstID, secondID] else {
-        print("FAILED: delivery history restore should recover the consumed prefix")
-        return false
-    }
-
-    // A full accepted delivery leaves an empty live workbench. Its snapshot can
-    // still rebuild the blocks for a deliberate re-send/edit action.
-    model.recordDelivery(blockIDs: [firstID, secondID],
-                         targetBundleID: "com.example.target",
-                         targetName: "Target")
-    guard let recoveryRecord = model.sentHistory.last else {
-        print("FAILED: missing recovery delivery record")
-        return false
-    }
+    model.consumeDelivered(blockIDs: [secondID])
     guard model.blocks.isEmpty,
           model.pendingDeliveryBlocks.isEmpty,
-          model.insertionIndex == 0,
-          model.restoreDelivery(recordID: recoveryRecord.id),
-          model.blocks.map(\.text) == ["你", "好"],
-          model.pendingDeliveryBlocks.map(\.id) == [firstID, secondID] else {
-        print("FAILED: full delivery history recovery")
+          model.insertionIndex == 0 else {
+        print("FAILED: full accepted delivery should empty the live workbench")
         return false
     }
 
-    // Partial recovery preserves the delivery snapshot's relative order. A
-    // missing prefix must be restored before its surviving suffix, not appended.
-    guard model.removeBlock(id: firstID),
-          model.blocks.map(\.id) == [secondID],
-          model.restoreDelivery(recordID: recoveryRecord.id),
-          model.blocks.map(\.id) == [firstID, secondID] else {
-        print("FAILED: partial delivery history recovery order")
-        return false
-    }
-
-    // Clear never exits capture, and a mistaken clear is recoverable in memory.
-    model.clear()
-    guard model.blocks.isEmpty, model.enabled, model.canUndoClear,
-          model.undoLastClear(), model.blocks.map(\.text) == ["你", "好"] else {
-        print("FAILED: clear/undo semantics")
-        return false
-    }
-
-    // Non-adjacent accepted blocks must return to their exact relative slots,
-    // using unsent neighbours from the complete pre-delivery order as anchors.
-    model.clear()
+    // Consuming non-adjacent accepted blocks must preserve the order of every
+    // unsent block and keep the insertion point valid.
     model.append("甲")
     model.append("乙")
     model.append("丙")
     model.append("丁")
     let originalOrder = model.blocks.map(\.id)
-    model.recordDelivery(blockIDs: [originalOrder[1], originalOrder[3]],
-                         targetBundleID: "com.example.target",
-                         targetName: "Target")
-    guard let interleavedRecord = model.sentHistory.last,
-          model.blocks.map(\.id) == [originalOrder[0], originalOrder[2]],
-          model.insertionIndex == 2,
-          model.restoreDelivery(recordID: interleavedRecord.id),
-          model.blocks.map(\.id) == originalOrder else {
-        print("FAILED: non-adjacent delivery restore order")
+    model.consumeDelivered(blockIDs: [originalOrder[1], originalOrder[3]])
+    guard model.blocks.map(\.id) == [originalOrder[0], originalOrder[2]],
+          model.pendingDeliveryBlocks.map(\.id) == [originalOrder[0], originalOrder[2]],
+          model.insertionIndex == 2 else {
+        print("FAILED: non-adjacent delivery consumption order")
         return false
     }
 
-    model.clear()
+    model.discardForPrivacy()
     model.append("前")
     model.append("后")
     guard model.removeLastBlock(),
@@ -1177,7 +1141,7 @@ func runBufferSmokeTest() -> Bool {
         return false
     }
 
-    model.clear()
+    model.discardForPrivacy()
     model.append("一")
     model.append("三")
     guard model.moveInsertionPoint(delta: -1),
@@ -1203,53 +1167,32 @@ func runBufferSmokeTest() -> Bool {
         return false
     }
 
-    // A consumed block can be restored and edited while preserving its stable
-    // provenance/identity/time. Restored live blocks never carry sent markers.
+    // Editing a live block preserves its stable provenance, identity and time.
     let editedBefore = model.blocks[1]
-    model.recordDelivery(blockIDs: [editedBefore.id],
-                         targetBundleID: "com.example.target",
-                         targetName: "Target")
-    guard let editRecord = model.sentHistory.last,
-          !model.blocks.contains(where: { $0.id == editedBefore.id }),
-          model.restoreDelivery(recordID: editRecord.id),
-          model.updateBlock(id: editedBefore.id, text: "二改"),
+    guard model.updateBlock(id: editedBefore.id, text: "二改"),
           let edited = model.blocks.first(where: { $0.id == editedBefore.id }),
           edited.origin == editedBefore.origin,
           edited.createdAt == editedBefore.createdAt,
-          edited.lastSentAt == nil,
           edited.text == "二改" else {
-        print("FAILED: block editing must preserve metadata and become pending")
+        print("FAILED: block editing must preserve metadata")
         return false
     }
 
+    model.beginTransientLoading(requestId: "pause-smoke", message: "处理中")
     model.pauseCapturePreservingContent()
-    guard !model.enabled, !model.blocks.isEmpty else {
-        print("FAILED: pause capture must preserve content")
-        return false
-    }
-
-    for index in 0..<55 {
-        let text = "历史\(index)"
-        model.append(text)
-        guard let blockID = model.blocks.first(where: { $0.text == text })?.id else {
-            print("FAILED: history-cap setup could not find appended block")
-            return false
-        }
-        model.recordDelivery(blockIDs: [blockID],
-                             targetBundleID: "com.example.target",
-                             targetName: "Target")
-    }
-    guard model.sentHistory.count == 50,
-          model.sentHistory.last?.blocks.first?.text == "历史54" else {
-        print("FAILED: delivery history must retain exactly the latest 50 records")
+    guard !model.enabled,
+          !model.transientEnabled,
+          model.loadingMessage == nil,
+          !model.blocks.isEmpty else {
+        print("FAILED: pause must preserve blocks and clear transient loading state")
         return false
     }
 
     model.discardForPrivacy()
     guard model.blocks.isEmpty,
-          model.sentHistory.isEmpty,
-          !model.canUndoClear else {
-        print("FAILED: privacy discard must not be recoverable")
+          model.loadingMessage == nil,
+          !model.transientEnabled else {
+        print("FAILED: privacy discard must erase all live state")
         return false
     }
 
@@ -1259,6 +1202,45 @@ func runBufferSmokeTest() -> Bool {
 
 func runBufferWindowSmokeTest() -> Bool {
     print("== RimeBuffer buffer window smoke test ==")
+
+    let ready = BufferDeliveryCoordinator.Availability.ready
+    let readyText = BufferWorkbenchStatusText.text(for: ready, secureInput: false)
+    let readyHelp = BufferWorkbenchStatusText.help(for: ready, secureInput: false)
+    let firstID = UUID()
+    let secondID = UUID()
+    guard BufferWorkbenchLayout.mainBar
+            == [.dragHandle, .disclosure, .bufferRail, .send],
+          BufferWorkbenchLayout.expandedShelf
+            == [.status, .edit, .captureSwitch, .close],
+          BufferWorkbenchLayout.dragControls == [.dragHandle],
+          BufferWorkbenchLayout.dragCursor == .pointingHand,
+          BufferWorkbenchMetrics.controlSize == 22,
+          BufferWorkbenchMetrics.mainSpacing == 3,
+          BufferWorkbenchMetrics.shelfSpacing == 4,
+          !BufferWorkbenchLayout.windowBackgroundDraggable,
+          FirstMouseSwitch(frame: .zero).acceptsFirstMouse(for: nil),
+          BufferEditorRouting.request(
+            blockIDs: [], selectedBlockID: nil, secureInput: false
+          ) == .noContent,
+          BufferEditorRouting.request(
+            blockIDs: [secondID], selectedBlockID: nil, secureInput: false
+          ) == .edit(secondID),
+          BufferEditorRouting.request(
+            blockIDs: [firstID, secondID], selectedBlockID: firstID, secureInput: false
+          ) == .edit(firstID),
+          BufferEditorRouting.request(
+            blockIDs: [firstID], selectedBlockID: firstID, secureInput: true
+          ) == .blockedSecureInput,
+          readyText == "可发送",
+          !readyText.contains("ChatGPT"),
+          !readyText.contains("→"),
+          !readyHelp.contains("ChatGPT"),
+          !readyHelp.contains("发送到"),
+          BufferWorkbenchStatusText.text(for: ready, secureInput: true)
+            == "安全输入，内容已隐藏" else {
+        print("FAILED: simplified workbench control/status contract")
+        return false
+    }
 
     guard BufferControlRoutingRules.disposition(
             bufferActive: false, ownClient: false, exactFocus: true
@@ -1273,6 +1255,57 @@ func runBufferWindowSmokeTest() -> Bool {
             bufferActive: true, ownClient: false, exactFocus: false
           ) == .consumeOnly else {
         print("FAILED: buffer Return/Backspace isolation disposition")
+        return false
+    }
+
+    // Host isolation and semantic composition are separate. In particular an
+    // idle buffer must keep Chromium in IME-composing mode without making our
+    // Return state machine think there is Rime input left to settle.
+    guard HostMarkedTextPresentationRules.presentation(
+            bufferControlsActive: true,
+            capturesRimeCommits: true,
+            rimeComposing: false,
+            secureInput: false
+          ) == .bufferGuard(rimeComposing: false),
+          HostMarkedTextPresentationRules.presentation(
+            bufferControlsActive: true,
+            capturesRimeCommits: true,
+            rimeComposing: true,
+            secureInput: false
+          ) == .bufferGuard(rimeComposing: true),
+          // Transient external blocks own idle Return, but local Rime preedit
+          // remains inline because transient mode does not capture typing.
+          HostMarkedTextPresentationRules.presentation(
+            bufferControlsActive: true,
+            capturesRimeCommits: false,
+            rimeComposing: false,
+            secureInput: false
+          ) == .bufferGuard(rimeComposing: false),
+          HostMarkedTextPresentationRules.presentation(
+            bufferControlsActive: true,
+            capturesRimeCommits: false,
+            rimeComposing: true,
+            secureInput: false
+          ) == .normalPreedit,
+          HostMarkedTextPresentationRules.presentation(
+            bufferControlsActive: false,
+            capturesRimeCommits: true,
+            rimeComposing: false,
+            secureInput: false
+          ) == .normalPreedit,
+          HostMarkedTextPresentationRules.presentation(
+            bufferControlsActive: true,
+            capturesRimeCommits: true,
+            rimeComposing: false,
+            secureInput: true
+          ) == .none,
+          HostMarkedTextPresentationRules.shouldRefreshForActiveChange(
+            previous: false, current: true
+          ),
+          !HostMarkedTextPresentationRules.shouldRefreshForActiveChange(
+            previous: true, current: true
+          ) else {
+        print("FAILED: buffer host marked-text isolation presentation")
         return false
     }
 
@@ -1763,17 +1796,12 @@ func runBufferWindowSmokeTest() -> Bool {
     let scrubbedByShield = rail.isHidden
         && rail.renderedBlockCount == 0
         && !rail.isEnterHoldProgressVisible
-    model.discardForPrivacy()
-    model.beginTransientLoading(requestId: "clear-loading-smoke",
-                                message: "loading")
-    _ = rail.refresh()
-    let canClearLoadingOnlyState = model.blocks.isEmpty && rail.canClearContent
     model.enabled = oldEnabled
-    model.clear()
+    model.discardForPrivacy()
     model.onChange = oldOnChange
     guard renderedBeforeShield, skippedUnchangedRail, showedEnterHoldProgress,
-          scrubbedByShield, canClearLoadingOnlyState else {
-        print("FAILED: buffer rail privacy or loading-clear behavior")
+          scrubbedByShield else {
+        print("FAILED: buffer rail secure-input shielding behavior")
         return false
     }
 
@@ -1890,13 +1918,13 @@ func runMarineBridgeSmokeTest() -> Bool {
     let oldEnabled = model.enabled
     let oldOnChange = model.onChange
     defer {
-        model.clear()
+        model.discardForPrivacy()
         model.enabled = oldEnabled
         model.onChange = oldOnChange
     }
 
     model.onChange = nil
-    model.clear()
+    model.discardForPrivacy()
 
     MarineBridge.shared.checkForFocusedIntent()
     let deadline = Date().addingTimeInterval(5)
@@ -2116,5 +2144,105 @@ func runCandidateMetricsSmokeTest() -> Bool {
           "an over-tall button must be clamped by the strip during layout")
 
     if ok { print("candidate metrics smoke: OK") }
+    return ok
+}
+
+/// Guards the fixed day palette against regressions to dynamic semantic colors
+/// or foregrounds that disappear on the small candidate/workbench typography.
+func runThemeSmokeTest() -> Bool {
+    print("== RimeBuffer theme contrast smoke test ==")
+    var ok = true
+    func check(_ condition: Bool, _ message: String) {
+        if !condition {
+            print("FAILED: \(message)")
+            ok = false
+        }
+    }
+
+    let day = RimeThemePalettes.day
+    let textColors: [(String, UInt32)] = [
+        ("primary", day.textPrimary),
+        ("secondary", day.textSecondary),
+        ("muted", day.textMuted),
+        ("selected candidate", day.selectedCandidate),
+    ]
+    for (name, color) in textColors {
+        let ratio = RimeColorContrast.ratio(
+            foreground: color,
+            background: day.candidateBackground
+        )
+        check(ratio >= 4.5, "day \(name) contrast \(ratio) should be >= 4.5")
+    }
+
+    let selectedLabelRatio = RimeColorContrast.ratio(
+        foreground: day.selectedCandidate,
+        alpha: 0.85,
+        background: day.candidateBackground
+    )
+    check(selectedLabelRatio >= 4.5,
+          "day selected label contrast \(selectedLabelRatio) should be >= 4.5")
+
+    let mutedBufferRatio = RimeColorContrast.ratio(
+        foreground: day.textMuted,
+        background: day.bufferBackgroundSecondary
+    )
+    check(mutedBufferRatio >= 4.5,
+          "day muted workbench contrast \(mutedBufferRatio) should be >= 4.5")
+
+    let borderRatio = RimeColorContrast.ratio(
+        foreground: day.borderStrong,
+        background: day.candidateBackground
+    )
+    check(borderRatio >= 3,
+          "day strong border contrast \(borderRatio) should be >= 3")
+
+    let night = RimeThemePalettes.night
+    let nightTextColors: [(String, UInt32)] = [
+        ("primary", night.textPrimary),
+        ("secondary", night.textSecondary),
+        ("muted", night.textMuted),
+        ("selected candidate", night.selectedCandidate),
+    ]
+    for (name, color) in nightTextColors {
+        let ratio = RimeColorContrast.ratio(
+            foreground: color,
+            background: night.candidateBackground
+        )
+        check(ratio >= 4.5, "night \(name) contrast \(ratio) should be >= 4.5")
+    }
+
+    let nightWorkbenchStatusRatio = RimeColorContrast.ratio(
+        foreground: night.textSecondary,
+        background: night.bufferBackground
+    )
+    check(nightWorkbenchStatusRatio >= 4.5,
+          "night workbench status contrast \(nightWorkbenchStatusRatio) should be >= 4.5")
+
+    let nightWorkbenchMutedRatio = RimeColorContrast.ratio(
+        foreground: night.textMuted,
+        background: night.bufferBackground
+    )
+    check(nightWorkbenchMutedRatio >= 4.5,
+          "night muted workbench contrast \(nightWorkbenchMutedRatio) should be >= 4.5")
+
+    let nightWorkbenchBorderRatio = RimeColorContrast.ratio(
+        foreground: night.borderStrong,
+        background: night.bufferBackground
+    )
+    check(nightWorkbenchBorderRatio >= 3,
+          "night workbench border contrast \(nightWorkbenchBorderRatio) should be >= 3")
+
+    check(RimeAppearanceMode.day.appKitAppearanceName(increasedContrast: false) == .aqua,
+          "day mode should force Aqua")
+    check(RimeAppearanceMode.night.appKitAppearanceName(increasedContrast: false) == .darkAqua,
+          "night mode should force Dark Aqua")
+    check(RimeAppearanceMode.day.appKitAppearanceName(increasedContrast: true)
+            == .accessibilityHighContrastAqua,
+          "day mode should preserve increased contrast")
+    check(RimeAppearanceMode.night.appKitAppearanceName(increasedContrast: true)
+            == .accessibilityHighContrastDarkAqua,
+          "night mode should preserve increased contrast")
+
+    if ok { print("theme contrast smoke: OK") }
     return ok
 }

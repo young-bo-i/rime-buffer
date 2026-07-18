@@ -482,17 +482,17 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
 
     private func bufferPage() -> NSView {
         let note = NSTextField(wrappingLabelWithString:
-            "缓冲区开启后，Rime 提交内容会进入单行缓冲条；轻按 Enter 发送下一块，长按 1.2 秒发送全部。成功发送的块会立即消失，并保留在最近 50 条进程内历史中供显式恢复；发送失败或尚未发送的块不会丢失。")
+            "缓冲区开启后，Rime 提交内容会进入单行缓冲条；轻按 Enter 发送下一块，长按 1.2 秒或点击主条右侧纸飞机发送全部。成功发送的块会立即消失；发送失败或尚未发送的块不会丢失，也不会保存发送历史。")
         note.font = .systemFont(ofSize: 11)
         note.textColor = .tertiaryLabelColor
 
         let resetNote = NSTextField(wrappingLabelWithString:
-            "默认跨应用保留。开启后，仅当整个缓冲都来自本地输入时，切到其他应用会不可撤销地清空内容、撤销快照和发送历史；只要混有外部来源块就整体保留。")
+            "默认跨应用保留。开启后，仅当整个缓冲都来自本地输入时，切到其他应用会不可撤销地清空内容；只要混有外部来源块就整体保留。")
         resetNote.font = .systemFont(ofSize: 11)
         resetNote.textColor = .tertiaryLabelColor
 
         let secureNote = NSTextField(wrappingLabelWithString:
-            "安全：当系统安全输入生效时，工作台会隐藏正文、统计与历史控件，关闭并擦净块编辑器，缓冲内容也不会被发送。此保护始终开启。")
+            "安全：当系统安全输入生效时，工作台会隐藏正文、禁用发送与编辑，并关闭、擦净块编辑器。此保护始终开启。")
         secureNote.font = .systemFont(ofSize: 11)
         secureNote.textColor = .tertiaryLabelColor
 
@@ -510,7 +510,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
             secondaryLabel("候选显示位置"),
             candidatePlacementPopUp,
             moveBufferWindowButton,
-            caption("关闭工作台会暂停捕获但保留内容；清空和关闭是两个独立动作。"),
+            caption("关闭工作台会暂停捕获并结束未完成的加载状态，但保留已有缓冲块。"),
             spacer(16),
             sectionLabel("安全与清理"),
             resetOnAppSwitchCheck,
