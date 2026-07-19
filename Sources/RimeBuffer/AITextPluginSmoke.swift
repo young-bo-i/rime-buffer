@@ -355,7 +355,7 @@ private enum AITextPluginSmoke {
 
     private static func workspaceGatesAndDelivery() -> Bool {
         let source = BufferModel()
-        source.append("source")
+        source.stageExternal("source", origin: .rime)
         let provider = AITextSmokeProvider()
         let selection = AITextSmokeSelection()
         let workspace = AITextPluginWorkspace(provider: provider,
@@ -393,7 +393,7 @@ private enum AITextPluginSmoke {
         workspace.consumeDelivered(blockIDs: [secondID], generation: secondGeneration)
         guard source.stagedText.isEmpty, workspace.outputBlocks.isEmpty else { return false }
 
-        source.append("stale")
+        source.stageExternal("stale", origin: .rime)
         guard workspace.generate(), provider.requests.count == 2 else { return false }
         workspace.reset()
         provider.emit(AITextProviderBlock(index: 0, text: "must-ignore", title: nil), request: 1)
@@ -443,7 +443,9 @@ private enum AITextPluginSmoke {
             runtimeIdentity: "runtime",
             reviewedAsPlainText: false
         )
-        actionSource.append("bound", origin: .plugin(id: "example.action"), pluginMetadata: unreviewed)
+        actionSource.stageExternal("bound",
+                                   origin: .plugin(id: "example.action"),
+                                   pluginMetadata: unreviewed)
         let actionProvider = AITextSmokeProvider(kind: .openAICompatible)
         let actionWorkspace = AITextPluginWorkspace(provider: actionProvider,
                                                     sourceModel: actionSource,
@@ -455,9 +457,11 @@ private enum AITextPluginSmoke {
               actionProvider.requests.isEmpty else { return false }
 
         let reviewedSource = BufferModel()
-        reviewedSource.append("reviewed",
-                              origin: .plugin(id: "example.action"),
-                              pluginMetadata: unreviewed.markingReviewedAsPlainText())
+        reviewedSource.stageExternal(
+            "reviewed",
+            origin: .plugin(id: "example.action"),
+            pluginMetadata: unreviewed.markingReviewedAsPlainText()
+        )
         let reviewedWorkspace = AITextPluginWorkspace(provider: actionProvider,
                                                       sourceModel: reviewedSource,
                                                       isSelected: { true })
