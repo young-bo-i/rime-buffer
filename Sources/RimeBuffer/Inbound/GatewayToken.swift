@@ -8,7 +8,9 @@ import CryptoKit
 /// trust domain can read the file, which is the documented threat model.
 enum GatewayToken {
     private static var url: URL {
-        let dir = URL(fileURLWithPath: NSHomeDirectory())
+        let dir = ProcessInfo.processInfo.environment["RIMEBUFFER_USER_DIR"].map {
+            URL(fileURLWithPath: $0, isDirectory: true)
+        } ?? URL(fileURLWithPath: NSHomeDirectory())
             .appendingPathComponent("Library/RimeBuffer", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("gateway-token")

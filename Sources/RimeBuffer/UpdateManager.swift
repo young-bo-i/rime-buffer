@@ -410,7 +410,7 @@ final class UpdateManager {
             proc.standardError = nil
             // Don't strand a composition or lose key stats before we go.
             RimeBufferController.active?.forceCommit()
-            KeyFrequencyStore.shared.saveNow()
+            InputMetricsPersistence.saveNow()
             try proc.run()
 
             IMELog.write("update: install script launched for v\(version), exiting")

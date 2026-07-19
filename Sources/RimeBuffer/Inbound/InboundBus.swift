@@ -19,13 +19,16 @@ struct InboundItem: Identifiable, Equatable {
     var streaming: Bool
     var state: State
     let createdAt: Date
+    let pluginMetadata: BufferModel.PluginMetadata?
 
     enum State: Equatable { case pending, accepted, rejected }
 
     init(id: UUID = UUID(), origin: Origin, title: String? = nil, text: String,
-         streaming: Bool = false, state: State = .pending, createdAt: Date = Date()) {
+         streaming: Bool = false, state: State = .pending, createdAt: Date = Date(),
+         pluginMetadata: BufferModel.PluginMetadata? = nil) {
         self.id = id; self.origin = origin; self.title = title; self.text = text
         self.streaming = streaming; self.state = state; self.createdAt = createdAt
+        self.pluginMetadata = pluginMetadata
     }
 }
 
@@ -36,6 +39,18 @@ struct InboundItem: Identifiable, Equatable {
 /// submitting.
 final class InboundBus {
     static let shared = InboundBus()
+
+    enum SubmissionRejection: Equatable {
+        case empty
+        case blocked
+        case full
+    }
+
+    enum SubmissionResult: Equatable {
+        case pending(UUID)
+        case staged
+        case rejected(SubmissionRejection)
+    }
 
     /// Hard caps so a chatty or hostile local process can't exhaust memory / UI.
     /// (RemotePeer has its own pendingCap=50; the gateway needs the same guard.)
@@ -53,35 +68,60 @@ final class InboundBus {
     func trust(for origin: Origin) -> SourceTrust {
         switch origin {
         case .marine: return .trusted           // preserve current Marine flow
+        case .plugin: return .ask               // stale/cancelled action results need review
         case .mcp, .http, .sse, .ssh: return .ask
-        case .rime, .remotePeer: return .ask    // shouldn't arrive here; be safe
+        case .rime, .processor, .remotePeer: return .ask // shouldn't arrive here; be safe
         }
     }
 
     /// Offer a complete item. Returns its id when it lands in the rail as
     /// pending, or nil when it was auto-accepted (trusted) or dropped.
     @discardableResult
-    func submit(origin: Origin, text: String, title: String? = nil) -> UUID? {
+    func submit(origin: Origin,
+                text: String,
+                title: String? = nil,
+                pluginMetadata: BufferModel.PluginMetadata? = nil) -> UUID? {
+        guard case let .pending(id) = submitDetailed(origin: origin,
+                                                    text: text,
+                                                    title: title,
+                                                    pluginMetadata: pluginMetadata) else {
+            return nil
+        }
+        return id
+    }
+
+    @discardableResult
+    func submitDetailed(origin: Origin,
+                        text: String,
+                        title: String? = nil,
+                        pluginMetadata: BufferModel.PluginMetadata? = nil) -> SubmissionResult {
         let clean = String(text.prefix(Self.maxTextCount))
-        guard !clean.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        guard !clean.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .rejected(.empty)
+        }
         switch trust(for: origin) {
         case .blocked:
             IMELog.write("inbound dropped origin=\(origin.tag) chars=\(clean.count) (blocked)")
-            return nil
+            return .rejected(.blocked)
         case .trusted:
-            BufferModel.shared.stageExternal(clean, origin: origin)
+            BufferModel.shared.stageExternal(clean,
+                                             origin: origin,
+                                             pluginMetadata: pluginMetadata)
             IMELog.write("inbound trusted->buffer origin=\(origin.tag) chars=\(clean.count)")
-            return nil
+            return .staged
         case .ask:
             guard pending.count < Self.maxPending else {
                 IMELog.write("inbound dropped origin=\(origin.tag) (pending cap \(Self.maxPending))")
-                return nil
+                return .rejected(.full)
             }
-            let item = InboundItem(origin: origin, title: title, text: clean)
+            let item = InboundItem(origin: origin,
+                                   title: title,
+                                   text: clean,
+                                   pluginMetadata: pluginMetadata)
             pending.append(item)
             IMELog.write("inbound pending+ origin=\(origin.tag) chars=\(clean.count) count=\(pending.count)")
             onChange?()
-            return item.id
+            return .pending(item.id)
         }
     }
 
@@ -123,7 +163,17 @@ final class InboundBus {
     func accept(_ id: UUID) {
         guard let idx = pending.firstIndex(where: { $0.id == id }) else { return }
         let item = pending[idx]
-        BufferModel.shared.stageExternal(item.text, origin: item.origin)
+        let acceptedMetadata: BufferModel.PluginMetadata?
+        if case .plugin = item.origin,
+           let metadata = item.pluginMetadata,
+           metadata.stale {
+            acceptedMetadata = metadata.markingReviewedAsPlainText()
+        } else {
+            acceptedMetadata = item.pluginMetadata
+        }
+        BufferModel.shared.stageExternal(item.text,
+                                         origin: item.origin,
+                                         pluginMetadata: acceptedMetadata)
         IMELog.write("inbound accepted origin=\(item.origin.tag) chars=\(item.text.count)")
         if !item.streaming { pending.remove(at: idx) }
         onChange?()

@@ -56,25 +56,11 @@ jobs:
           bash -n scripts/make-pkg.sh
           bash -n scripts/pkg/scripts/postinstall
 
-      # Privacy: the log must never carry user-entered/committed text. Every
-      # plaintext leak used the quoted-interpolation form '\(x)'; counts/ids are
-      # unquoted. Ban the quoted form so new leaks fail the build — wrap user
-      # text in IMELog.redact() (length only) instead. See Log.swift.
+      # Privacy: the log must never carry user-entered/committed text. The
+      # scanner follows multiline/raw strings and nested interpolation, while
+      # allowing only explicitly redacted values and known-safe metadata.
       - name: No plaintext in logs
-        run: |
-          python3 - <<'PY'
-          import re, pathlib, sys
-          bad = []
-          for p in pathlib.Path("Sources").rglob("*.swift"):
-              for i, line in enumerate(p.read_text().splitlines(), 1):
-                  if re.search(r"IMELog\.(write|reset)\(", line) and "'\\(" in line:
-                      bad.append(f"{p}:{i}: {line.strip()}")
-          if bad:
-              print("IMELog logs a quoted interpolation (likely user text). Use IMELog.redact():")
-              print("\n".join(bad))
-              sys.exit(1)
-          print("log redaction check: clean")
-          PY
+        run: python3 scripts/lint-log-privacy.py
 
       # librime is dlopen'd at runtime (see CRimeBridge.cpp), so the build has no
       # link-time dependency on Squirrel — a stock runner compiles it cleanly.
@@ -95,4 +81,32 @@ jobs:
           "$BIN" theme-smoke    # fixed day-palette contrast + explicit AppKit appearance (pure)
           "$BIN" origin-smoke   # block-origin plumbing + echo guard (pure)
           "$BIN" inbound-smoke  # inbound gating / cap / streaming / accept (pure)
+          "$BIN" plugin-smoke   # action-plugin runtime binding + target-safe delivery (pure/local URLProtocol)
+          "$BIN" plugin-stream-smoke # NDJSON v1 identity/sequence/bounds + stable block streaming (pure)
+          "$BIN" plugin-platform-smoke # namespaced built-in/external discovery + enablement delegation
+          "$BIN" translation-smoke # local translation latest-wins + derived target-only delivery
+          "$BIN" ai-text-smoke # fake CLI/API streams + private config + derived target-only delivery
+          "$BIN" settings-routing-smoke # stable vertical routes + dynamic extension/subpage fallback
+          "$BIN" history-heatmap-smoke # all-history calendar layout/intensity math (pure)
+          "$BIN" typing-speed-smoke # aggregate sessions/persistence/privacy (pure)
+          "$BIN" fly-chord-learning-smoke # schema-derived lessons/progress/privacy (pure)
+          "$BIN" input-telemetry-smoke # sanitized observation + typing admission policy (pure)
+          "$BIN" user-lexicon-smoke # portable learned-dictionary validation/import/export (fake engine)
           "$BIN" remote-smoke   # ECDH + framing + loopback socket (no Squirrel/network perms)
+
+      # Instantiate every core/dynamic AppKit route, render it off-screen, and
+      # verify the complete manifest. All writable roots are runner-temporary,
+      # so this cannot read a developer's live stats, plugins, token, or userdb.
+      - name: Settings assembly render smoke
+        run: |
+          BIN="$(swift build --show-bin-path)/RimeBuffer"
+          ROOT="$RUNNER_TEMP/rimebuffer-settings-render"
+          OUTPUT="$ROOT/output"
+          mkdir -p "$OUTPUT" "$ROOT/profile" "$ROOT/local" "$ROOT/plugins"
+          RIMEBUFFER_USER_DIR="$ROOT/profile" \
+          RIMEBUFFER_LOCAL_DATA_ROOT="$ROOT/local" \
+          RIMEBUFFER_PLUGIN_ROOT="$ROOT/plugins" \
+            "$BIN" settings-render "$OUTPUT"
+          test "$(find "$OUTPUT" -maxdepth 1 -type f -name '*.png' | wc -l | tr -d ' ')" = '22'
+          python3 -m json.tool "$OUTPUT/manifest.json" >/dev/null
+          ! rg -q 'extension\.apple-translation' "$OUTPUT/manifest.json"

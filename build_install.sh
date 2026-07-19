@@ -69,6 +69,14 @@ if [ "${RB_KEEP_USERDB:-0}" != "1" ]; then
     cp rime-data/default.custom.yaml "$RB_USER/default.custom.yaml"
 fi
 
+# Product-owned schemas must advance even when the learned userdb is kept.
+# Rime gives a root user-data schema precedence over the app's SharedSupport
+# copy, and older installs imported exactly such a my_combo.schema.yaml from
+# Squirrel.  Keep user customisations in my_combo.custom.yaml (Rime's standard
+# overlay); refresh only the versioned base schema here.
+mkdir -p "$RB_USER"
+install -m 0644 rime-data/my_combo.schema.yaml "$RB_USER/my_combo.schema.yaml"
+
 echo "==> swift build ($CONFIG)"
 swift build -c "$CONFIG"
 

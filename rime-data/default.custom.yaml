@@ -1,6 +1,6 @@
 patch:
   schema_list:
-    - schema: my_combo          # 并击
+    - schema: my_combo          # 飞耀互击
     - schema: double_pinyin     # 自然码双拼
     - schema: rime_ice          # 雾凇拼音
     - schema: english           # 英文

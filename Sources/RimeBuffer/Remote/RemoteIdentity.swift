@@ -17,8 +17,11 @@ enum RemoteIdentity {
     private static let trustKey = "remoteTrustedPeers"   // [pubKeyB64: name]
 
     private static var keyFileURL: URL {
-        URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent("Library/RimeBuffer/remote_identity.key")
+        let root = ProcessInfo.processInfo.environment["RIMEBUFFER_USER_DIR"].map {
+            URL(fileURLWithPath: $0, isDirectory: true)
+        } ?? URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent("Library/RimeBuffer", isDirectory: true)
+        return root.appendingPathComponent("remote_identity.key")
     }
 
     // MARK: Long-term key pair (private key in a 0600 file)

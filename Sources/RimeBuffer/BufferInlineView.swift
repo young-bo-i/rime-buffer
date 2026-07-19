@@ -2,12 +2,16 @@ import Cocoa
 import QuartzCore
 
 /// Compact block rail used by the independent workbench window. It never holds
-/// an IMK client or action buttons; it only renders and selects staged blocks.
+/// an IMK client or action buttons; it only renders staged blocks.
 final class BufferInlineView: NSView {
+    static let standardPreferredHeight: CGFloat = 34
+    static let translationPreferredHeight: CGFloat = 68
+
     private struct RenderedBlock: Equatable {
         let id: UUID
         let text: String
         let origin: Origin
+        let pluginMetadata: BufferModel.PluginMetadata?
     }
 
     private struct RenderSignature: Equatable {
@@ -16,30 +20,54 @@ final class BufferInlineView: NSView {
         let active: Bool
         let preedit: String
         let loadingMessage: String?
+        let loadingActive: Bool
+        let translation: TranslationRailSnapshot?
         let shielded: Bool
-        let selectedBlockID: UUID?
         let isNight: Bool
     }
 
     private let chipScroll = NSScrollView()
     private let chipRow = NSStackView()
+    private let normalRailContainer = NSStackView()
+    private let translationContainer = NSStackView()
+    private let translationSourceScroll = NSScrollView()
+    private let translationSourceRow = NSStackView()
+    private let translationTargetScroll = NSScrollView()
+    private let translationTargetRow = NSStackView()
     private let leadingSpacer = NSView()
+    private let translationSourceSpacer = NSView()
+    private let translationTargetSpacer = NSView()
     private let caretView = NSView()
     private let emptyLabel = NSTextField(labelWithString: "等待暂存内容")
+    private let translationSourceEmptyLabel = NSTextField(labelWithString: "等待原文")
+    private let translationTargetEmptyLabel = NSTextField(labelWithString: "等待译文")
+    private let loadingIndicator = NSProgressIndicator()
     private let enterHoldProgressLayer = CALayer()
     private var renderedBlockIDs: [UUID] = []
     private var lastRenderSignature: RenderSignature?
     private var contentShielded = false
     private var enterHoldProgress: CGFloat?
-    private(set) var selectedBlockID: UUID?
     private(set) var renderPassCount = 0
-    var onSelectionChange: ((UUID?) -> Void)?
     var renderedBlockCount: Int { renderedBlockIDs.count }
     var isEnterHoldProgressVisible: Bool { enterHoldProgress != nil }
+    var renderedTextFragments: [String] {
+        func collect(_ view: NSView) -> [String] {
+            let own = (view as? NSTextField).map { [$0.stringValue] } ?? []
+            return own + view.subviews.flatMap(collect)
+        }
+        return collect(chipRow)
+            + collect(translationSourceRow)
+            + collect(translationTargetRow)
+    }
 
     var preferredHeight: CGFloat {
-        34
+        translationContainer.isHidden
+            ? Self.standardPreferredHeight
+            : Self.translationPreferredHeight
     }
+
+    var usesStackedTranslationLayout: Bool { !translationContainer.isHidden }
+    var translationRailCount: Int { usesStackedTranslationLayout ? 2 : 0 }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -55,13 +83,28 @@ final class BufferInlineView: NSView {
 
         emptyLabel.font = .systemFont(ofSize: 12)
         emptyLabel.lineBreakMode = .byTruncatingTail
+        for label in [translationSourceEmptyLabel, translationTargetEmptyLabel] {
+            label.font = .systemFont(ofSize: 11, weight: .medium)
+            label.lineBreakMode = .byTruncatingTail
+        }
+
+        loadingIndicator.style = .spinning
+        loadingIndicator.controlSize = .small
+        loadingIndicator.isDisplayedWhenStopped = false
+        loadingIndicator.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            loadingIndicator.widthAnchor.constraint(equalToConstant: 12),
+            loadingIndicator.heightAnchor.constraint(equalToConstant: 12),
+        ])
 
         chipRow.orientation = .horizontal
         chipRow.spacing = 5
         chipRow.alignment = .centerY
         chipRow.distribution = .fill
-        leadingSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        leadingSpacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        for spacer in [leadingSpacer, translationSourceSpacer, translationTargetSpacer] {
+            spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        }
 
         caretView.wantsLayer = true
         caretView.layer?.cornerRadius = 1
@@ -69,33 +112,60 @@ final class BufferInlineView: NSView {
         caretView.widthAnchor.constraint(equalToConstant: 2).isActive = true
         caretView.heightAnchor.constraint(equalToConstant: 18).isActive = true
 
-        chipScroll.drawsBackground = false
-        chipScroll.hasHorizontalScroller = false
-        chipScroll.hasVerticalScroller = false
-        chipScroll.horizontalScrollElasticity = .allowed
-        chipScroll.verticalScrollElasticity = .none
-        chipScroll.documentView = chipRow
-        chipScroll.translatesAutoresizingMaskIntoConstraints = false
-        chipScroll.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        configureHorizontalRail(chipScroll, row: chipRow)
         chipScroll.heightAnchor.constraint(equalToConstant: 24).isActive = true
 
-        let row = NSStackView(views: [chipScroll])
-        row.orientation = .horizontal
-        row.alignment = .centerY
-        row.edgeInsets = NSEdgeInsets(top: 5, left: 8, bottom: 5, right: 8)
-        row.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(row)
+        normalRailContainer.addArrangedSubview(chipScroll)
+        normalRailContainer.orientation = .horizontal
+        normalRailContainer.alignment = .centerY
+        normalRailContainer.edgeInsets = NSEdgeInsets(top: 5, left: 8, bottom: 5, right: 8)
+        normalRailContainer.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(normalRailContainer)
+
+        configureHorizontalRail(translationSourceScroll, row: translationSourceRow)
+        configureHorizontalRail(translationTargetScroll, row: translationTargetRow)
+        translationContainer.orientation = .vertical
+        translationContainer.alignment = .width
+        translationContainer.distribution = .fillEqually
+        translationContainer.spacing = 4
+        translationContainer.translatesAutoresizingMaskIntoConstraints = false
+        translationContainer.addArrangedSubview(translationSourceScroll)
+        translationContainer.addArrangedSubview(translationTargetScroll)
+        translationContainer.isHidden = true
+        addSubview(translationContainer)
         NSLayoutConstraint.activate([
-            row.leadingAnchor.constraint(equalTo: leadingAnchor),
-            row.trailingAnchor.constraint(equalTo: trailingAnchor),
-            row.topAnchor.constraint(equalTo: topAnchor),
-            row.bottomAnchor.constraint(equalTo: bottomAnchor),
+            normalRailContainer.leadingAnchor.constraint(equalTo: leadingAnchor),
+            normalRailContainer.trailingAnchor.constraint(equalTo: trailingAnchor),
+            normalRailContainer.topAnchor.constraint(equalTo: topAnchor),
+            normalRailContainer.bottomAnchor.constraint(equalTo: bottomAnchor),
+            translationContainer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            translationContainer.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            translationContainer.topAnchor.constraint(equalTo: topAnchor, constant: 5),
+            translationContainer.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -5),
         ])
 
         applyAppearance()
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    private func configureHorizontalRail(_ scroll: NSScrollView, row: NSStackView) {
+        row.orientation = .horizontal
+        row.spacing = 5
+        row.alignment = .centerY
+        row.distribution = .fill
+        scroll.drawsBackground = false
+        scroll.hasHorizontalScroller = false
+        scroll.hasVerticalScroller = false
+        scroll.horizontalScrollElasticity = .allowed
+        scroll.verticalScrollElasticity = .none
+        scroll.documentView = row
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        scroll.wantsLayer = true
+        scroll.layer?.cornerRadius = 5
+        scroll.layer?.masksToBounds = true
+    }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
@@ -141,19 +211,31 @@ final class BufferInlineView: NSView {
         let model = BufferModel.shared
         let preeditText = preedit.trimmingCharacters(in: .whitespacesAndNewlines)
         let active = model.active
+        let translation: TranslationRailSnapshot?
+        if AppleTranslationWorkspace.shared.isSelected {
+            translation = AppleTranslationWorkspace.shared.railSnapshot
+        } else {
+            translation = AITextWorkspaceRouter.railSnapshot
+        }
         contentShielded = shielded
         if shielded {
             setEnterHoldProgress(nil)
         }
 
         let signature = RenderSignature(
-            blocks: model.blocks.map { RenderedBlock(id: $0.id, text: $0.text, origin: $0.origin) },
+            blocks: model.blocks.map {
+                RenderedBlock(id: $0.id,
+                              text: $0.text,
+                              origin: $0.origin,
+                              pluginMetadata: $0.pluginMetadata)
+            },
             insertionIndex: min(max(model.insertionIndex, 0), model.blocks.count),
             active: active,
             preedit: preeditText,
             loadingMessage: model.loadingMessage,
+            loadingActive: model.transientLoadingActive,
+            translation: translation,
             shielded: shielded,
-            selectedBlockID: selectedBlockID,
             isNight: RimeUI.isNight
         )
         if signature == lastRenderSignature {
@@ -164,14 +246,11 @@ final class BufferInlineView: NSView {
         lastRenderSignature = signature
         renderPassCount += 1
 
-        chipRow.arrangedSubviews.forEach {
-            chipRow.removeArrangedSubview($0)
-            $0.removeFromSuperview()
-        }
-        renderedBlockIDs.removeAll(keepingCapacity: true)
-        chipRow.addArrangedSubview(leadingSpacer)
+        resetRailContents()
 
         if shielded {
+            normalRailContainer.isHidden = false
+            translationContainer.isHidden = true
             emptyLabel.stringValue = "内容已隐藏"
             chipRow.addArrangedSubview(emptyLabel)
             stopCaretBlinking()
@@ -180,9 +259,29 @@ final class BufferInlineView: NSView {
             return true
         }
 
+
+        if let translation {
+            normalRailContainer.isHidden = true
+            translationContainer.isHidden = false
+            renderTranslation(translation, active: active)
+            applyAppearance()
+            layoutSubtreeIfNeeded()
+            updateTranslationDocumentSizes()
+            scrollTranslationRailsToEnd()
+            isHidden = false
+            return true
+        }
+
+        normalRailContainer.isHidden = false
+        translationContainer.isHidden = true
+
         let insertionIndex = signature.insertionIndex
         if model.blocks.isEmpty, preeditText.isEmpty {
             emptyLabel.stringValue = model.loadingMessage ?? "等待暂存内容"
+            if model.transientLoadingActive {
+                chipRow.addArrangedSubview(loadingIndicator)
+                loadingIndicator.startAnimation(nil)
+            }
             chipRow.addArrangedSubview(emptyLabel)
             if active {
                 chipRow.addArrangedSubview(caretView)
@@ -207,19 +306,146 @@ final class BufferInlineView: NSView {
                 chipRow.addArrangedSubview(preeditChip(text: preeditText))
             }
         }
+        if let message = model.loadingMessage?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !message.isEmpty,
+           !(model.blocks.isEmpty && preeditText.isEmpty) {
+            if model.transientLoadingActive {
+                chipRow.addArrangedSubview(loadingIndicator)
+                loadingIndicator.startAnimation(nil)
+            }
+            chipRow.addArrangedSubview(messageChip(text: message))
+        }
 
         active ? startCaretBlinking() : stopCaretBlinking()
-        if let selectedBlockID,
-           !model.blocks.contains(where: { $0.id == selectedBlockID }) {
-            self.selectedBlockID = nil
-            onSelectionChange?(nil)
-        }
         applyAppearance()
         layoutSubtreeIfNeeded()
         updateChipDocumentSize()
         scrollChipsToInsertionPoint()
         isHidden = false
         return true
+    }
+
+    /// Dev-only render seam used by the CLI smoke and visual previews. Runtime
+    /// Runtime derived rails still come exclusively from their selected,
+    /// trusted workspace.
+    @discardableResult
+    func renderTranslationForPreview(_ snapshot: TranslationRailSnapshot,
+                                     active: Bool = true) -> Bool {
+        lastRenderSignature = nil
+        contentShielded = false
+        resetRailContents()
+        normalRailContainer.isHidden = true
+        translationContainer.isHidden = false
+        renderTranslation(snapshot, active: active)
+        applyAppearance()
+        layoutSubtreeIfNeeded()
+        updateTranslationDocumentSizes()
+        scrollTranslationRailsToEnd()
+        isHidden = false
+        return usesStackedTranslationLayout && translationRailCount == 2
+    }
+
+    private func renderTranslation(_ snapshot: TranslationRailSnapshot,
+                                   active: Bool) {
+        renderedBlockIDs.removeAll(keepingCapacity: true)
+        translationSourceRow.addArrangedSubview(
+            translationRoleLabel(snapshot.sourceRole, target: false)
+        )
+        if snapshot.sourceText.isEmpty {
+            translationSourceEmptyLabel.stringValue = snapshot.sourceEmptyText
+            translationSourceRow.addArrangedSubview(translationSourceEmptyLabel)
+        } else {
+            translationSourceRow.addArrangedSubview(translationChip(text: snapshot.sourceText,
+                                                                     target: false))
+        }
+        if active { translationSourceRow.addArrangedSubview(caretView) }
+        translationSourceRow.addArrangedSubview(translationSourceSpacer)
+
+        translationTargetRow.addArrangedSubview(
+            translationRoleLabel(snapshot.targetRole, target: true)
+        )
+        if snapshot.outputBlocks.isEmpty {
+            switch snapshot.phase {
+            case .waiting, .translating:
+                translationTargetRow.addArrangedSubview(loadingIndicator)
+                loadingIndicator.startAnimation(nil)
+                translationTargetRow.addArrangedSubview(messageChip(
+                    text: snapshot.message ?? (snapshot.phase == .waiting
+                        ? snapshot.waitingText
+                        : snapshot.processingText)
+                ))
+            case .failed:
+                translationTargetRow.addArrangedSubview(messageChip(
+                    text: snapshot.message ?? "处理失败"
+                ))
+            case .unavailable:
+                translationTargetRow.addArrangedSubview(messageChip(
+                    text: snapshot.message ?? "插件不可用"
+                ))
+            case .idle, .ready:
+                translationTargetEmptyLabel.stringValue = snapshot.targetEmptyText
+                translationTargetRow.addArrangedSubview(translationTargetEmptyLabel)
+            }
+        } else {
+            let targetIsCurrent = snapshot.phase == .ready
+            for block in snapshot.outputBlocks {
+                renderedBlockIDs.append(block.id)
+                translationTargetRow.addArrangedSubview(translationChip(text: block.text,
+                                                                         target: true,
+                                                                         stale: !targetIsCurrent))
+            }
+            if snapshot.phase == .waiting || snapshot.phase == .translating {
+                translationTargetRow.addArrangedSubview(loadingIndicator)
+                loadingIndicator.startAnimation(nil)
+                translationTargetRow.addArrangedSubview(messageChip(
+                    text: snapshot.message ?? snapshot.updatingText
+                ))
+            }
+        }
+        translationTargetRow.addArrangedSubview(translationTargetSpacer)
+        active ? startCaretBlinking() : stopCaretBlinking()
+    }
+
+    private func translationRoleLabel(_ role: String, target: Bool) -> NSTextField {
+        let label = NSTextField(labelWithString: role)
+        label.font = .systemFont(ofSize: 9, weight: .semibold)
+        label.textColor = target ? RimeUI.accentBlue : RimeUI.textSecondary
+        label.alignment = .center
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.widthAnchor.constraint(greaterThanOrEqualToConstant: 14).isActive = true
+        label.setContentHuggingPriority(.required, for: .horizontal)
+        label.setContentCompressionResistancePriority(.required, for: .horizontal)
+        return label
+    }
+
+    private func translationChip(text: String,
+                                 target: Bool,
+                                 stale: Bool = false) -> NSView {
+        let label = NSTextField(labelWithString: text)
+        label.font = .systemFont(ofSize: 12)
+        label.textColor = RimeUI.textPrimary
+        label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 1
+        label.toolTip = text
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.widthAnchor.constraint(lessThanOrEqualToConstant: target ? 900 : 1200).isActive = true
+
+        let row = NSStackView(views: [label])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 5
+        row.edgeInsets = NSEdgeInsets(top: 2, left: 6, bottom: 2, right: 7)
+        row.wantsLayer = true
+        row.layer?.cornerRadius = 6
+        row.layer?.backgroundColor = (target
+            ? RimeUI.accentBlue.withAlphaComponent(RimeUI.isNight ? 0.22 : 0.14)
+            : RimeUI.surface2).cgColor
+        row.layer?.borderColor = RimeUI.border.cgColor
+        row.layer?.borderWidth = 1 / max(window?.backingScaleFactor ?? 2, 1)
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        row.alphaValue = stale ? 0.55 : 1
+        return row
     }
 
     /// Colored provenance dot for a non-local block. Rime commits (local typing)
@@ -230,7 +456,8 @@ final class BufferInlineView: NSView {
         switch origin {
         case .rime: return nil
         case .remotePeer: color = RimeUI.color(0x9B8CFF)        // paired Mac — violet
-        case .marine, .mcp: color = RimeUI.color(0xF59E0B)      // local agent — amber
+        case .marine, .plugin, .processor, .mcp:
+            color = RimeUI.color(0xF59E0B) // local action/transform/agent — amber
         case .http, .sse, .ssh: color = RimeUI.color(0x4A9FD8)  // network feed — blue
         }
         let dot = NSView()
@@ -256,29 +483,37 @@ final class BufferInlineView: NSView {
         label.textColor = RimeUI.textPrimary
         label.lineBreakMode = .byTruncatingTail
         label.maximumNumberOfLines = 1
-        label.toolTip = block.text
+        label.toolTip = blockToolTip(block)
 
         let row = NSStackView(views: [label])
         if let badge = originBadge(for: block.origin) {
             row.insertArrangedSubview(badge, at: 0)
             row.setCustomSpacing(5, after: badge)
         }
+        if block.pluginMetadata?.incomplete == true {
+            let progress = NSProgressIndicator()
+            progress.style = .spinning
+            progress.controlSize = .small
+            progress.isDisplayedWhenStopped = false
+            progress.toolTip = "插件正在生成，当前内容不可发送或编辑"
+            progress.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                progress.widthAnchor.constraint(equalToConstant: 10),
+                progress.heightAnchor.constraint(equalToConstant: 10),
+            ])
+            row.addArrangedSubview(progress)
+            progress.startAnimation(nil)
+        }
         row.orientation = .horizontal
         row.alignment = .centerY
 
-        let box = FirstMouseButton(title: "", target: self, action: #selector(blockTapped(_:)))
-        box.tag = index
-        box.isBordered = false
-        box.focusRingType = .none
-        box.setButtonType(.momentaryChange)
+        let box = NSView()
         box.wantsLayer = true
         box.layer?.backgroundColor = RimeUI.accentBlue.withAlphaComponent(
             RimeUI.isNight ? 0.22 : 0.14
         ).cgColor
         box.layer?.cornerRadius = 6
-        box.layer?.borderWidth = selectedBlockID == block.id ? 1 : 0
-        box.layer?.borderColor = RimeUI.accentBlue.cgColor
-        box.toolTip = block.text
+        box.toolTip = blockToolTip(block)
         row.translatesAutoresizingMaskIntoConstraints = false
         box.addSubview(row)
         NSLayoutConstraint.activate([
@@ -290,6 +525,25 @@ final class BufferInlineView: NSView {
             box.heightAnchor.constraint(equalToConstant: 22),
         ])
         return box
+    }
+
+    private func blockToolTip(_ block: BufferModel.Block) -> String {
+        guard let metadata = block.pluginMetadata else { return block.text }
+        var lines = [metadata.title, metadata.targetSummary]
+            .compactMap { value -> String? in
+                guard let value,
+                      !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    return nil
+                }
+                return value
+            }
+        if metadata.stale { lines.append("原投放目标已失效，接受前请重新确认") }
+        if metadata.incomplete { lines.append("正在生成，完成并复核目标前不能发送") }
+        if metadata.reviewedAsPlainText {
+            lines.append("已人工确认并降级为普通文本；发送时不再绑定原目标")
+        }
+        lines.append(block.text)
+        return lines.joined(separator: "\n")
     }
 
     private func preeditChip(text: String) -> NSView {
@@ -326,6 +580,30 @@ final class BufferInlineView: NSView {
         return box
     }
 
+    private func messageChip(text: String) -> NSView {
+        let label = NSTextField(labelWithString: text)
+        label.font = .systemFont(ofSize: 11, weight: .semibold)
+        label.textColor = .systemOrange
+        label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 1
+        label.toolTip = text
+
+        let box = NSView()
+        box.wantsLayer = true
+        box.layer?.backgroundColor = NSColor.systemOrange.withAlphaComponent(0.12).cgColor
+        box.layer?.cornerRadius = 6
+        label.translatesAutoresizingMaskIntoConstraints = false
+        box.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 7),
+            label.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -7),
+            label.centerYAnchor.constraint(equalTo: box.centerYAnchor),
+            label.widthAnchor.constraint(lessThanOrEqualToConstant: 240),
+            box.heightAnchor.constraint(equalToConstant: 22),
+        ])
+        return box
+    }
+
     private func configureIconButton(_ button: FirstMouseButton,
                                      symbolName: String,
                                      toolTip: String) {
@@ -346,6 +624,22 @@ final class BufferInlineView: NSView {
         button.heightAnchor.constraint(equalToConstant: 24).isActive = true
     }
 
+    private func clearArrangedSubviews(of row: NSStackView) {
+        row.arrangedSubviews.forEach {
+            row.removeArrangedSubview($0)
+            $0.removeFromSuperview()
+        }
+    }
+
+    private func resetRailContents() {
+        clearArrangedSubviews(of: chipRow)
+        clearArrangedSubviews(of: translationSourceRow)
+        clearArrangedSubviews(of: translationTargetRow)
+        loadingIndicator.stopAnimation(nil)
+        renderedBlockIDs.removeAll(keepingCapacity: true)
+        chipRow.addArrangedSubview(leadingSpacer)
+    }
+
     private func updateChipDocumentSize() {
         let fit = chipRow.fittingSize
         let documentWidth = max(fit.width, chipScroll.contentSize.width)
@@ -354,8 +648,39 @@ final class BufferInlineView: NSView {
         chipRow.layoutSubtreeIfNeeded()
     }
 
+    private func updateTranslationDocumentSizes() {
+        updateDocumentSize(for: translationSourceRow, in: translationSourceScroll)
+        updateDocumentSize(for: translationTargetRow, in: translationTargetScroll)
+    }
+
+    private func updateDocumentSize(for row: NSStackView, in scroll: NSScrollView) {
+        let fit = row.fittingSize
+        let documentWidth = max(fit.width, scroll.contentSize.width)
+        let documentHeight = max(fit.height, scroll.contentSize.height)
+        row.setFrameSize(NSSize(width: documentWidth, height: documentHeight))
+        row.needsLayout = true
+        row.layoutSubtreeIfNeeded()
+    }
+
+    private func scrollTranslationRailsToEnd() {
+        scrollToEnd(row: translationSourceRow, in: translationSourceScroll)
+        scrollToEnd(row: translationTargetRow, in: translationTargetScroll)
+    }
+
+    private func scrollToEnd(row: NSView, in scroll: NSScrollView) {
+        let maxX = max(0, row.frame.width - scroll.contentSize.width)
+        scroll.contentView.scroll(to: NSPoint(x: maxX, y: 0))
+        scroll.reflectScrolledClipView(scroll.contentView)
+    }
+
     private func scrollChipsToInsertionPoint() {
         let maxX = max(0, chipRow.frame.width - chipScroll.contentSize.width)
+        if BufferModel.shared.loadingMessage?.trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty == false {
+            chipScroll.contentView.scroll(to: NSPoint(x: maxX, y: 0))
+            chipScroll.reflectScrolledClipView(chipScroll.contentView)
+            return
+        }
         guard BufferModel.shared.active else {
             chipScroll.contentView.scroll(to: NSPoint(x: maxX, y: 0))
             chipScroll.reflectScrolledClipView(chipScroll.contentView)
@@ -380,9 +705,15 @@ final class BufferInlineView: NSView {
     private func applyAppearance() {
         layer?.backgroundColor = RimeUI.candidateBackgroundColor.cgColor
         layer?.borderColor = RimeUI.borderStrong.cgColor
+        translationSourceScroll.layer?.backgroundColor = RimeUI.surface2
+            .withAlphaComponent(RimeUI.isNight ? 0.70 : 0.78).cgColor
+        translationTargetScroll.layer?.backgroundColor = RimeUI.accentBlue
+            .withAlphaComponent(RimeUI.isNight ? 0.13 : 0.08).cgColor
         caretView.layer?.backgroundColor = RimeUI.accentBlue.cgColor
         enterHoldProgressLayer.backgroundColor = RimeUI.accentBlue.cgColor
         emptyLabel.textColor = RimeUI.isNight ? RimeUI.textSecondary : RimeUI.textMuted
+        translationSourceEmptyLabel.textColor = RimeUI.textSecondary
+        translationTargetEmptyLabel.textColor = RimeUI.textSecondary
     }
 
     private func startCaretBlinking() {
@@ -403,13 +734,6 @@ final class BufferInlineView: NSView {
         caretView.layer?.opacity = 1
     }
 
-    @objc private func blockTapped(_ sender: NSButton) {
-        guard renderedBlockIDs.indices.contains(sender.tag) else { return }
-        let id = renderedBlockIDs[sender.tag]
-        selectedBlockID = selectedBlockID == id ? nil : id
-        onSelectionChange?(selectedBlockID)
-        _ = refresh()
-    }
 }
 
 /// A button that works on the first click inside a never-key panel.

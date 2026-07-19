@@ -4,9 +4,10 @@ import Foundation
 /// without seeing the UI. Cheap; fine to leave on during bring-up.
 ///
 /// Privacy rule: NEVER log user-entered or committed text. Wrap any such value
-/// in `IMELog.redact(_:)`, which records only its length. CI bans the `'\(…)'`
-/// quoted-interpolation pattern that used to smuggle text bodies into the log,
-/// so counts/ids stay unquoted and content goes through `redact`.
+/// in `IMELog.redact(_:)`, which records only its length. CI scans complete
+/// multiline calls (including raw strings) for quoted or direct interpolation
+/// of text-like values; counts/ids stay visible and content goes through
+/// `redact`.
 enum IMELog {
     private static let url = URL(fileURLWithPath: NSHomeDirectory())
         .appendingPathComponent("rimebuffer.log")

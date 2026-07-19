@@ -1,6 +1,21 @@
 import Foundation
 import CRimeBridge
 
+extension Notification.Name {
+    /// Sent synchronously on the main thread before librime closes every
+    /// session for a user-dictionary export/import. Controllers must settle
+    /// marked text, destroy their session, and set the cached id to zero.
+    static let rimeUserDictionaryMaintenanceWillBegin = Notification.Name(
+        "RimeBuffer.RimeUserDictionaryMaintenance.willBegin"
+    )
+
+    /// Sent synchronously after the operation. Controllers recreate sessions
+    /// lazily through their ordinary ensureSessionReady path.
+    static let rimeUserDictionaryMaintenanceDidEnd = Notification.Name(
+        "RimeBuffer.RimeUserDictionaryMaintenance.didEnd"
+    )
+}
+
 /// Thin, INSTANTIABLE wrapper over the C bridge. Deliberately NOT a singleton
 /// and holds NO shared session — each IMK controller owns its own session so
 /// composition never bleeds across fields. (The prototype's `.shared` +
@@ -72,6 +87,9 @@ final class RimeEngine {
         guard session != 0 else { return }
         BBRimeDestroySession(session)
     }
+    func sessionExists(_ session: UInt64) -> Bool {
+        session != 0 && BBRimeSessionExists(session)
+    }
 
     func processKey(_ keycode: Int32, mask: Int32 = 0, session: UInt64) -> Bool {
         BBRimeProcessKey(session, keycode, mask)
@@ -118,6 +136,63 @@ final class RimeEngine {
             let name = buf[i].name.map { String(cString: $0) } ?? id
             return (id, name.isEmpty ? id : name)
         }
+    }
+
+    // MARK: User dictionary maintenance
+
+    /// True when librime currently has a LevelDB for this `user_dict` name.
+    /// Listing does not open or mutate the database and is safe while typing.
+    func hasUserDictionary(named name: String) -> Bool {
+        guard started, !name.isEmpty else { return false }
+        return name.withCString { BBRimeHasUserDictionary($0) }
+    }
+
+    /// Export learned entries in librime's portable TSV format. This operation
+    /// necessarily closes every Rime session so the LevelDB can be opened by
+    /// the official levers manager. Call only on main: notification observers
+    /// must first settle IMK marked text and invalidate their cached sessions.
+    func exportUserDictionary(named name: String, to fileURL: URL) -> Int {
+        performUserDictionaryMaintenance {
+            name.withCString { dict in
+                fileURL.path.withCString { path in
+                    Int(BBRimeExportUserDictionary(dict, path))
+                }
+            }
+        }
+    }
+
+    /// Merge portable TSV entries into the selected librime user dictionary.
+    /// Existing frequencies are preserved/raised according to librime's own
+    /// UserDbImporter rules; the LevelDB is never copied or replaced.
+    func importUserDictionary(named name: String, from fileURL: URL) -> Int {
+        performUserDictionaryMaintenance {
+            name.withCString { dict in
+                fileURL.path.withCString { path in
+                    Int(BBRimeImportUserDictionary(dict, path))
+                }
+            }
+        }
+    }
+
+    /// Merge a lossless `*.userdb.txt` snapshot. The snapshot itself declares
+    /// its database name; UserLexiconService validates it before this call.
+    func restoreUserDictionarySnapshot(from fileURL: URL) -> Bool {
+        performUserDictionaryMaintenance {
+            fileURL.path.withCString { path in
+                BBRimeRestoreUserDictionarySnapshot(path) ? 0 : -1
+            }
+        } >= 0
+    }
+
+    private func performUserDictionaryMaintenance(_ operation: () -> Int) -> Int {
+        guard Thread.isMainThread, started else { return -1 }
+        NotificationCenter.default.post(name: .rimeUserDictionaryMaintenanceWillBegin,
+                                        object: self)
+        let result = operation()
+        NotificationCenter.default.post(name: .rimeUserDictionaryMaintenanceDidEnd,
+                                        object: self,
+                                        userInfo: ["succeeded": result >= 0])
+        return result
     }
 
     // MARK: Context / status

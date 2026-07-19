@@ -146,13 +146,30 @@ final class InboundTrayWindow: NSObject {
         let head = NSStackView(views: [dot, source])
         head.spacing = 6; head.alignment = .centerY
 
+        var cardRows: [NSView] = [head]
+        if item.pluginMetadata?.stale == true {
+            var warningText = "原投放目标已经变化；接受后会降级为普通文本，只发送到你届时聚焦的输入框"
+            if let target = item.pluginMetadata?.targetSummary,
+               !target.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                warningText += " · 原目标：\(target)"
+            }
+            let warning = NSTextField(wrappingLabelWithString: warningText)
+            warning.font = .systemFont(ofSize: 11, weight: .semibold)
+            warning.textColor = .systemOrange
+            warning.maximumNumberOfLines = 2
+            cardRows.append(warning)
+        }
+
         let preview = NSTextField(wrappingLabelWithString: item.text.isEmpty ? "（空）" : item.text)
         preview.font = .systemFont(ofSize: 13)
         preview.textColor = .labelColor
         preview.translatesAutoresizingMaskIntoConstraints = false
         preview.widthAnchor.constraint(equalToConstant: 380).isActive = true
 
-        let accept = NSButton(title: "发送到缓冲区", target: self, action: #selector(acceptTapped(_:)))
+        let acceptTitle = item.pluginMetadata?.stale == true
+            ? "作为普通文本加入"
+            : "发送到缓冲区"
+        let accept = NSButton(title: acceptTitle, target: self, action: #selector(acceptTapped(_:)))
         accept.bezelColor = .controlAccentColor
         accept.tag = 0
         accept.identifier = NSUserInterfaceItemIdentifier(item.id.uuidString)
@@ -166,7 +183,8 @@ final class InboundTrayWindow: NSObject {
         body.translatesAutoresizingMaskIntoConstraints = false
         body.widthAnchor.constraint(equalToConstant: 528).isActive = true
 
-        let card = NSStackView(views: [head, body])
+        cardRows.append(body)
+        let card = NSStackView(views: cardRows)
         card.orientation = .vertical
         card.alignment = .leading
         card.spacing = 5
@@ -196,7 +214,7 @@ final class InboundTrayWindow: NSObject {
     private func badgeColor(_ origin: Origin) -> NSColor {
         switch origin {
         case .remotePeer: return RimeUI.color(0x9B8CFF)
-        case .marine, .mcp: return RimeUI.color(0xF59E0B)
+        case .marine, .plugin, .processor, .mcp: return RimeUI.color(0xF59E0B)
         case .http, .sse, .ssh: return RimeUI.color(0x4A9FD8)
         case .rime: return .tertiaryLabelColor
         }

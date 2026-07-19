@@ -73,20 +73,131 @@ enum BufferPrivacyTransitionRules {
 final class BufferModel {
     static let shared = BufferModel()
 
+    struct PluginMetadata: Equatable {
+        let pluginId: String
+        let actionId: String
+        let requestId: String
+        let contextId: String
+        let focusToken: FocusToken
+        let runtimeIdentity: String
+        let title: String?
+        let targetSummary: String?
+        let stale: Bool
+        /// Visible streamed output remains fail-closed until its terminal frame
+        /// and final target status both validate under the original lease.
+        let incomplete: Bool
+        let streamProtocolVersion: Int?
+        let streamIndex: Int?
+        /// The user explicitly accepted a stale inbox result as ordinary text.
+        /// Its old browser binding remains display-only provenance and must
+        /// never be consulted as a live delivery target again.
+        let reviewedAsPlainText: Bool
+
+        init(pluginId: String,
+             actionId: String,
+             requestId: String,
+             contextId: String,
+             focusToken: FocusToken,
+             runtimeIdentity: String,
+             title: String? = nil,
+             targetSummary: String? = nil,
+             stale: Bool = false,
+             incomplete: Bool = false,
+             streamProtocolVersion: Int? = nil,
+             streamIndex: Int? = nil,
+             reviewedAsPlainText: Bool = false) {
+            self.pluginId = pluginId
+            self.actionId = actionId
+            self.requestId = requestId
+            self.contextId = contextId
+            self.focusToken = focusToken
+            self.runtimeIdentity = runtimeIdentity
+            self.title = title
+            self.targetSummary = targetSummary
+            self.stale = stale
+            self.incomplete = incomplete
+            self.streamProtocolVersion = streamProtocolVersion
+            self.streamIndex = streamIndex
+            self.reviewedAsPlainText = reviewedAsPlainText
+        }
+
+        func markingStale() -> PluginMetadata {
+            PluginMetadata(pluginId: pluginId,
+                           actionId: actionId,
+                           requestId: requestId,
+                           contextId: contextId,
+                           focusToken: focusToken,
+                           runtimeIdentity: runtimeIdentity,
+                           title: title,
+                           targetSummary: targetSummary,
+                           stale: true,
+                           incomplete: false,
+                           streamProtocolVersion: streamProtocolVersion,
+                           streamIndex: streamIndex,
+                           reviewedAsPlainText: false)
+        }
+
+        func markingReviewedAsPlainText() -> PluginMetadata {
+            PluginMetadata(pluginId: pluginId,
+                           actionId: actionId,
+                           requestId: requestId,
+                           contextId: contextId,
+                           focusToken: focusToken,
+                           runtimeIdentity: runtimeIdentity,
+                           title: title,
+                           targetSummary: targetSummary,
+                           stale: false,
+                           incomplete: false,
+                           streamProtocolVersion: nil,
+                           streamIndex: nil,
+                           reviewedAsPlainText: true)
+        }
+    }
+
+    enum MutationReason: Equatable {
+        case ordinary
+        case transient
+        case pluginStreamUpdate
+        case pluginStreamFinalization
+        case pluginStreamCancellation
+        case blockRemoval
+        case pause
+        case privacyDiscard
+    }
+
+    struct PluginStreamUpdate {
+        let id: UUID
+        let index: Int
+        let text: String
+        let origin: Origin
+        let metadata: PluginMetadata
+    }
+
+    struct PluginStreamFinalBlock {
+        let id: UUID
+        let index: Int
+        let text: String
+        let origin: Origin
+        let metadata: PluginMetadata
+    }
+
     struct Block {
         let id: UUID
         var text: String
         let origin: Origin
         let createdAt: Date
+        var pluginMetadata: PluginMetadata?
 
         init(id: UUID = UUID(),
              text: String,
              origin: Origin = .rime,
-             createdAt: Date = Date()) {
+             createdAt: Date = Date(),
+             pluginMetadata: PluginMetadata? = nil) {
             self.id = id
             self.text = text
             self.origin = origin
             self.createdAt = createdAt
+            self.pluginMetadata = pluginMetadata
         }
     }
 
@@ -95,11 +206,19 @@ final class BufferModel {
     private(set) var transientEnabled = false
     private(set) var loadingMessage: String?
     private(set) var loadingRequestId: String?
+    private(set) var transientLoadingActive = false
+    private(set) var lastMutationReason: MutationReason = .ordinary
+    private(set) var changeCount = 0
 
     var stagedText: String { blocks.map(\.text).joined() }
     var stagedCharacterCount: Int { stagedText.count }
-    var pendingDeliveryBlocks: [Block] { blocks }
-    var pendingDeliveryCount: Int { blocks.count }
+    var pendingDeliveryBlocks: [Block] {
+        blocks.filter { $0.pluginMetadata?.incomplete != true }
+    }
+    var pendingDeliveryCount: Int { pendingDeliveryBlocks.count }
+    var hasIncompletePluginBlocks: Bool {
+        blocks.contains { $0.pluginMetadata?.incomplete == true }
+    }
 
     /// External content exists to be sent to another app, so an optional
     /// app-switch cleanup must never erase it automatically.
@@ -151,15 +270,22 @@ final class BufferModel {
     /// Stage accepted external text without changing the user's persistent
     /// capture preference. It may expose buffer keyboard commands while visible,
     /// but local Rime commits still use `enabled` to decide whether to capture.
-    func stageExternal(_ text: String, origin: Origin) {
+    func stageExternal(_ text: String,
+                       origin: Origin,
+                       pluginMetadata: PluginMetadata? = nil) {
         transientEnabled = true
-        append(text, origin: origin)
+        append(text, origin: origin, pluginMetadata: pluginMetadata)
     }
 
-    func append(_ text: String, origin: Origin = .rime) {
+    func append(_ text: String,
+                origin: Origin = .rime,
+                pluginMetadata: PluginMetadata? = nil) {
         guard !text.isEmpty else { return }
         let index = clampedInsertionIndex()
-        blocks.insert(Block(text: text, origin: origin), at: index)
+        blocks.insert(Block(text: text,
+                            origin: origin,
+                            pluginMetadata: pluginMetadata),
+                      at: index)
         insertionIndex = index + 1
         IMELog.write("buffer insert block at \(index) origin=\(origin.tag) count=\(blocks.count)")
         notifyChange()
@@ -169,8 +295,9 @@ final class BufferModel {
         transientEnabled = true
         loadingRequestId = requestId
         loadingMessage = message
+        transientLoadingActive = true
         IMELog.write("buffer transient loading request=\(requestId) message=\(IMELog.redact(message))")
-        notifyChange()
+        notifyChange(reason: .transient)
     }
 
     func appendMarineDraft(_ text: String, requestId: String) {
@@ -179,6 +306,7 @@ final class BufferModel {
         if loadingRequestId == requestId {
             loadingRequestId = nil
             loadingMessage = nil
+            transientLoadingActive = false
         }
         append(text, origin: .marine)
         IMELog.write("buffer marine draft loaded request=\(requestId) chars=\(text.count)")
@@ -189,8 +317,20 @@ final class BufferModel {
         transientEnabled = true
         loadingRequestId = requestId
         loadingMessage = message
+        transientLoadingActive = false
         IMELog.write("buffer transient failed request=\(requestId) message=\(IMELog.redact(message))")
-        notifyChange()
+        notifyChange(reason: .transient)
+    }
+
+    /// Settle only the matching asynchronous placeholder. A stale completion
+    /// must never erase a newer plugin/Marine request's status.
+    func finishTransientLoading(requestId: String) {
+        guard loadingRequestId == requestId else { return }
+        loadingRequestId = nil
+        loadingMessage = nil
+        transientLoadingActive = false
+        settleTransientIfIdle()
+        notifyChange(reason: .transient)
     }
 
     /// Safe close-window behavior: stop invisible capture/interaction while
@@ -201,8 +341,9 @@ final class BufferModel {
         transientEnabled = false
         loadingRequestId = nil
         loadingMessage = nil
+        transientLoadingActive = false
         IMELog.write("buffer capture paused; preserved blocks=\(blocks.count), cleared transient state")
-        notifyChange()
+        notifyChange(reason: .pause)
     }
 
     @discardableResult
@@ -211,7 +352,21 @@ final class BufferModel {
         clampInsertionIndexInPlace()
         IMELog.write("buffer remove last block \(IMELog.redact(removed.text)) remaining=\(blocks.count)")
         settleTransientIfIdle()
-        notifyChange()
+        notifyChange(reason: .blockRemoval)
+        return true
+    }
+
+    /// Translation presents the source as one continuous buffer even though
+    /// Rime commit boundaries remain internally available for provenance.
+    @discardableResult
+    func removeLastCharacter() -> Bool {
+        guard let index = blocks.indices.last else { return false }
+        if blocks[index].text.count <= 1 {
+            return removeBlock(id: blocks[index].id)
+        }
+        blocks[index].text.removeLast()
+        IMELog.write("buffer remove last character block=\(blocks[index].id) origin=\(blocks[index].origin.tag)")
+        notifyChange(reason: .blockRemoval)
         return true
     }
 
@@ -223,17 +378,181 @@ final class BufferModel {
         clampInsertionIndexInPlace()
         settleTransientIfIdle()
         IMELog.write("buffer remove block id=\(id) origin=\(removed.origin.tag)")
-        notifyChange()
+        notifyChange(reason: .blockRemoval)
         return true
     }
 
-    /// Explicit per-block editing preserves id, origin and createdAt.
+    func block(id: UUID) -> Block? {
+        blocks.first(where: { $0.id == id })
+    }
+
+    /// Apply coalesced full snapshots for one invocation with one notification.
+    /// UUIDs are allocated once by the host for each logical stream index.
     @discardableResult
-    func updateBlock(id: UUID, text: String) -> Bool {
-        guard let index = blocks.firstIndex(where: { $0.id == id }) else { return false }
-        guard !text.isEmpty else { return removeBlock(id: id) }
-        blocks[index].text = text
-        IMELog.write("buffer edit block id=\(id) chars=\(text.count) origin=\(blocks[index].origin.tag)")
+    func applyPluginStreamUpdates(requestId: String,
+                                  updates: [PluginStreamUpdate]) -> Bool {
+        guard !updates.isEmpty,
+              Set(updates.map(\.id)).count == updates.count,
+              Set(updates.map(\.index)).count == updates.count,
+              updates.allSatisfy({ update in
+                  !update.text.isEmpty
+                      && update.metadata.requestId == requestId
+                      && update.metadata.incomplete
+                      && update.metadata.streamIndex == update.index
+                      && streamOriginMatches(update.origin, metadata: update.metadata)
+              }) else { return false }
+
+        // Validate the whole batch before touching the model. A malformed or
+        // stale coalesced update must never leave an earlier item applied.
+        for update in updates {
+            if let sameLogicalBlock = blocks.first(where: {
+                $0.id != update.id
+                    && $0.pluginMetadata?.requestId == requestId
+                    && $0.pluginMetadata?.streamIndex == update.index
+            }) {
+                IMELog.write("buffer plugin stream duplicate logical block id=\(sameLogicalBlock.id)")
+                return false
+            }
+            guard let existingIndex = blocks.firstIndex(where: { $0.id == update.id }) else {
+                continue
+            }
+            guard let existingMetadata = blocks[existingIndex].pluginMetadata,
+                  streamLeaseMatches(existingMetadata, update.metadata),
+                  blocks[existingIndex].origin == update.origin else { return false }
+        }
+
+        for update in updates.sorted(by: { $0.index < $1.index }) {
+            if let existingIndex = blocks.firstIndex(where: { $0.id == update.id }) {
+                blocks[existingIndex].text = update.text
+                blocks[existingIndex].pluginMetadata = update.metadata
+            } else {
+                let index = insertionIndexForStreamBlock(requestId: requestId,
+                                                         streamIndex: update.index)
+                blocks.insert(Block(id: update.id,
+                                    text: update.text,
+                                    origin: update.origin,
+                                    pluginMetadata: update.metadata),
+                              at: index)
+                if index <= insertionIndex { insertionIndex += 1 }
+                clampInsertionIndexInPlace()
+            }
+        }
+        transientEnabled = true
+        if loadingRequestId == requestId {
+            loadingRequestId = nil
+            loadingMessage = nil
+            transientLoadingActive = false
+        }
+        IMELog.write("buffer plugin stream update request=\(requestId) blocks=\(updates.count)")
+        notifyChange(reason: .pluginStreamUpdate)
+        return true
+    }
+
+    /// Reconcile provisional snapshots with the authoritative terminal array.
+    /// Existing indices retain their UUIDs; terminal-only indices use UUIDs
+    /// supplied by the host. The entire promotion emits one model change.
+    @discardableResult
+    func finalizePluginStream(requestId: String,
+                              partialBlockIDs: Set<UUID>,
+                              blocks finalBlocks: [PluginStreamFinalBlock]) -> Bool {
+        guard !finalBlocks.isEmpty,
+              Set(finalBlocks.map(\.id)).count == finalBlocks.count,
+              Set(finalBlocks.map(\.index)).count == finalBlocks.count,
+              finalBlocks.allSatisfy({ block in
+                  !block.text.isEmpty
+                      && block.metadata.requestId == requestId
+                      && !block.metadata.incomplete
+                      && !block.metadata.stale
+                      && block.metadata.streamIndex == block.index
+                      && streamOriginMatches(block.origin, metadata: block.metadata)
+              }) else { return false }
+
+        let livePartialIDs = Set(blocks.compactMap { block -> UUID? in
+            guard block.pluginMetadata?.requestId == requestId,
+                  block.pluginMetadata?.incomplete == true else { return nil }
+            return block.id
+        })
+        guard livePartialIDs == partialBlockIDs else { return false }
+
+        for id in partialBlockIDs {
+            guard let existing = blocks.first(where: { $0.id == id }),
+                  existing.pluginMetadata?.requestId == requestId,
+                  existing.pluginMetadata?.incomplete == true else { return false }
+        }
+
+        // Promotion is transactional as well: validate every surviving UUID
+        // before removing superseded provisional blocks or changing text.
+        for final in finalBlocks {
+            if blocks.contains(where: {
+                $0.id != final.id
+                    && $0.pluginMetadata?.requestId == requestId
+                    && $0.pluginMetadata?.streamIndex == final.index
+            }) {
+                return false
+            }
+            guard let existingIndex = blocks.firstIndex(where: { $0.id == final.id }) else {
+                continue
+            }
+            guard let existingMetadata = blocks[existingIndex].pluginMetadata,
+                  existingMetadata.requestId == requestId,
+                  existingMetadata.incomplete,
+                  streamAuthorityMatches(existingMetadata, final.metadata),
+                  blocks[existingIndex].origin == final.origin else { return false }
+        }
+
+        let finalIDs = Set(finalBlocks.map(\.id))
+        removeBlocksWithoutNotification(ids: partialBlockIDs.subtracting(finalIDs),
+                                        requestId: requestId,
+                                        requireIncomplete: true)
+
+        for final in finalBlocks.sorted(by: { $0.index < $1.index }) {
+            if let existingIndex = blocks.firstIndex(where: { $0.id == final.id }) {
+                blocks[existingIndex].text = final.text
+                blocks[existingIndex].pluginMetadata = final.metadata
+            } else {
+                let index = insertionIndexForStreamBlock(requestId: requestId,
+                                                         streamIndex: final.index)
+                blocks.insert(Block(id: final.id,
+                                    text: final.text,
+                                    origin: final.origin,
+                                    pluginMetadata: final.metadata),
+                              at: index)
+                if index <= insertionIndex { insertionIndex += 1 }
+                clampInsertionIndexInPlace()
+            }
+        }
+        transientEnabled = true
+        if loadingRequestId == requestId {
+            loadingRequestId = nil
+            loadingMessage = nil
+            transientLoadingActive = false
+        }
+        IMELog.write("buffer plugin stream finalized request=\(requestId) blocks=\(finalBlocks.count)")
+        notifyChange(reason: .pluginStreamFinalization)
+        return true
+    }
+
+    /// Cancellation removes only provisional UUIDs owned by this invocation.
+    /// Finalized results and other requests cannot match this mutation.
+    func removePluginStreamBlocks(requestId: String, blockIDs: Set<UUID>) {
+        let before = blocks.count
+        removeBlocksWithoutNotification(ids: blockIDs,
+                                        requestId: requestId,
+                                        requireIncomplete: true)
+        guard blocks.count != before else { return }
+        settleTransientIfIdle()
+        IMELog.write("buffer plugin stream removed request=\(requestId) blocks=\(before - blocks.count)")
+        notifyChange(reason: .pluginStreamCancellation)
+    }
+
+    @discardableResult
+    func markPluginBlockStale(id: UUID) -> Bool {
+        guard let index = blocks.firstIndex(where: { $0.id == id }),
+              let metadata = blocks[index].pluginMetadata,
+              !metadata.stale,
+              !metadata.reviewedAsPlainText else { return false }
+        blocks[index].pluginMetadata = metadata.markingStale()
+        IMELog.write("buffer plugin block marked stale id=\(id)")
         notifyChange()
         return true
     }
@@ -257,13 +576,15 @@ final class BufferModel {
     func consumeDelivered(blockIDs: [UUID]) {
         guard !blockIDs.isEmpty else { return }
         let ids = Set(blockIDs)
-        let deliveredIndexes = blocks.indices.filter { ids.contains(blocks[$0].id) }
+        let deliveredIndexes = blocks.indices.filter {
+            ids.contains(blocks[$0].id) && blocks[$0].pluginMetadata?.incomplete != true
+        }
         guard !deliveredIndexes.isEmpty else { return }
 
         let removedBeforeInsertion = deliveredIndexes.reduce(into: 0) { count, index in
             if index < insertionIndex { count += 1 }
         }
-        blocks.removeAll { ids.contains($0.id) }
+        blocks.removeAll { ids.contains($0.id) && $0.pluginMetadata?.incomplete != true }
         insertionIndex -= removedBeforeInsertion
         clampInsertionIndexInPlace()
         settleTransientIfIdle()
@@ -278,9 +599,10 @@ final class BufferModel {
         insertionIndex = 0
         loadingRequestId = nil
         loadingMessage = nil
+        transientLoadingActive = false
         transientEnabled = false
         IMELog.write("buffer privacy discard blocks=\(blockCount)")
-        notifyChange()
+        notifyChange(reason: .privacyDiscard)
     }
 
     private func clampedInsertionIndex() -> Int {
@@ -297,7 +619,70 @@ final class BufferModel {
         }
     }
 
-    private func notifyChange() {
+    private func insertionIndexForStreamBlock(requestId: String,
+                                              streamIndex: Int) -> Int {
+        let sameRequest = blocks.indices.filter {
+            blocks[$0].pluginMetadata?.requestId == requestId
+                && blocks[$0].pluginMetadata?.streamIndex != nil
+        }
+        if let before = sameRequest.first(where: {
+            (blocks[$0].pluginMetadata?.streamIndex ?? Int.max) > streamIndex
+        }) {
+            return before
+        }
+        if let last = sameRequest.last { return last + 1 }
+        return clampedInsertionIndex()
+    }
+
+    private func removeBlocksWithoutNotification(ids: Set<UUID>,
+                                                 requestId: String,
+                                                 requireIncomplete: Bool) {
+        let indexes = blocks.indices.filter { index in
+            let block = blocks[index]
+            guard ids.contains(block.id),
+                  block.pluginMetadata?.requestId == requestId else { return false }
+            return !requireIncomplete || block.pluginMetadata?.incomplete == true
+        }
+        let removedBeforeInsertion = indexes.reduce(into: 0) { count, index in
+            if index < insertionIndex { count += 1 }
+        }
+        blocks.removeAll { block in
+            guard ids.contains(block.id),
+                  block.pluginMetadata?.requestId == requestId else { return false }
+            return !requireIncomplete || block.pluginMetadata?.incomplete == true
+        }
+        insertionIndex -= removedBeforeInsertion
+        clampInsertionIndexInPlace()
+    }
+
+    private func streamOriginMatches(_ origin: Origin,
+                                     metadata: PluginMetadata) -> Bool {
+        guard case let .plugin(pluginID) = origin else { return false }
+        return pluginID == metadata.pluginId
+    }
+
+    private func streamLeaseMatches(_ lhs: PluginMetadata,
+                                    _ rhs: PluginMetadata) -> Bool {
+        lhs.incomplete
+            && rhs.incomplete
+            && lhs.streamIndex == rhs.streamIndex
+            && streamAuthorityMatches(lhs, rhs)
+    }
+
+    private func streamAuthorityMatches(_ lhs: PluginMetadata,
+                                        _ rhs: PluginMetadata) -> Bool {
+        lhs.pluginId == rhs.pluginId
+            && lhs.actionId == rhs.actionId
+            && lhs.requestId == rhs.requestId
+            && lhs.contextId == rhs.contextId
+            && lhs.focusToken == rhs.focusToken
+            && lhs.runtimeIdentity == rhs.runtimeIdentity
+            && lhs.streamProtocolVersion == rhs.streamProtocolVersion
+    }
+
+    private func notifyChange(reason: MutationReason = .ordinary) {
+        lastMutationReason = reason
+        changeCount += 1
         onChange?()
         NotificationCenter.default.post(name: .bufferModelDidChange, object: self)
     }

@@ -1,50 +1,56 @@
 import Cocoa
 import CRimeBridge
+import UniformTypeIdentifiers
+
+private enum SettingsPluginSwitchMode {
+    case enablement
+    case activeBufferPlugin
+}
+
+private final class SettingsPluginSwitch: NSSwitch {
+    var pluginKey = PluginKey(domain: .builtIn, rawID: "")
+    var mode: SettingsPluginSwitchMode = .enablement
+}
+
+private final class SettingsLexiconButton: NSButton {
+    var lexiconKind: UserLexiconKind = .chinese
+}
+
+private final class SettingsRouteButton: NSButton {
+    var routeID = SettingsCoreRoute.inputMethod.id
+}
+
+private final class SettingsPageDocumentView: NSView {
+    override var isFlipped: Bool { true }
+}
+
+private final class SettingsBackgroundView: NSView {
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.windowBackgroundColor.setFill()
+        dirtyRect.fill()
+    }
+}
 
 /// Central settings surface for input schemas, candidate UI, buffer mode,
 /// remote typing, and local diagnostics.
-final class SettingsWindowController: NSObject, NSTextFieldDelegate {
+final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDelegate {
     static let shared = SettingsWindowController()
-
-    private enum Page: Int, CaseIterable {
-        // 输入法组
-        case input
-        case candidateWindow
-        case maintenance
-        // 工作台组
-        case buffer
-        case connections
-        case processors
-
-        var title: String {
-            switch self {
-            case .input: return "输入"
-            case .candidateWindow: return "候选窗"
-            case .maintenance: return "维护"
-            case .buffer: return "缓冲区"
-            case .connections: return "连接"
-            case .processors: return "处理器"
-            }
-        }
-
-        var group: String {
-            switch self {
-            case .input, .candidateWindow, .maintenance: return "输入法"
-            case .buffer, .connections, .processors: return "工作台"
-            }
-        }
-    }
 
     private var window: NSWindow?
     private let sidebar = NSStackView()
     private let contentHost = NSView()
-    private var navButtons: [Page: NSButton] = [:]
-    private var selectedPage: Page = .input
+    private var routeCatalog = try! SettingsRouteCatalog()
+    private lazy var navigation = SettingsNavigationState(catalog: routeCatalog)
+    private var navButtons: [SettingsRouteID: NSButton] = [:]
+    private var activePluginSettingsController: NSViewController?
     private var statsObserver: NSObjectProtocol?
+    private var pluginObserver: NSObjectProtocol?
+    private var registryObserver: NSObjectProtocol?
+    private var activeBufferPluginObserver: NSObjectProtocol?
+    private var inputConfigurationObserver: NSObjectProtocol?
 
-    private var schemaChecks: [String: NSButton] = [:]
-    private let currentSchemaLabel = NSTextField(labelWithString: "")
-    private let schemaApplyStatus = NSTextField(labelWithString: "")
+    private var encodingRadios: [InputEncoding: NSButton] = [:]
+    private var keyingModeRadios: [KeyingMode: NSButton] = [:]
     private let appearancePopUp = NSPopUpButton()
     private let bufferCheck = NSButton(checkboxWithTitle: "启用缓冲模式（提交先暂存，手动确认上屏）", target: nil, action: nil)
     private let bufferWindowVisibleCheck = NSButton(checkboxWithTitle: "显示独立缓冲工作台", target: nil, action: nil)
@@ -57,6 +63,10 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     private let gatewayCopyConfigButton = NSButton(title: "复制配置 (JSON)", target: nil, action: nil)
     private let gatewayCommandField = NSTextField(string: "")
     private let gatewayCopyButton = NSButton(title: "复制 Claude Code 命令", target: nil, action: nil)
+    private let aiBaseURLField = NSTextField(string: "")
+    private let aiModelField = NSTextField(string: "")
+    private let aiAPIKeyField = NSSecureTextField(string: "")
+    private let aiConfigurationStatus = NSTextField(labelWithString: "")
     private var candidateMetricFields: [CandidateWindowMetric: NSTextField] = [:]
     private var candidateMetricSliders: [CandidateWindowMetric: NSSlider] = [:]
     private var candidateMetricHints: [CandidateWindowMetric: NSTextField] = [:]
@@ -74,9 +84,18 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     private let remoteDevicesStack = NSStackView()
     private var remoteDiscoveredIDs: [String] = []
     private var remoteTrustedKeys: [String] = []
+    private let pluginRowsStack = NSStackView()
+    private let pluginStatusLabel = NSTextField(labelWithString: "")
+    private var pluginDownloadInProgress = false
+    private var pluginRefreshScheduled = false
 
     private var userDir: URL {
-        URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/RimeBuffer")
+        if let override = ProcessInfo.processInfo.environment["RIMEBUFFER_USER_DIR"],
+           !override.isEmpty {
+            return URL(fileURLWithPath: override, isDirectory: true)
+        }
+        return URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent("Library/RimeBuffer", isDirectory: true)
     }
 
     private var installLogURL: URL {
@@ -85,8 +104,9 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
 
     func show() {
         if window == nil { build() }
+        rebuildRouteCatalog()
         reload()
-        showPage(selectedPage)
+        showCurrentRoute()
         NSApp.activate(ignoringOtherApps: true)
         window?.center()
         window?.makeKeyAndOrderFront(nil)
@@ -97,15 +117,92 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     /// the UI without a live input session.
     func renderForPreview(pageIndex: Int, to path: String) {
         if window == nil { build() }
+        rebuildRouteCatalog()
         reload()
-        showPage(Page(rawValue: pageIndex) ?? .buffer)
-        guard let content = window?.contentView else { return }
+        let targets = previewTargets()
+        let target = targets.indices.contains(pageIndex)
+            ? targets[pageIndex]
+            : (SettingsCoreRoute.buffer.id, SettingsSubpageID(rawValue: "general"), "buffer")
+        selectPreviewTarget(routeID: target.0, subpageID: target.1)
+        renderCurrentView(to: path)
+    }
+
+    /// Renders every route/subpage from the live catalog and writes a manifest
+    /// so visual checks never depend on enum ordinals or a hard-coded page
+    /// count. Preview user-data isolation is established by main.swift.
+    @discardableResult
+    func renderAllForPreview(to directory: String) -> Bool {
+        if window == nil { build() }
+        rebuildRouteCatalog()
+        reload()
+        let root = URL(fileURLWithPath: directory, isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: root,
+                                                    withIntermediateDirectories: true)
+        } catch {
+            print("settings render directory failed: \(error.localizedDescription)")
+            return false
+        }
+
+        var manifest: [[String: String]] = []
+        var allRendered = true
+        for target in previewTargets() {
+            selectPreviewTarget(routeID: target.0, subpageID: target.1)
+            let fileName = target.2 + ".png"
+            let path = root.appendingPathComponent(fileName).path
+            allRendered = renderCurrentView(to: path) && allRendered
+            manifest.append([
+                "routeID": target.0.rawValue,
+                "subpageID": target.1.rawValue,
+                "file": fileName,
+            ])
+        }
+        do {
+            let data = try JSONSerialization.data(withJSONObject: manifest,
+                                                  options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: root.appendingPathComponent("manifest.json"),
+                           options: .atomic)
+        } catch {
+            print("settings render manifest failed: \(error.localizedDescription)")
+            allRendered = false
+        }
+        return allRendered
+    }
+
+    private func previewTargets() -> [(SettingsRouteID, SettingsSubpageID, String)] {
+        routeCatalog.orderedRoutes.flatMap { route in
+            route.subpages.map { subpage in
+                let routeSlug = route.id.rawValue
+                    .replacingOccurrences(of: ".", with: "-")
+                let subpageSlug = subpage.id.rawValue
+                    .replacingOccurrences(of: ".", with: "-")
+                return (route.id, subpage.id, "\(routeSlug)--\(subpageSlug)")
+            }
+        }
+    }
+
+    private func selectPreviewTarget(routeID: SettingsRouteID,
+                                     subpageID: SettingsSubpageID) {
+        _ = navigation.selectRoute(routeID, catalog: routeCatalog)
+        _ = navigation.selectSubpage(subpageID, catalog: routeCatalog)
+        showCurrentRoute()
+    }
+
+    @discardableResult
+    private func renderCurrentView(to path: String) -> Bool {
+        guard let content = window?.contentView else { return false }
         content.layoutSubtreeIfNeeded()
         content.display()
-        guard let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds) else { return }
+        guard let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds) else { return false }
         content.cacheDisplay(in: content.bounds, to: rep)
-        try? rep.representation(using: .png, properties: [:])?
-            .write(to: URL(fileURLWithPath: path))
+        guard let data = rep.representation(using: .png, properties: [:]) else { return false }
+        do {
+            try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+            return true
+        } catch {
+            print("settings render failed \(path): \(error.localizedDescription)")
+            return false
+        }
     }
 
     // MARK: UI construction
@@ -116,7 +213,9 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
                            backing: .buffered, defer: false)
         win.title = "Enter输入法 设置"
         win.isReleasedWhenClosed = false
+        win.delegate = self
         win.minSize = NSSize(width: 860, height: 600)
+        win.backgroundColor = .windowBackgroundColor
 
         configureControls()
 
@@ -125,26 +224,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         sidebar.spacing = 6
         sidebar.edgeInsets = NSEdgeInsets(top: 16, left: 12, bottom: 16, right: 12)
         sidebar.translatesAutoresizingMaskIntoConstraints = false
-
-        var lastGroup: String?
-        for page in Page.allCases {
-            if page.group != lastGroup {
-                sidebar.addArrangedSubview(sidebarGroupHeader(page.group, first: lastGroup == nil))
-                lastGroup = page.group
-            }
-            let button = NSButton(title: page.title, target: self, action: #selector(pageChosen(_:)))
-            button.tag = page.rawValue
-            button.bezelStyle = .regularSquare
-            button.isBordered = false
-            button.alignment = .left
-            button.font = .systemFont(ofSize: 13, weight: .medium)
-            button.translatesAutoresizingMaskIntoConstraints = false
-            button.widthAnchor.constraint(equalToConstant: 136).isActive = true
-            button.heightAnchor.constraint(equalToConstant: 30).isActive = true
-            sidebar.addArrangedSubview(button)
-            navButtons[page] = button
-        }
-        sidebar.addArrangedSubview(flexSpacer())
+        rebuildSidebar()
 
         let divider = NSBox()
         divider.boxType = .separator
@@ -152,21 +232,26 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
 
         contentHost.translatesAutoresizingMaskIntoConstraints = false
 
-        let root = NSStackView(views: [sidebar, divider, contentHost])
-        root.orientation = .horizontal
-        root.alignment = .top
-        root.spacing = 0
-        root.translatesAutoresizingMaskIntoConstraints = false
-
-        win.contentView = NSView()
-        win.contentView?.addSubview(root)
+        let background = SettingsBackgroundView()
+        win.contentView = background
+        background.addSubview(sidebar)
+        background.addSubview(divider)
+        background.addSubview(contentHost)
+        contentHost.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        contentHost.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         NSLayoutConstraint.activate([
-            root.leadingAnchor.constraint(equalTo: win.contentView!.leadingAnchor),
-            root.trailingAnchor.constraint(equalTo: win.contentView!.trailingAnchor),
-            root.topAnchor.constraint(equalTo: win.contentView!.topAnchor),
-            root.bottomAnchor.constraint(equalTo: win.contentView!.bottomAnchor),
+            sidebar.leadingAnchor.constraint(equalTo: background.leadingAnchor),
+            sidebar.topAnchor.constraint(equalTo: background.topAnchor),
+            sidebar.bottomAnchor.constraint(equalTo: background.bottomAnchor),
             sidebar.widthAnchor.constraint(equalToConstant: 160),
+            divider.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+            divider.topAnchor.constraint(equalTo: background.topAnchor),
+            divider.bottomAnchor.constraint(equalTo: background.bottomAnchor),
             divider.widthAnchor.constraint(equalToConstant: 1),
+            contentHost.leadingAnchor.constraint(equalTo: divider.trailingAnchor),
+            contentHost.trailingAnchor.constraint(equalTo: background.trailingAnchor),
+            contentHost.topAnchor.constraint(equalTo: background.topAnchor),
+            contentHost.bottomAnchor.constraint(equalTo: background.bottomAnchor),
         ])
 
         statsObserver = NotificationCenter.default.addObserver(
@@ -174,30 +259,90 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            guard self?.selectedPage == .maintenance else { return }
+            guard self?.window?.isVisible == true,
+                  self?.selectedBuiltInPluginID == BuiltInPluginID.statistics else { return }
             self?.refreshStats()
+        }
+
+        pluginObserver = NotificationCenter.default.addObserver(
+            forName: ActionPluginManager.didChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self,
+                  notification.userInfo?[ActionPluginManager.rootPathUserInfoKey] as? String
+                    == ActionPluginManager.shared.rootURL.path,
+                  self.window?.isVisible == true,
+                  self.selectedCoreRoute == .plugins else { return }
+            self.schedulePluginListRefresh()
+        }
+
+        registryObserver = NotificationCenter.default.addObserver(
+            forName: .pluginRegistryDidChange,
+            object: PluginRegistry.shared,
+            queue: .main
+        ) { [weak self] _ in
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.window?.isVisible == true else { return }
+                self.rebuildRouteCatalog()
+                self.showCurrentRoute()
+            }
+        }
+
+        activeBufferPluginObserver = NotificationCenter.default.addObserver(
+            forName: .activeBufferPluginDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self,
+                  self.window?.isVisible == true,
+                  self.selectedCoreRoute == .plugins else { return }
+            self.schedulePluginListRefresh()
+        }
+
+        inputConfigurationObserver = NotificationCenter.default.addObserver(
+            forName: .inputConfigurationDidChange,
+            object: InputConfigurationStore.shared,
+            queue: .main
+        ) { [weak self] _ in
+            self?.refreshInputConfigurationSelection()
         }
 
         window = win
     }
 
+    func windowWillClose(_ notification: Notification) {
+        guard notification.object as? NSWindow === window else { return }
+        // The controller is a process-lifetime singleton, but dynamic plugin
+        // pages must not be: they observe high-frequency metric stores. Drop
+        // the hosted view/controller so a closed Settings window does no
+        // hidden AppKit work on the IME main thread.
+        contentHost.subviews.forEach { $0.removeFromSuperview() }
+        activePluginSettingsController = nil
+        candidatePreview = nil
+    }
+
     private func configureControls() {
-        for (index, option) in InputSchemaCatalog.options.enumerated() {
-            let button = NSButton(checkboxWithTitle: option.name,
+        for (index, encoding) in InputEncoding.allCases.enumerated() {
+            let button = NSButton(radioButtonWithTitle: encoding.title,
                                   target: self,
-                                  action: #selector(schemaToggled(_:)))
+                                  action: #selector(inputEncodingSelected(_:)))
             button.tag = index
             button.font = .systemFont(ofSize: 13, weight: .medium)
-            button.toolTip = option.detail
             button.translatesAutoresizingMaskIntoConstraints = false
             button.widthAnchor.constraint(equalToConstant: 150).isActive = true
-            schemaChecks[option.id] = button
+            encodingRadios[encoding] = button
         }
-        currentSchemaLabel.font = .systemFont(ofSize: 12)
-        currentSchemaLabel.textColor = .secondaryLabelColor
-        schemaApplyStatus.font = .systemFont(ofSize: 11)
-        schemaApplyStatus.textColor = .tertiaryLabelColor
-
+        for (index, mode) in KeyingMode.allCases.enumerated() {
+            let button = NSButton(radioButtonWithTitle: mode.title,
+                                  target: self,
+                                  action: #selector(keyingModeSelected(_:)))
+            button.tag = index
+            button.font = .systemFont(ofSize: 13, weight: .medium)
+            button.translatesAutoresizingMaskIntoConstraints = false
+            button.widthAnchor.constraint(equalToConstant: 150).isActive = true
+            keyingModeRadios[mode] = button
+        }
         bufferCheck.target = self
         bufferCheck.action = #selector(bufferToggled)
         bufferWindowVisibleCheck.target = self
@@ -236,6 +381,20 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         gatewayCopyButton.target = self
         gatewayCopyButton.action = #selector(copyGatewayCommand)
 
+        aiBaseURLField.placeholderString = "https://api.openai.com/v1"
+        aiBaseURLField.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        aiModelField.placeholderString = "模型名称"
+        aiModelField.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        aiAPIKeyField.placeholderString = "API Key（可留空）"
+        aiAPIKeyField.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        for field in [aiBaseURLField, aiModelField, aiAPIKeyField] {
+            field.translatesAutoresizingMaskIntoConstraints = false
+            field.widthAnchor.constraint(equalToConstant: 420).isActive = true
+        }
+        aiConfigurationStatus.font = .systemFont(ofSize: 11)
+        aiConfigurationStatus.textColor = .tertiaryLabelColor
+        aiConfigurationStatus.lineBreakMode = .byTruncatingTail
+
         appearancePopUp.removeAllItems()
         for mode in RimeAppearanceMode.allCases {
             appearancePopUp.addItem(withTitle: mode.title)
@@ -270,6 +429,19 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         remoteDevicesStack.orientation = .vertical
         remoteDevicesStack.alignment = .leading
         remoteDevicesStack.spacing = 6
+
+        pluginStatusLabel.font = .systemFont(ofSize: 11)
+        pluginStatusLabel.textColor = .secondaryLabelColor
+        pluginStatusLabel.lineBreakMode = .byTruncatingTail
+
+        pluginRowsStack.orientation = .vertical
+        pluginRowsStack.alignment = .width
+        pluginRowsStack.distribution = .fill
+        pluginRowsStack.spacing = 6
+        pluginRowsStack.translatesAutoresizingMaskIntoConstraints = false
+        pluginRowsStack.setContentHuggingPriority(.required, for: .vertical)
+        pluginRowsStack.setContentCompressionResistancePriority(.required, for: .vertical)
+        pluginRowsStack.widthAnchor.constraint(equalToConstant: 650).isActive = true
     }
 
     private func configureCandidateMetricControls() {
@@ -338,34 +510,196 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         chordDurationStepper.action = #selector(chordDurationStepperChanged)
     }
 
-    private func showPage(_ page: Page) {
-        selectedPage = page
-        for (p, button) in navButtons {
-            button.state = p == page ? .on : .off
-            button.contentTintColor = p == page ? .controlAccentColor : .labelColor
+    private var selectedRoute: SettingsRouteDescriptor? {
+        routeCatalog.route(for: navigation.currentRouteID)
+    }
+
+    private var selectedCoreRoute: SettingsCoreRoute? {
+        guard case let .core(route)? = selectedRoute?.source else { return nil }
+        return route
+    }
+
+    private var selectedBuiltInPluginID: String? {
+        guard case let .builtInPlugin(key)? = selectedRoute?.source else { return nil }
+        return key.rawID
+    }
+
+    private func rebuildRouteCatalog() {
+        do {
+            let next = try SettingsRouteCatalog(
+                pluginContributions: PluginRegistry.shared.enabledSettingsContributions()
+            )
+            routeCatalog = next
+            navigation.reconcile(with: next)
+            if window != nil { rebuildSidebar() }
+        } catch {
+            IMELog.write("settings route catalog rejected: \(error)")
+        }
+    }
+
+    private func rebuildSidebar() {
+        sidebar.arrangedSubviews.forEach {
+            sidebar.removeArrangedSubview($0)
+            $0.removeFromSuperview()
+        }
+        navButtons.removeAll()
+        for (sectionIndex, section) in routeCatalog.sections.enumerated() {
+            sidebar.addArrangedSubview(
+                sidebarGroupHeader(section.title, first: sectionIndex == 0)
+            )
+            for route in section.routes {
+                let button = SettingsRouteButton(
+                    title: route.title,
+                    target: self,
+                    action: #selector(routeChosen(_:))
+                )
+                button.routeID = route.id
+                button.bezelStyle = .regularSquare
+                button.isBordered = false
+                button.alignment = .left
+                button.font = .systemFont(ofSize: 13, weight: .medium)
+                button.image = NSImage(systemSymbolName: route.symbolName,
+                                       accessibilityDescription: route.title)
+                button.imagePosition = .imageLeading
+                button.imageHugsTitle = true
+                button.wantsLayer = true
+                button.layer?.cornerRadius = 7
+                button.translatesAutoresizingMaskIntoConstraints = false
+                button.widthAnchor.constraint(equalToConstant: 136).isActive = true
+                button.heightAnchor.constraint(equalToConstant: 32).isActive = true
+                sidebar.addArrangedSubview(button)
+                navButtons[route.id] = button
+            }
+        }
+        sidebar.addArrangedSubview(flexSpacer())
+        refreshSidebarSelection()
+    }
+
+    private func refreshSidebarSelection() {
+        for (routeID, button) in navButtons {
+            let selected = routeID == navigation.currentRouteID
+            button.state = selected ? .on : .off
+            button.contentTintColor = selected ? .labelColor : .secondaryLabelColor
+            button.layer?.backgroundColor = selected
+                ? NSColor.controlAccentColor.withAlphaComponent(0.13).cgColor
+                : NSColor.clear.cgColor
+        }
+    }
+
+    private func showCurrentRoute() {
+        guard let route = selectedRoute else { return }
+        refreshSidebarSelection()
+        activePluginSettingsController = nil
+        contentHost.subviews.forEach { $0.removeFromSuperview() }
+
+        let subpageID = navigation.selectedSubpage()?.rawValue
+        let body: NSView
+        switch route.source {
+        case let .core(core):
+            body = makeCorePage(core, subpageID: subpageID)
+        case let .builtInPlugin(pluginKey):
+            if let subpageID,
+               let controller = PluginRegistry.shared.makeSettingsViewController(
+                    pluginKey: pluginKey,
+                    subpageID: subpageID
+               ) {
+                activePluginSettingsController = controller
+                body = controller.view
+            } else {
+                body = contentColumn([
+                    title(route.title),
+                    caption("扩展页面当前不可用，可在“插件”中重新启用。"),
+                ])
+            }
         }
 
-        contentHost.subviews.forEach { $0.removeFromSuperview() }
-        let pageView: NSView
-        switch page {
-        case .input: pageView = inputPage()
-        case .candidateWindow: pageView = candidateWindowPage()
-        case .buffer: pageView = bufferPage()
-        case .connections: pageView = connectionsPage()
-        case .processors: pageView = processorsPage()
-        case .maintenance: pageView = maintenancePage()
-        }
+        let pageView = pageShell(route: route, body: body)
         pageView.translatesAutoresizingMaskIntoConstraints = false
         contentHost.addSubview(pageView)
         NSLayoutConstraint.activate([
             pageView.leadingAnchor.constraint(equalTo: contentHost.leadingAnchor),
             pageView.trailingAnchor.constraint(equalTo: contentHost.trailingAnchor),
             pageView.topAnchor.constraint(equalTo: contentHost.topAnchor),
-            pageView.bottomAnchor.constraint(lessThanOrEqualTo: contentHost.bottomAnchor),
+            pageView.bottomAnchor.constraint(equalTo: contentHost.bottomAnchor),
         ])
-        if page == .maintenance { refreshStats() }
-        if page == .connections { refreshRemoteStatus() }
-        if page == .candidateWindow { refreshCandidateMetricControls() }
+
+        switch route.source {
+        case .core(.appearance): refreshCandidateMetricControls()
+        case .core(.connectors): refreshRemoteStatus()
+        case .core(.plugins): refreshPluginList()
+        case .builtInPlugin(let key) where key.rawID == BuiltInPluginID.statistics:
+            refreshStats()
+        default: break
+        }
+    }
+
+    private func makeCorePage(_ route: SettingsCoreRoute,
+                              subpageID: String?) -> NSView {
+        switch route {
+        case .inputMethod: return inputPage(subpageID: subpageID ?? "encoding")
+        case .appearance: return appearancePage(subpageID: subpageID ?? "candidate-window")
+        case .buffer: return bufferPage(subpageID: subpageID ?? "general")
+        case .connectors: return connectionsPage(subpageID: subpageID ?? "remote-typing")
+        case .plugins: return pluginsPage(subpageID: subpageID ?? "all")
+        case .maintenance: return maintenancePage(subpageID: subpageID ?? "update-restart")
+        }
+    }
+
+    private func pageShell(route: SettingsRouteDescriptor, body: NSView) -> NSView {
+        let tabs = NSSegmentedControl(
+            labels: route.subpages.map(\.title),
+            trackingMode: .selectOne,
+            target: self,
+            action: #selector(subpageChosen(_:))
+        )
+        tabs.segmentStyle = .automatic
+        if let selected = navigation.selectedSubpage(),
+           let index = route.subpages.firstIndex(where: { $0.id == selected }) {
+            tabs.selectedSegment = index
+        }
+
+        let tabsRow = NSStackView(views: [tabs, flexSpacer()])
+        tabsRow.orientation = .horizontal
+        tabsRow.alignment = .centerY
+        tabsRow.edgeInsets = NSEdgeInsets(top: 12, left: 24, bottom: 10, right: 24)
+
+        let bodyHost: NSView
+        if body is NSScrollView {
+            // Page-owned controllers may preserve their own scroll positions;
+            // do not nest them in another scroll view with zero intrinsic height.
+            bodyHost = body
+        } else {
+            let scroll = NSScrollView()
+            scroll.drawsBackground = false
+            scroll.hasVerticalScroller = true
+            scroll.autohidesScrollers = true
+            let document = SettingsPageDocumentView()
+            scroll.documentView = document
+            document.translatesAutoresizingMaskIntoConstraints = false
+            body.translatesAutoresizingMaskIntoConstraints = false
+            document.addSubview(body)
+            NSLayoutConstraint.activate([
+                document.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+                document.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
+                document.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+                document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+                body.leadingAnchor.constraint(equalTo: document.leadingAnchor),
+                body.trailingAnchor.constraint(equalTo: document.trailingAnchor),
+                body.topAnchor.constraint(equalTo: document.topAnchor),
+                body.bottomAnchor.constraint(equalTo: document.bottomAnchor),
+            ])
+            bodyHost = scroll
+        }
+
+        let root = NSStackView(views: [tabsRow, bodyHost])
+        root.orientation = .vertical
+        root.alignment = .leading
+        root.spacing = 0
+        tabsRow.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+        bodyHost.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+        bodyHost.setContentHuggingPriority(.defaultLow, for: .vertical)
+        bodyHost.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        return root
     }
 
     private func sidebarGroupHeader(_ title: String, first: Bool) -> NSView {
@@ -378,10 +712,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         return wrap
     }
 
-    private func inputPage() -> NSView {
-        let deployBtn = NSButton(title: "应用方案并重启", target: self, action: #selector(deployAndRestart))
-        deployBtn.bezelColor = .controlAccentColor
-
+    private func inputPage(subpageID: String) -> NSView {
         let openDirBtn = NSButton(title: "打开配置目录", target: self, action: #selector(openDir))
         let note = NSTextField(wrappingLabelWithString:
             "配置目录是 ~/Library/RimeBuffer。未显示的方案文件仅作为词典或反查依赖保留，不会出现在 F4。")
@@ -389,32 +720,142 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         note.textColor = .tertiaryLabelColor
 
         let chordNote = NSTextField(wrappingLabelWithString:
-            "仅并击方案生效：多个键在此间隔内先后按下会合并成一次并击。值越小越跟手，太小容易漏字。默认 0.10 秒，修改后立即生效。")
+            "飞耀方案使用此间隔划分每一击；互击允许左侧声母、右侧韵母分别成击，并击则要求同一击左右两侧都参与。默认 0.10 秒，修改后立即生效。")
         chordNote.font = .systemFont(ofSize: 11)
         chordNote.textColor = .tertiaryLabelColor
 
-        return contentColumn([
-            title("输入"),
-            caption("勾选允许使用的方案；实际切换统一使用 F4。"),
-            spacer(8),
-            sectionLabel("F4 输入方案"),
-            currentSchemaLabel,
-            schemaChecklistView(),
-            schemaApplyStatus,
-            deployBtn,
-            spacer(16),
-            sectionLabel("并击间隔"),
-            chordDurationRow(),
-            chordNote,
-            spacer(16),
-            sectionLabel("配置目录"),
-            openDirBtn,
-            note,
-        ])
+        switch subpageID {
+        case "typing-mode":
+            return contentColumn([
+                title("键入模式"),
+                spacer(8),
+                keyingModeSelectionView(),
+                spacer(16),
+                sectionLabel("飞耀组键间隔"),
+                chordDurationRow(),
+                chordNote,
+            ])
+        case "dictionaries":
+            let learning = NSTextField(wrappingLabelWithString:
+                "Rime 会在独立的 ~/Library/RimeBuffer 中学习词频。这里导入、导出的只是可移植学习记录，不会复制或替换正在使用的 LevelDB。")
+            learning.font = .systemFont(ofSize: 11)
+            learning.textColor = .tertiaryLabelColor
+            return contentColumn([
+                title("词库"),
+                caption("词库负责候选内容；输入编码与键入模式只决定如何检索它。"),
+                spacer(8),
+                sectionLabel("已安装词库"),
+                lexiconCard(kind: .chinese,
+                            title: "雾凇拼音",
+                            detail: "中文主词库 · 全拼、自然码双拼、飞耀互击共享"),
+                lexiconCard(kind: .english,
+                            title: "Easy English",
+                            detail: "英文候选、补全、生词兜底与独立学习"),
+                spacer(16),
+                sectionLabel("用户学习"),
+                learning,
+                openDirBtn,
+                note,
+            ])
+        default:
+            return contentColumn([
+                title("输入编码"),
+                spacer(8),
+                inputEncodingSelectionView(),
+            ])
+        }
+    }
+
+    private func inputModeCard(title: String,
+                               detail: String,
+                               active: Bool,
+                               inactiveLabel: String = "规划中") -> NSView {
+        let name = NSTextField(labelWithString: title)
+        name.font = .systemFont(ofSize: 13, weight: .semibold)
+        let status = NSTextField(labelWithString: active ? "可用" : inactiveLabel)
+        status.font = .systemFont(ofSize: 10, weight: .medium)
+        status.textColor = active ? .systemGreen : .tertiaryLabelColor
+        let detailLabel = NSTextField(wrappingLabelWithString: detail)
+        detailLabel.font = .systemFont(ofSize: 11)
+        detailLabel.textColor = .secondaryLabelColor
+        let header = NSStackView(views: [name, flexSpacer(), status])
+        header.orientation = .horizontal
+        let card = NSStackView(views: [header, detailLabel])
+        card.orientation = .vertical
+        card.alignment = .leading
+        card.spacing = 5
+        card.edgeInsets = NSEdgeInsets(top: 10, left: 12, bottom: 10, right: 12)
+        card.wantsLayer = true
+        card.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.65).cgColor
+        card.layer?.cornerRadius = 8
+        card.translatesAutoresizingMaskIntoConstraints = false
+        card.widthAnchor.constraint(equalToConstant: 600).isActive = true
+        header.widthAnchor.constraint(equalTo: card.widthAnchor, constant: -24).isActive = true
+        detailLabel.widthAnchor.constraint(equalTo: card.widthAnchor, constant: -24).isActive = true
+        card.alphaValue = active ? 1 : 0.68
+        return card
+    }
+
+    private func dictionaryCard(title: String, detail: String) -> NSView {
+        inputModeCard(title: title, detail: detail, active: true)
+    }
+
+    private func lexiconCard(kind: UserLexiconKind,
+                             title: String,
+                             detail: String) -> NSView {
+        let status = UserLexiconService.shared.status(for: kind)
+        let name = NSTextField(labelWithString: title)
+        name.font = .systemFont(ofSize: 13, weight: .semibold)
+
+        let statusLabel = NSTextField(labelWithString:
+            status.hasLearningDatabase ? "学习库已建立" : "尚未建立学习库")
+        statusLabel.font = .systemFont(ofSize: 10, weight: .medium)
+        statusLabel.textColor = status.hasLearningDatabase ? .systemGreen : .tertiaryLabelColor
+
+        let detailLabel = NSTextField(wrappingLabelWithString: detail)
+        detailLabel.font = .systemFont(ofSize: 11)
+        detailLabel.textColor = .secondaryLabelColor
+
+        let importButton = SettingsLexiconButton(title: "导入学习…",
+                                                  target: self,
+                                                  action: #selector(importUserLexicon(_:)))
+        importButton.lexiconKind = kind
+        importButton.controlSize = .small
+
+        let exportButton = SettingsLexiconButton(title: "导出学习…",
+                                                  target: self,
+                                                  action: #selector(exportUserLexicon(_:)))
+        exportButton.lexiconKind = kind
+        exportButton.controlSize = .small
+        exportButton.isEnabled = status.hasLearningDatabase
+
+        let header = NSStackView(views: [name, flexSpacer(), statusLabel])
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        let actions = NSStackView(views: [importButton, exportButton, flexSpacer()])
+        actions.orientation = .horizontal
+        actions.alignment = .centerY
+        actions.spacing = 7
+
+        let card = NSStackView(views: [header, detailLabel, actions])
+        card.orientation = .vertical
+        card.alignment = .leading
+        card.spacing = 7
+        card.edgeInsets = NSEdgeInsets(top: 10, left: 12, bottom: 10, right: 12)
+        card.wantsLayer = true
+        card.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.65).cgColor
+        card.layer?.cornerRadius = 8
+        card.translatesAutoresizingMaskIntoConstraints = false
+        card.widthAnchor.constraint(equalToConstant: 600).isActive = true
+        for arrangedView in card.arrangedSubviews {
+            arrangedView.widthAnchor.constraint(equalTo: card.widthAnchor,
+                                                 constant: -24).isActive = true
+        }
+        return card
     }
 
     private func chordDurationRow() -> NSView {
-        let label = NSTextField(labelWithString: "并击间隔")
+        let label = NSTextField(labelWithString: "组键间隔")
         label.alignment = .right
         label.font = .systemFont(ofSize: 12)
         label.textColor = .secondaryLabelColor
@@ -439,30 +880,43 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         return row
     }
 
-    private func schemaChecklistView() -> NSView {
-        let rows = InputSchemaCatalog.options.compactMap { option -> NSView? in
-            guard let check = schemaChecks[option.id] else { return nil }
-            check.removeFromSuperview()
+    private func inputEncodingSelectionView() -> NSView {
+        radioSelectionView(InputEncoding.allCases.compactMap { encoding in
+            guard let button = encodingRadios[encoding] else { return nil }
+            return button
+        })
+    }
 
-            let detail = NSTextField(labelWithString: option.detail)
-            detail.font = .systemFont(ofSize: 11)
-            detail.textColor = .tertiaryLabelColor
-            detail.lineBreakMode = .byTruncatingTail
+    private func keyingModeSelectionView() -> NSView {
+        radioSelectionView(KeyingMode.allCases.compactMap { mode in
+            guard let button = keyingModeRadios[mode] else { return nil }
+            return button
+        })
+    }
 
-            let row = NSStackView(views: [check, detail])
-            row.orientation = .horizontal
-            row.alignment = .centerY
-            row.spacing = 8
-            return row
-        }
-        let stack = NSStackView(views: rows)
+    private func radioSelectionView(_ buttons: [NSButton]) -> NSView {
+        buttons.forEach { $0.removeFromSuperview() }
+        let stack = NSStackView(views: buttons)
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 8
+        stack.spacing = 10
         return stack
     }
 
-    private func candidateWindowPage() -> NSView {
+    private func appearancePage(subpageID: String) -> NSView {
+        if subpageID == "theme" {
+            appearancePopUp.removeFromSuperview()
+            return contentColumn([
+                title("主题"),
+                caption("主题同时作用于候选窗、缓冲工作台和设置页中的输入法预览。"),
+                spacer(8),
+                sectionLabel("显示模式"),
+                appearancePopUp,
+                spacer(12),
+                inputModeCard(title: "明亮", detail: "浅色表面、深色正文和高对比度边界。", active: true),
+                inputModeCard(title: "暗色", detail: "深色表面、浅色正文；菜单和状态文字使用独立层级色。", active: true),
+            ])
+        }
         let preview = CandidatePreviewView(maxWidth: 620)
         candidatePreview = preview
         return contentColumn([
@@ -472,15 +926,12 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
             sectionLabel("实时预览"),
             preview,
             spacer(16),
-            sectionLabel("主题"),
-            appearancePopUp,
-            spacer(16),
             sectionLabel("尺寸与文字"),
             candidateMetricsView(),
         ])
     }
 
-    private func bufferPage() -> NSView {
+    private func bufferPage(subpageID: String) -> NSView {
         let note = NSTextField(wrappingLabelWithString:
             "缓冲区开启后，Rime 提交内容会进入单行缓冲条；轻按 Enter 发送下一块，长按 1.2 秒或点击主条右侧纸飞机发送全部。成功发送的块会立即消失；发送失败或尚未发送的块不会丢失，也不会保存发送历史。")
         note.font = .systemFont(ofSize: 11)
@@ -492,10 +943,24 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         resetNote.textColor = .tertiaryLabelColor
 
         let secureNote = NSTextField(wrappingLabelWithString:
-            "安全：当系统安全输入生效时，工作台会隐藏正文、禁用发送与编辑，并关闭、擦净块编辑器。此保护始终开启。")
+            "安全：当系统安全输入生效时，工作台会隐藏正文，并禁用发送与插件操作。此保护始终开启。")
         secureNote.font = .systemFont(ofSize: 11)
         secureNote.textColor = .tertiaryLabelColor
 
+        if subpageID == "workbench" {
+            return contentColumn([
+                title("缓冲工作台"),
+                caption("独立、可拖动、可常显的缓冲区窗口；关闭只暂停捕获，不删除已有块。"),
+                spacer(8),
+                sectionLabel("窗口"),
+                bufferWindowVisibleCheck,
+                bufferPinnedCheck,
+                secondaryLabel("候选显示位置"),
+                candidatePlacementPopUp,
+                moveBufferWindowButton,
+                caption("工作台只允许从左侧拖拽手柄移动，其他区域不会拖动窗口。"),
+            ])
+        }
         return contentColumn([
             title("缓冲区"),
             caption("把提交内容先暂存，再由你确认发送到当前输入框。"),
@@ -503,14 +968,6 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
             sectionLabel("模式"),
             bufferCheck,
             note,
-            spacer(16),
-            sectionLabel("窗口"),
-            bufferWindowVisibleCheck,
-            bufferPinnedCheck,
-            secondaryLabel("候选显示位置"),
-            candidatePlacementPopUp,
-            moveBufferWindowButton,
-            caption("关闭工作台会暂停捕获并结束未完成的加载状态，但保留已有缓冲块。"),
             spacer(16),
             sectionLabel("安全与清理"),
             resetOnAppSwitchCheck,
@@ -520,7 +977,10 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         ])
     }
 
-    private func connectionsPage() -> NSView {
+    private func connectionsPage(subpageID: String) -> NSView {
+        if subpageID == "ai-model" {
+            return aiModelConnectionsPage()
+        }
         let applyNameBtn = NSButton(title: "应用名称", target: self, action: #selector(applyRemoteName))
         let nameRow = NSStackView(views: [remoteNameField, applyNameBtn])
         nameRow.orientation = .horizontal
@@ -546,35 +1006,108 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         laterSources.alignment = .leading
         laterSources.spacing = 8
 
+        if subpageID == "local-gateway" {
+            return contentColumn([
+                title("本地网关"),
+                caption("让本机智能体和工具把内容送入缓冲区收件箱；所有内容仍需手动确认。"),
+                spacer(8),
+                sectionLabel("MCP / HTTP 接入"),
+                gatewayEnableCheck,
+                sourcesNote,
+                spacer(6),
+                secondaryLabel("接入配置（标准 MCP，任意客户端通用）"),
+                gatewayConfigField,
+                gatewayCopyConfigButton,
+                spacer(10),
+                cliNote,
+                gatewayCommandField,
+                gatewayCopyButton,
+                spacer(16),
+                sectionLabel("更多来源"),
+                laterSources,
+            ])
+        }
         return contentColumn([
-            title("连接"),
-            caption("配对设备与外部来源的收发与信任，都在这里管理。"),
+            title("隔空传字"),
+            caption("在受信任的 Mac 之间发送文字；配对关系和设备名称在这里维护。"),
             spacer(8),
-            sectionLabel("配对设备（隔空传字）"),
             remoteCheck,
             remoteStatusLabel,
             spacer(8),
             secondaryLabel("本机名称"),
             nameRow,
             spacer(6),
-            secondaryLabel("已配对设备"),
+            secondaryLabel("设备"),
             remoteDevicesStack,
-            spacer(16),
-            sectionLabel("本地网关（MCP / HTTP 接入）"),
-            gatewayEnableCheck,
-            sourcesNote,
-            spacer(6),
-            secondaryLabel("接入配置（标准 MCP，任意客户端通用）"),
-            gatewayConfigField,
-            gatewayCopyConfigButton,
-            spacer(10),
-            cliNote,
-            gatewayCommandField,
-            gatewayCopyButton,
-            spacer(16),
-            sectionLabel("更多来源"),
-            laterSources,
         ])
+    }
+
+    private func aiModelConnectionsPage() -> NSView {
+        let codexReady = CodexCLITextProvider().availability == .ready
+        let claudeReady = ClaudeCodeCLITextProvider().availability == .ready
+        let save = NSButton(title: "保存配置",
+                            target: self,
+                            action: #selector(saveAIModelConfiguration))
+        let clearKey = NSButton(title: "清除密钥",
+                                target: self,
+                                action: #selector(clearAIModelAPIKey))
+        let actions = NSStackView(views: [save, clearKey])
+        actions.orientation = .horizontal
+        actions.alignment = .centerY
+        actions.spacing = 8
+
+        let privacy = NSTextField(wrappingLabelWithString:
+            "Codex CLI 与 Claude Code CLI 在本机启动，但并不代表本地推理：点击生成后，缓冲区全文会通过各自已登录的 CLI 服务发送。OpenAI 兼容 API 插件只会在你点击生成时把全文发送到这里配置的端点。")
+        privacy.font = .systemFont(ofSize: 11)
+        privacy.textColor = .tertiaryLabelColor
+
+        let keyNote = NSTextField(wrappingLabelWithString:
+            "Base URL 应包含 API 前缀（例如 /v1），程序会追加 /chat/completions。远程地址必须使用 HTTPS；HTTP 仅允许 localhost、127.0.0.1 或 ::1。密钥保存在权限为 0600 的本地配置文件，不写入偏好设置或日志。")
+        keyNote.font = .systemFont(ofSize: 11)
+        keyNote.textColor = .tertiaryLabelColor
+
+        return contentColumn([
+            title("AI 模型"),
+            caption("配置三个显式生成型缓冲插件；生成结果进入独立下层缓冲区，由你确认后发送。"),
+            spacer(8),
+            sectionLabel("本地 CLI"),
+            inputModeCard(title: "Codex CLI",
+                          detail: codexReady
+                            ? "使用本机已登录的 codex 命令行；正文只通过标准输入传入。"
+                            : "未找到可执行的 codex 命令，请先安装或配置 RIMEBUFFER_CODEX_PATH。",
+                          active: codexReady,
+                          inactiveLabel: "未找到"),
+            inputModeCard(title: "Claude Code CLI",
+                          detail: claudeReady
+                            ? "使用本机已登录的 claude 命令行；工具调用与会话持久化被关闭。"
+                            : "未找到可执行的 claude 命令，请先安装或配置 RIMEBUFFER_CLAUDE_PATH。",
+                          active: claudeReady,
+                          inactiveLabel: "未找到"),
+            privacy,
+            spacer(16),
+            sectionLabel("OpenAI 兼容 Chat Completions"),
+            labeledSettingsRow("Base URL", control: aiBaseURLField),
+            labeledSettingsRow("模型", control: aiModelField),
+            labeledSettingsRow("API Key", control: aiAPIKeyField),
+            actions,
+            aiConfigurationStatus,
+            keyNote,
+        ])
+    }
+
+    private func labeledSettingsRow(_ labelText: String, control: NSView) -> NSView {
+        control.removeFromSuperview()
+        let label = NSTextField(labelWithString: labelText)
+        label.font = .systemFont(ofSize: 12)
+        label.textColor = .secondaryLabelColor
+        label.alignment = .right
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.widthAnchor.constraint(equalToConstant: 76).isActive = true
+        let row = NSStackView(views: [label, control])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        return row
     }
 
     /// Client-agnostic MCP server config — the `mcpServers` shape Claude Desktop,
@@ -615,28 +1148,177 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         NSPasteboard.general.setString(gatewayCommand(), forType: .string)
     }
 
-    private func processorsPage() -> NSView {
+    @objc private func saveAIModelConfiguration() {
+        window?.makeFirstResponder(nil)
+        do {
+            let previous = try OpenAICompatibleConfigurationStore.shared.load()
+            let enteredKey = aiAPIKeyField.stringValue
+            let configuration = OpenAICompatibleConfiguration(
+                baseURL: aiBaseURLField.stringValue,
+                model: aiModelField.stringValue,
+                apiKey: enteredKey.isEmpty ? (previous?.apiKey ?? "") : enteredKey
+            )
+            try OpenAICompatibleConfigurationStore.shared.save(configuration)
+            refreshAIModelConfiguration(statusMessage: "OpenAI 兼容配置已保存")
+            AITextPluginRuntimeRegistry.shared.workspace(for: .openAICompatible)?
+                .configurationDidChange()
+        } catch let error as AITextProviderError {
+            refreshAIModelConfiguration(statusMessage: error.userFacingMessage,
+                                        isError: true)
+        } catch {
+            refreshAIModelConfiguration(statusMessage: "保存失败，请检查本地目录权限",
+                                        isError: true)
+        }
+    }
+
+    @objc private func clearAIModelAPIKey() {
+        window?.makeFirstResponder(nil)
+        do {
+            guard var configuration = try OpenAICompatibleConfigurationStore.shared.load() else {
+                refreshAIModelConfiguration(statusMessage: "当前没有已保存的密钥")
+                return
+            }
+            configuration.apiKey = ""
+            try OpenAICompatibleConfigurationStore.shared.save(configuration)
+            refreshAIModelConfiguration(statusMessage: "已清除本地 API Key")
+            AITextPluginRuntimeRegistry.shared.workspace(for: .openAICompatible)?
+                .configurationDidChange()
+        } catch {
+            refreshAIModelConfiguration(statusMessage: "清除失败，请检查本地目录权限",
+                                        isError: true)
+        }
+    }
+
+    private func pluginsPage(subpageID: String) -> NSView {
+        let installButton = NSButton(title: "安装…",
+                                     target: self,
+                                     action: #selector(showPluginInstallDialog))
+        let uninstallButton = NSButton(title: "卸载…",
+                                       target: self,
+                                       action: #selector(showPluginUninstallDialog))
+        let manageButton = NSButton(title: "管理…",
+                                    target: self,
+                                    action: #selector(showPluginManagementDialog))
+        for button in [installButton, uninstallButton, manageButton] {
+            button.controlSize = .small
+        }
+        let actions = NSStackView(views: [installButton, uninstallButton, manageButton])
+        actions.orientation = .horizontal
+        actions.alignment = .centerY
+        actions.spacing = 6
+
+        let heading = NSStackView(views: [title("插件"), flexSpacer(), actions])
+        heading.orientation = .horizontal
+        heading.alignment = .centerY
+        heading.spacing = 12
+        heading.translatesAutoresizingMaskIntoConstraints = false
+        heading.widthAnchor.constraint(equalToConstant: 650).isActive = true
+
+        pluginRowsStack.removeFromSuperview()
         let note = NSTextField(wrappingLabelWithString:
-            "处理器在文字发送前对缓冲区内容做变换，结果作为新块回到缓冲区供你确认。以下处理器即将支持。")
+            "缓冲插件一次只运行一个。打开新的插件会自动切换，插件结果仍需在缓冲区确认后发送。")
         note.font = .systemFont(ofSize: 11)
         note.textColor = .tertiaryLabelColor
 
-        let procs = NSStackView(views: [
-            comingSoonRow("翻译", "Apple 设备端翻译，中英互译，本地运行", "M3"),
-            comingSoonRow("AI 润色 / 改写", "OpenAI 兼容接口，流式返回", "M4"),
-        ])
-        procs.orientation = .vertical
-        procs.alignment = .leading
-        procs.spacing = 8
-
-        return contentColumn([
-            title("处理器"),
-            caption("发送前把缓冲区文字翻译或用 AI 改写。"),
+        let showExternal = subpageID == "all" || subpageID == "buffer-plugins"
+        let showBuiltIns = subpageID == "all" || subpageID == "built-in-extensions"
+        var views: [NSView] = [
+            heading,
+            caption("在这里选择当前缓冲插件，或管理随应用提供的内部扩展。"),
             spacer(8),
-            sectionLabel("可用处理器"),
-            note,
-            procs,
-        ])
+        ]
+        if showBuiltIns {
+            let rows = NSStackView()
+            rows.orientation = .vertical
+            rows.alignment = .width
+            rows.spacing = 6
+            let builtIns = PluginRegistry.shared.plugins(source: .builtIn).filter {
+                !$0.descriptor.capabilities.contains(.bufferAction)
+            }
+            for plugin in builtIns {
+                rows.addArrangedSubview(pluginRow(plugin, mode: .enablement))
+            }
+            views.append(sectionLabel("内置扩展"))
+            views.append(rows)
+            if showExternal { views.append(spacer(16)) }
+        }
+        if showExternal {
+            views.append(sectionLabel("缓冲插件"))
+            views.append(note)
+            views.append(pluginRowsStack)
+            views.append(pluginStatusLabel)
+        }
+        return pluginContentColumn(views)
+    }
+
+    private func pluginRow(_ plugin: RegisteredPlugin,
+                           mode: SettingsPluginSwitchMode) -> NSView {
+        let name = NSTextField(labelWithString: plugin.descriptor.name)
+        name.font = .systemFont(ofSize: 13, weight: .semibold)
+        name.lineBreakMode = .byTruncatingTail
+        name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let version = NSTextField(labelWithString: "v\(plugin.descriptor.version)")
+        version.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        version.textColor = .tertiaryLabelColor
+        version.setContentHuggingPriority(.required, for: .horizontal)
+
+        let titleRow = NSStackView(views: [name, version])
+        titleRow.orientation = .horizontal
+        titleRow.alignment = .firstBaseline
+        titleRow.spacing = 6
+
+        let detail = NSTextField(labelWithString: plugin.descriptor.summary)
+        detail.font = .systemFont(ofSize: 10)
+        detail.textColor = .secondaryLabelColor
+        detail.lineBreakMode = .byTruncatingTail
+        detail.toolTip = plugin.descriptor.summary
+        detail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let labels = NSStackView(views: [titleRow, detail])
+        labels.orientation = .vertical
+        labels.alignment = .leading
+        labels.spacing = 2
+        labels.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        labels.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let toggle = SettingsPluginSwitch(frame: .zero)
+        toggle.pluginKey = plugin.descriptor.key
+        toggle.mode = mode
+        toggle.state = mode == .activeBufferPlugin
+            ? (BufferPluginSelectionStore.shared.isSelected(plugin.descriptor.key) ? .on : .off)
+            : (plugin.isEnabled ? .on : .off)
+        toggle.controlSize = .small
+        toggle.target = self
+        toggle.action = #selector(pluginSwitchToggled(_:))
+        toggle.toolTip = mode == .activeBufferPlugin
+            ? (toggle.state == .on ? "关闭当前缓冲插件" : "切换到这个缓冲插件")
+            : (toggle.state == .on ? "停用扩展" : "启用扩展")
+        toggle.setContentHuggingPriority(.required, for: .horizontal)
+
+        let row = NSStackView(views: [labels, flexSpacer(), toggle])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+        row.edgeInsets = NSEdgeInsets(top: 8, left: 11, bottom: 8, right: 10)
+        row.wantsLayer = true
+        row.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.72).cgColor
+        row.layer?.borderColor = NSColor.separatorColor.cgColor
+        row.layer?.borderWidth = 1 / max(window?.backingScaleFactor ?? 2, 1)
+        row.layer?.cornerRadius = 8
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.widthAnchor.constraint(equalToConstant: 650).isActive = true
+        row.heightAnchor.constraint(equalToConstant: 58).isActive = true
+        return row
+    }
+
+    private func pluginContentColumn(_ views: [NSView]) -> NSView {
+        let column = NSStackView(views: views)
+        column.orientation = .vertical
+        column.alignment = .leading
+        column.spacing = 8
+        column.edgeInsets = NSEdgeInsets(top: 22, left: 24, bottom: 22, right: 24)
+        return column
     }
 
     /// A disabled preview row for a not-yet-built connection/processor, with a
@@ -675,15 +1357,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         return row
     }
 
-    private func maintenancePage() -> NSView {
-        let refreshBtn = NSButton(title: "刷新", target: self, action: #selector(refreshStatsTapped))
-        let clearDayBtn = NSButton(title: "清空当天", target: self, action: #selector(clearStatsDay))
-        let clearAllBtn = NSButton(title: "清空全部", target: self, action: #selector(clearStatsAll))
-        let controls = NSStackView(views: [statsDatePicker, refreshBtn, flexSpacer(), clearDayBtn, clearAllBtn])
-        controls.orientation = .horizontal
-        controls.alignment = .centerY
-        controls.spacing = 8
-
+    private func maintenancePage(subpageID: String) -> NSView {
         let checkUpdateBtn = NSButton(title: "检查更新…", target: self, action: #selector(checkUpdate))
         let openLogBtn = NSButton(title: "打开运行日志", target: self, action: #selector(openRuntimeLog))
         let restartBtn = NSButton(title: "重启输入法进程", target: self, action: #selector(restartInputMethod))
@@ -701,9 +1375,32 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         installNote.font = .systemFont(ofSize: 11)
         installNote.textColor = .tertiaryLabelColor
 
+        if subpageID == "logs-data" {
+            let openConfigBtn = NSButton(title: "打开 RimeBuffer 数据目录",
+                                         target: self,
+                                         action: #selector(openDir))
+            let dataNote = NSTextField(wrappingLabelWithString:
+                "配置、词库学习、插件、统计和练习进度都只保存在 ~/Library/RimeBuffer。缓冲区正文与发送历史不会持久化。")
+            dataNote.font = .systemFont(ofSize: 11)
+            dataNote.textColor = .tertiaryLabelColor
+            let logButtons = NSStackView(views: [openLogBtn, openInstallLogBtn])
+            logButtons.orientation = .horizontal
+            logButtons.spacing = 8
+            return contentColumn([
+                title("日志与数据"),
+                caption("查看本地诊断信息和应用数据位置。"),
+                spacer(8),
+                sectionLabel("日志"),
+                logButtons,
+                spacer(16),
+                sectionLabel("本地数据"),
+                openConfigBtn,
+                dataNote,
+            ])
+        }
         return contentColumn([
-            title("维护"),
-            caption("更新、日志、重启、重新安装和本地诊断。"),
+            title("更新与重启"),
+            caption("检查更新、重启输入法进程或从当前源码重新安装。"),
             spacer(8),
             sectionLabel("运行状态"),
             runtimeButtons,
@@ -712,14 +1409,6 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
             installButtons,
             installStatus,
             installNote,
-            spacer(16),
-            sectionLabel("按键统计"),
-            caption("按天统计本输入法收到的物理按键次数；只保存按键计数，不保存输入内容。"),
-            controls,
-            spacer(8),
-            statsSummary,
-            statsTopKey,
-            heatmapView,
         ])
     }
 
@@ -729,22 +1418,13 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         column.alignment = .leading
         column.spacing = 8
         column.edgeInsets = NSEdgeInsets(top: 22, left: 24, bottom: 22, right: 24)
-        column.translatesAutoresizingMaskIntoConstraints = false
-
-        let container = NSView()
-        container.addSubview(column)
-        NSLayoutConstraint.activate([
-            column.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            column.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            column.topAnchor.constraint(equalTo: container.topAnchor),
-            column.bottomAnchor.constraint(lessThanOrEqualTo: container.bottomAnchor),
-        ])
-        return container
+        return column
     }
 
     private func title(_ s: String) -> NSTextField {
         let l = NSTextField(labelWithString: s)
         l.font = .systemFont(ofSize: 20, weight: .semibold)
+        l.alignment = .left
         return l
     }
 
@@ -752,6 +1432,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         let l = NSTextField(wrappingLabelWithString: s)
         l.font = .systemFont(ofSize: 12)
         l.textColor = .secondaryLabelColor
+        l.alignment = .left
         return l
     }
 
@@ -759,6 +1440,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         let l = NSTextField(labelWithString: s)
         l.font = .systemFont(ofSize: 12, weight: .semibold)
         l.textColor = .secondaryLabelColor
+        l.alignment = .left
         return l
     }
 
@@ -766,6 +1448,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         let l = NSTextField(wrappingLabelWithString: s)
         l.font = .systemFont(ofSize: 11)
         l.textColor = .tertiaryLabelColor
+        l.alignment = .left
         return l
     }
 
@@ -834,22 +1517,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     // MARK: State
 
     private func reload() {
-        var enabled = SchemaListStore.enabledIDs(at: userDir.appendingPathComponent("default.custom.yaml"))
-        if enabled.isEmpty {
-            enabled = InputSchemaCatalog.normalized(rimeEngine.schemaList().map(\.id))
-        }
-        if enabled.isEmpty { enabled = InputSchemaCatalog.defaultEnabledIDs }
-        let enabledSet = Set(enabled)
-        for option in InputSchemaCatalog.options {
-            schemaChecks[option.id]?.state = enabledSet.contains(option.id) ? .on : .off
-        }
-        let currentName = StatusMenu.shared.schemaName.isEmpty
-            ? (UserDefaults.standard.string(forKey: "preferredSchema") ?? "尚未载入")
-            : StatusMenu.shared.schemaName
-        currentSchemaLabel.stringValue = "当前：\(currentName) · 按 F4 切换"
-        if schemaApplyStatus.stringValue.isEmpty {
-            schemaApplyStatus.stringValue = "勾选项都会出现在 F4；至少保留一个。"
-        }
+        refreshInputConfigurationSelection()
         bufferCheck.state = BufferModel.shared.enabled ? .on : .off
         bufferWindowVisibleCheck.state = BufferWindowController.shared.isVisible ? .on : .off
         bufferPinnedCheck.state = BufferWindowController.shared.pinned ? .on : .off
@@ -863,6 +1531,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         gatewayEnableCheck.state = LocalGateway.shared.enabled ? .on : .off
         gatewayConfigField.stringValue = gatewayConfigJSON()
         gatewayCommandField.stringValue = gatewayCommand()
+        refreshAIModelConfiguration()
         if let idx = (0..<appearancePopUp.numberOfItems).first(where: {
             appearancePopUp.item(at: $0)?.representedObject as? String == RimeUI.appearance.rawValue
         }) {
@@ -874,8 +1543,103 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         refreshStats()
     }
 
+    private func refreshInputConfigurationSelection() {
+        let inputConfiguration = InputConfigurationStore.shared.configuration
+        for encoding in InputEncoding.allCases {
+            encodingRadios[encoding]?.state = inputConfiguration.encoding == encoding ? .on : .off
+        }
+        for mode in KeyingMode.allCases {
+            keyingModeRadios[mode]?.state = inputConfiguration.keyingMode == mode ? .on : .off
+        }
+    }
+
+    private func refreshAIModelConfiguration(statusMessage: String? = nil,
+                                             isError: Bool = false) {
+        do {
+            let configuration = try OpenAICompatibleConfigurationStore.shared.load()
+            aiBaseURLField.stringValue = configuration?.baseURL ?? ""
+            aiModelField.stringValue = configuration?.model ?? ""
+            aiAPIKeyField.stringValue = ""
+            aiAPIKeyField.placeholderString = configuration?.apiKey.isEmpty == false
+                ? "已保存（留空保持不变）"
+                : "API Key（可留空）"
+            if let statusMessage {
+                aiConfigurationStatus.stringValue = statusMessage
+                aiConfigurationStatus.textColor = isError ? .systemRed : .secondaryLabelColor
+            } else {
+                aiConfigurationStatus.stringValue = configuration == nil
+                    ? "尚未保存 OpenAI 兼容端点"
+                    : "配置已保存在本机"
+                aiConfigurationStatus.textColor = .tertiaryLabelColor
+            }
+        } catch {
+            aiAPIKeyField.stringValue = ""
+            aiAPIKeyField.placeholderString = "无法读取已保存密钥"
+            aiConfigurationStatus.stringValue = statusMessage ?? "读取配置失败，请检查本地文件权限"
+            aiConfigurationStatus.textColor = .systemRed
+        }
+    }
+
+    private func refreshPluginList(statusMessage: String? = nil) {
+        let plugins = PluginRegistry.shared.plugins(capability: .bufferAction)
+        pluginRowsStack.arrangedSubviews.forEach {
+            pluginRowsStack.removeArrangedSubview($0)
+            $0.removeFromSuperview()
+        }
+
+        if plugins.isEmpty {
+            let empty = NSTextField(wrappingLabelWithString:
+                "当前没有可用的缓冲插件。")
+            empty.alignment = .center
+            empty.font = .systemFont(ofSize: 12)
+            empty.textColor = .secondaryLabelColor
+            empty.translatesAutoresizingMaskIntoConstraints = false
+            empty.heightAnchor.constraint(equalToConstant: 58).isActive = true
+            pluginRowsStack.addArrangedSubview(empty)
+        } else {
+            plugins.forEach {
+                pluginRowsStack.addArrangedSubview(
+                    pluginRow($0, mode: .activeBufferPlugin)
+                )
+            }
+        }
+
+        if let statusMessage {
+            setPluginStatus(statusMessage)
+        } else if !pluginDownloadInProgress {
+            let activeName = BufferPluginSelectionStore.shared.activeKey.flatMap { key in
+                plugins.first(where: { $0.descriptor.key == key })?.descriptor.name
+            }
+            setPluginStatus(activeName.map { "当前使用：\($0)" } ?? "当前未打开缓冲插件")
+        }
+    }
+
+    /// Local manager notifications are posted synchronously. Defer and
+    /// coalesce the rebuild so an AppKit control is not removed from its row
+    /// while that control's action selector is still executing.
+    private func schedulePluginListRefresh() {
+        guard !pluginRefreshScheduled else { return }
+        pluginRefreshScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.pluginRefreshScheduled = false
+            guard self.selectedCoreRoute == .plugins else { return }
+            self.refreshPluginList()
+        }
+    }
+
+    private func setPluginDownloadInProgress(_ inProgress: Bool) {
+        pluginDownloadInProgress = inProgress
+    }
+
+    private func setPluginStatus(_ message: String, isError: Bool = false) {
+        pluginStatusLabel.stringValue = message
+        pluginStatusLabel.textColor = isError ? .systemRed : .secondaryLabelColor
+        pluginStatusLabel.toolTip = message
+    }
+
     func remoteStatusDidChange() {
-        guard selectedPage == .connections else { return }
+        guard selectedCoreRoute == .connectors else { return }
         refreshRemoteStatus()
     }
 
@@ -1016,44 +1780,258 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
 
     // MARK: Actions
 
-    @objc private func pageChosen(_ sender: NSButton) {
-        guard let page = Page(rawValue: sender.tag) else { return }
+    @objc private func routeChosen(_ sender: SettingsRouteButton) {
+        guard navigation.selectRoute(sender.routeID, catalog: routeCatalog) else { return }
         reload()
-        showPage(page)
+        showCurrentRoute()
     }
 
-    @objc private func schemaToggled(_ sender: NSButton) {
-        let enabled = selectedSchemaIDs()
-        guard !enabled.isEmpty else {
-            sender.state = .on
-            NSSound.beep()
-            schemaApplyStatus.stringValue = "至少保留一个输入方案。"
+    @objc private func subpageChosen(_ sender: NSSegmentedControl) {
+        guard let route = selectedRoute,
+              route.subpages.indices.contains(sender.selectedSegment) else { return }
+        let subpage = route.subpages[sender.selectedSegment].id
+        guard navigation.selectSubpage(subpage, catalog: routeCatalog) else { return }
+        showCurrentRoute()
+    }
+
+    @objc private func openPluginDirectory() {
+        let directory = ActionPluginManager.shared.rootURL
+        do {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            NSWorkspace.shared.open(directory)
+        } catch {
+            setPluginStatus("无法打开插件目录：\(error.localizedDescription)", isError: true)
+        }
+    }
+
+    @objc private func showPluginInstallDialog() {
+        guard let window, !pluginDownloadInProgress else { return }
+        let alert = NSAlert()
+        alert.messageText = "安装缓冲插件"
+        alert.informativeText = "从本地插件目录、manifest.json 文件，或 HTTPS 清单地址安装。"
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "本地文件…")
+        alert.addButton(withTitle: "HTTPS 地址…")
+        alert.addButton(withTitle: "取消")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self else { return }
+            DispatchQueue.main.async {
+                switch response {
+                case .alertFirstButtonReturn:
+                    self.installLocalPlugin()
+                case .alertSecondButtonReturn:
+                    self.showRemotePluginInstallDialog()
+                default:
+                    break
+                }
+            }
+        }
+    }
+
+    private func showRemotePluginInstallDialog() {
+        guard let window, !pluginDownloadInProgress else { return }
+        let field = NSTextField(string: "")
+        field.placeholderString = "https://example.com/plugin/manifest.json"
+        field.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        field.translatesAutoresizingMaskIntoConstraints = false
+        field.widthAnchor.constraint(equalToConstant: 430).isActive = true
+
+        let alert = NSAlert()
+        alert.messageText = "从 HTTPS 安装"
+        alert.informativeText = "只下载并验证 manifest.json，不会执行安装脚本。"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "安装")
+        alert.addButton(withTitle: "取消")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self, response == .alertFirstButtonReturn else { return }
+            self.installRemotePlugin(from: field.stringValue)
+        }
+    }
+
+    @objc private func showPluginUninstallDialog() {
+        guard let window else { return }
+        let plugins = PluginRegistry.shared.plugins(capability: .bufferAction)
+            .filter(\.descriptor.canUninstall)
+        guard !plugins.isEmpty else {
+            info("当前没有可以卸载的插件。内置插件随应用提供，不能单独卸载。")
+            return
+        }
+
+        let popup = NSPopUpButton()
+        popup.translatesAutoresizingMaskIntoConstraints = false
+        popup.widthAnchor.constraint(equalToConstant: 360).isActive = true
+        for plugin in plugins {
+            popup.addItem(withTitle: "\(plugin.descriptor.name)  ·  v\(plugin.descriptor.version)")
+            popup.lastItem?.representedObject = plugin.descriptor.key.rawID
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "卸载插件"
+        alert.informativeText = "选择要从本机插件目录移除的插件。插件服务及其数据不会被启动或修改。"
+        alert.alertStyle = .warning
+        alert.accessoryView = popup
+        alert.addButton(withTitle: "卸载")
+        alert.addButton(withTitle: "取消")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self,
+                  response == .alertFirstButtonReturn,
+                  let pluginID = popup.selectedItem?.representedObject as? String else { return }
+            self.uninstallPlugin(id: pluginID)
+        }
+    }
+
+    @objc private func showPluginManagementDialog() {
+        guard let window else { return }
+        let bufferPlugins = PluginRegistry.shared.plugins(capability: .bufferAction)
+        let externalCount = bufferPlugins.filter { $0.descriptor.canUninstall }.count
+        let details = NSTextField(wrappingLabelWithString:
+            "缓冲插件：\(bufferPlugins.count)\n外部插件：\(externalCount)\n目录：\(ActionPluginManager.shared.rootURL.path)")
+        details.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        details.textColor = .secondaryLabelColor
+        details.translatesAutoresizingMaskIntoConstraints = false
+        details.widthAnchor.constraint(equalToConstant: 430).isActive = true
+
+        let alert = NSAlert()
+        alert.messageText = "管理插件"
+        alert.informativeText = "刷新插件清单，或在 Finder 中查看外部插件文件。"
+        alert.accessoryView = details
+        alert.addButton(withTitle: "刷新")
+        alert.addButton(withTitle: "打开插件目录")
+        alert.addButton(withTitle: "完成")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self else { return }
+            switch response {
+            case .alertFirstButtonReturn:
+                self.refreshPluginList(statusMessage: "插件列表已刷新")
+                ActionPluginHost.shared.refreshStatuses(force: true)
+            case .alertSecondButtonReturn:
+                self.openPluginDirectory()
+            default:
+                break
+            }
+        }
+    }
+
+    @objc private func installLocalPlugin() {
+        guard let window else { return }
+        let panel = NSOpenPanel()
+        panel.title = "安装工作台插件"
+        panel.message = "选择包含 manifest.json 的目录，或直接选择 manifest.json 文件。"
+        panel.prompt = "安装"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.resolvesAliases = true
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard let self, response == .OK, let source = panel.url else { return }
+            do {
+                let plugin = try ActionPluginManager.shared.installLocal(url: source)
+                self.refreshPluginList(statusMessage: "已安装或更新插件：\(plugin.name)")
+            } catch {
+                self.setPluginStatus("本地安装失败：\(error.localizedDescription)", isError: true)
+                self.refreshPluginList()
+            }
+        }
+    }
+
+    private func installRemotePlugin(from rawValue: String) {
+        guard !pluginDownloadInProgress else { return }
+        let raw = rawValue
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: raw),
+              url.scheme?.lowercased() == "https",
+              !raw.isEmpty else {
+            setPluginStatus("请输入有效的 HTTPS manifest.json 地址", isError: true)
+            return
+        }
+        setPluginDownloadInProgress(true)
+        setPluginStatus("正在下载并验证插件清单…")
+        ActionPluginManager.shared.installRemote(url: url) { [weak self] result in
+            guard let self else { return }
+            self.setPluginDownloadInProgress(false)
+            switch result {
+            case let .success(plugin):
+                self.refreshPluginList(statusMessage: "已安装或更新插件：\(plugin.name)")
+            case let .failure(error):
+                self.setPluginStatus("下载安装失败：\(error.localizedDescription)", isError: true)
+                self.refreshPluginList()
+            }
+        }
+    }
+
+    @objc private func pluginSwitchToggled(_ sender: SettingsPluginSwitch) {
+        let on = sender.state == .on
+        let pluginName = PluginRegistry.shared.allPlugins()
+            .first(where: { $0.descriptor.key == sender.pluginKey })?
+            .descriptor.name ?? sender.pluginKey.rawID
+        do {
+            switch sender.mode {
+            case .activeBufferPlugin:
+                try PluginRegistry.shared.setBufferPluginActive(on,
+                                                                for: sender.pluginKey)
+                setPluginStatus(on ? "已切换到：\(pluginName)" : "已关闭：\(pluginName)")
+            case .enablement:
+                try PluginRegistry.shared.setEnabled(on, for: sender.pluginKey)
+                setPluginStatus(on ? "已启用扩展：\(pluginName)" : "已停用扩展：\(pluginName)")
+            }
+            DispatchQueue.main.async { [weak self] in self?.refreshPluginList() }
+        } catch {
+            setPluginStatus("更新插件状态失败：\(error.localizedDescription)", isError: true)
+            refreshPluginList()
+        }
+    }
+
+    private func uninstallPlugin(id pluginID: String) {
+        guard let plugin = ActionPluginManager.shared.listInstalledPlugins()
+            .first(where: { $0.id == pluginID }) else {
+            setPluginStatus("插件列表已经变化，请刷新后重试", isError: true)
+            refreshPluginList()
             return
         }
         do {
-            try persistSchemaSelection(enabled)
-            schemaApplyStatus.stringValue = "已保存；点击「应用方案并重启」后更新 F4。"
+            try PluginRegistry.shared.setBufferPluginActive(
+                false,
+                for: PluginKey(domain: .externalActionV1, rawID: plugin.id)
+            )
+            try ActionPluginManager.shared.uninstall(id: plugin.id)
+            refreshPluginList(statusMessage: "已卸载插件：\(plugin.name)")
         } catch {
-            reload()
-            info("保存方案失败：\(error.localizedDescription)")
+            setPluginStatus("卸载失败：\(error.localizedDescription)", isError: true)
+            refreshPluginList()
         }
     }
 
-    private func selectedSchemaIDs() -> [String] {
-        InputSchemaCatalog.options.compactMap { option in
-            schemaChecks[option.id]?.state == .on ? option.id : nil
+    @objc private func inputEncodingSelected(_ sender: NSButton) {
+        guard InputEncoding.allCases.indices.contains(sender.tag) else { return }
+        _ = InputConfigurationStore.shared.select(
+            encoding: InputEncoding.allCases[sender.tag]
+        )
+        RimeBufferController.applyStoredInputConfiguration()
+        reload()
+    }
+
+    @objc private func keyingModeSelected(_ sender: NSButton) {
+        guard KeyingMode.allCases.indices.contains(sender.tag) else { return }
+        let selected = KeyingMode.allCases[sender.tag]
+        guard InputConfigurationStore.shared.select(keyingMode: selected) else {
+            NSSound.beep()
+            reload()
+            return
         }
+        RimeBufferController.applyStoredInputConfiguration()
+        reload()
     }
 
     private func persistSchemaSelection(_ ids: [String]? = nil) throws {
-        let enabled = ids ?? selectedSchemaIDs()
+        let enabled = ids ?? InputSchemaCatalog.defaultEnabledIDs
         try SchemaListStore.writeEnabledIDs(enabled,
                                             to: userDir.appendingPathComponent("default.custom.yaml"))
-        let preferred = UserDefaults.standard.string(forKey: "preferredSchema") ?? ""
-        if !enabled.contains(preferred), let fallback = enabled.first {
-            UserDefaults.standard.set(fallback, forKey: "preferredSchema")
-            IMELog.write("settings: disabled preferred schema \(preferred); fallback -> \(fallback)")
-        }
+        let preferred = InputConfigurationStore.shared.runtimeProfile.schemaID
+        UserDefaults.standard.set(preferred, forKey: "preferredSchema")
         IMELog.write("settings: F4 schemas -> \(enabled.joined(separator: ","))")
     }
 
@@ -1075,7 +2053,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
                     self.info("部署失败，输入法没有重启。请查看运行日志。")
                     return
                 }
-                KeyFrequencyStore.shared.saveNow()
+                InputMetricsPersistence.saveNow()
                 exit(0)   // text-input system relaunches us
             }
         }
@@ -1095,7 +2073,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
         RimeBufferController.active?.forceCommit()
-        KeyFrequencyStore.shared.saveNow()
+        InputMetricsPersistence.saveNow()
 
         let command = [
             "cd \(shellQuote(script.deletingLastPathComponent().path))",
@@ -1136,9 +2114,12 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
 
     @objc private func bufferToggled() {
         let enabled = bufferCheck.state == .on
-        BufferModel.shared.enabled = enabled
         if enabled {
+            BufferModel.shared.enabled = true
             BufferWindowController.shared.show()
+        } else {
+            ActionPluginHost.shared.cancelActiveInvocationForWorkbench()
+            BufferModel.shared.pauseCapturePreservingContent()
         }
         RimeBufferController.refreshActiveUI()
         reload()
@@ -1147,7 +2128,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
 
     @objc private func bufferWindowVisibilityToggled() {
         if bufferWindowVisibleCheck.state == .on {
-            BufferWindowController.shared.show()
+            BufferWindowController.shared.openAndResume()
         } else {
             BufferWindowController.shared.closeAndPause()
         }
@@ -1167,7 +2148,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
     }
 
     @objc private func moveBufferWindow() {
-        BufferWindowController.shared.show()
+        BufferWindowController.shared.openAndResume()
         BufferWindowController.shared.moveToCurrentScreen()
         reload()
     }
@@ -1289,6 +2270,66 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
         refreshStats()
     }
 
+    @objc private func importUserLexicon(_ sender: SettingsLexiconButton) {
+        let kind = sender.lexiconKind
+        let panel = NSOpenPanel()
+        panel.title = "导入\(kind.displayName)"
+        panel.message = "选择由 ETInput 或 Rime 用户词典管理器导出的 TSV；记录会合并，不会替换现有学习数据。"
+        panel.prompt = "选择并导入"
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.tabSeparatedText, .plainText]
+        guard panel.runModal() == .OK, let sourceURL = panel.url else { return }
+
+        let confirmation = NSAlert()
+        confirmation.alertStyle = .informational
+        confirmation.messageText = "合并到\(kind.displayName)？"
+        confirmation.informativeText = "Rime 会短暂收束当前组字并重新建立输入会话；已有词频不会被清空。"
+        confirmation.addButton(withTitle: "导入并合并")
+        confirmation.addButton(withTitle: "取消")
+        guard confirmation.runModal() == .alertFirstButtonReturn else { return }
+
+        do {
+            let result = try UserLexiconService.shared.importLearningData(kind,
+                                                                          from: sourceURL)
+            info("已向\(kind.displayName)合并 \(result.entryCount) 条学习记录。")
+            showCurrentRoute()
+        } catch {
+            showLexiconError(error, operation: "导入")
+        }
+    }
+
+    @objc private func exportUserLexicon(_ sender: SettingsLexiconButton) {
+        let kind = sender.lexiconKind
+        let panel = NSSavePanel()
+        panel.title = "导出\(kind.displayName)"
+        panel.message = "导出为可再次导入的 UTF-8 TSV，不包含基础词库、输入正文或其他统计。"
+        panel.prompt = "导出"
+        panel.nameFieldStringValue = kind.suggestedFileName
+        panel.canCreateDirectories = true
+        panel.allowedContentTypes = [.tabSeparatedText]
+        guard panel.runModal() == .OK, let destinationURL = panel.url else { return }
+
+        do {
+            let result = try UserLexiconService.shared.exportLearningData(kind,
+                                                                          to: destinationURL)
+            info("已导出 \(result.entryCount) 条\(kind.displayName)记录。")
+            NSWorkspace.shared.activateFileViewerSelecting([destinationURL])
+        } catch {
+            showLexiconError(error, operation: "导出")
+        }
+    }
+
+    private func showLexiconError(_ error: Error, operation: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "学习词库\(operation)失败"
+        alert.informativeText = (error as? LocalizedError)?.errorDescription
+            ?? error.localizedDescription
+        alert.runModal()
+    }
+
     @objc private func openDir() {
         NSWorkspace.shared.open(userDir)
     }
@@ -1304,7 +2345,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate {
 
     @objc private func restartInputMethod() {
         RimeBufferController.active?.forceCommit()
-        KeyFrequencyStore.shared.saveNow()
+        InputMetricsPersistence.saveNow()
         IMELog.write("settings: restart requested")
         exit(0)
     }

@@ -20,6 +20,42 @@ if CommandLine.arguments.contains("schema-smoke") {
 if CommandLine.arguments.contains("marine-bridge-smoke") {
     exit(runMarineBridgeSmokeTest() ? 0 : 1)
 }
+if CommandLine.arguments.contains("plugin-stream-smoke") {
+    exit(runActionPluginStreamSmokeTest() ? 0 : 1)
+}
+if CommandLine.arguments.contains("plugin-smoke") {
+    exit(runActionPluginSmokeTest() ? 0 : 1)
+}
+if CommandLine.arguments.contains("plugin-platform-smoke") {
+    exit(runPluginPlatformSmokeTest() ? 0 : 1)
+}
+if CommandLine.arguments.contains("translation-smoke") {
+    exit(runTranslationPluginSmokeTest() ? 0 : 1)
+}
+if CommandLine.arguments.contains("ai-text-smoke") {
+    exit(runAITextPluginSmokeTest() ? 0 : 1)
+}
+if CommandLine.arguments.contains("settings-routing-smoke") {
+    exit(runSettingsRoutingSmokeTest() ? 0 : 1)
+}
+if CommandLine.arguments.contains("history-heatmap-smoke") {
+    exit(runHistoryHeatmapSmokeTest() ? 0 : 1)
+}
+if CommandLine.arguments.contains("typing-speed-smoke") {
+    exit(runTypingSpeedStoreSmokeTest() ? 0 : 1)
+}
+if CommandLine.arguments.contains("fly-chord-learning-smoke") {
+    exit(runFlyChordLearningSmokeTest() ? 0 : 1)
+}
+if CommandLine.arguments.contains("input-telemetry-smoke") {
+    exit(runInputTelemetrySmokeTest() ? 0 : 1)
+}
+if CommandLine.arguments.contains("user-lexicon-smoke") {
+    exit(runUserLexiconServiceSmokeTest() ? 0 : 1)
+}
+if CommandLine.arguments.contains("user-lexicon-bridge-smoke") {
+    exit(runRimeUserLexiconBridgeSmokeTest() ? 0 : 1)
+}
 if CommandLine.arguments.contains("remote-smoke") {
     exit(runRemoteSmokeTest() ? 0 : 1)
 }
@@ -60,10 +96,21 @@ if CommandLine.arguments.contains("--prepare-update") {
 // the user's live typing. So the dev GUI tools redirect to an isolated userdb
 // (unless the caller already pinned RIMEBUFFER_USER_DIR).
 func isolatePreviewUserDir() {
-    guard ProcessInfo.processInfo.environment["RIMEBUFFER_USER_DIR"] == nil else { return }
-    let dir = NSTemporaryDirectory() + "rimebuffer-preview"
+    let environment = ProcessInfo.processInfo.environment
+    let dir = environment["RIMEBUFFER_USER_DIR"] ?? (
+        NSTemporaryDirectory()
+            + "rimebuffer-preview-\(ProcessInfo.processInfo.processIdentifier)"
+    )
     try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-    setenv("RIMEBUFFER_USER_DIR", dir, 1)
+    if environment["RIMEBUFFER_USER_DIR"] == nil {
+        setenv("RIMEBUFFER_USER_DIR", dir, 1)
+    }
+    if environment["RIMEBUFFER_LOCAL_DATA_ROOT"] == nil {
+        setenv("RIMEBUFFER_LOCAL_DATA_ROOT", dir, 1)
+    }
+    if environment["RIMEBUFFER_PLUGIN_ROOT"] == nil {
+        setenv("RIMEBUFFER_PLUGIN_ROOT", dir + "/plugins", 1)
+    }
 }
 
 // Dev-only: show the Settings window standalone (no IMK) so it can be reviewed
@@ -77,7 +124,7 @@ if CommandLine.arguments.contains("settings-preview") {
     app.activate(ignoringOtherApps: true)
     app.run()
 }
-// Dev-only: `ETInput settings-render <dir>` writes page-N.png for every page.
+// Dev-only: render every stable route/subpage plus manifest.json.
 if let i = CommandLine.arguments.firstIndex(of: "settings-render"),
    i + 1 < CommandLine.arguments.count {
     isolatePreviewUserDir()
@@ -85,12 +132,11 @@ if let i = CommandLine.arguments.firstIndex(of: "settings-render"),
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
     app.finishLaunching()
-    for page in 0..<6 {
-        SettingsWindowController.shared.renderForPreview(
-            pageIndex: page, to: "\(dir)/page-\(page).png")
-    }
-    print("rendered settings pages to \(dir)")
-    exit(0)
+    let rendered = SettingsWindowController.shared.renderAllForPreview(to: dir)
+    print(rendered
+        ? "rendered settings routes to \(dir)"
+        : "failed to render one or more settings routes")
+    exit(rendered ? 0 : 1)
 }
 // Dev-only: `ETInput panel-render <path>` renders the actual compact workbench.
 if let i = CommandLine.arguments.firstIndex(of: "panel-render"),
@@ -104,18 +150,29 @@ if let i = CommandLine.arguments.firstIndex(of: "panel-render"),
     model.stageExternal("这次", origin: .rime)
     model.append("做了", origin: .mcp(client: "preview"))
     model.append("缓冲工作台", origin: .remotePeer(deviceID: "preview"))
-    let expanded = i + 2 < CommandLine.arguments.count
-        && CommandLine.arguments[i + 2] == "expanded"
-    let scale: CGFloat = i + 3 < CommandLine.arguments.count
-        ? CGFloat(Double(CommandLine.arguments[i + 3]) ?? 2)
-        : 2
+    let options = Array(CommandLine.arguments.dropFirst(i + 2))
+    let expanded = options.contains("expanded")
+    let translation = options.contains("translation")
+    let scaleValue = options.first { Double($0) != nil }.flatMap { Double($0) }
+    let scale = CGFloat(scaleValue ?? 2)
+    let translationSnapshot = translation ? TranslationRailSnapshot(
+        sourceText: "今天终于把翻译缓冲区分成上下两个区域了。",
+        outputBlocks: [
+            TranslationOutputBlock(id: UUID(),
+                                   text: "Today the translation buffer is finally split"),
+            TranslationOutputBlock(id: UUID(),
+                                   text: "into two vertically stacked areas."),
+        ],
+        phase: .ready
+    ) : nil
     let rendered = BufferWindowController.shared.renderForPreview(
         to: CommandLine.arguments[i + 1],
         expanded: expanded,
-        scale: scale
+        scale: scale,
+        translationSnapshot: translationSnapshot
     )
     print(rendered
-        ? "rendered \(expanded ? "expanded" : "collapsed") workbench @\(scale)x"
+        ? "rendered \(translation ? "translation " : "")\(expanded ? "expanded" : "collapsed") workbench @\(scale)x"
         : "failed to render workbench")
     exit(rendered ? 0 : 1)
 }
@@ -139,6 +196,21 @@ if CommandLine.arguments.contains("gateway-serve") {
 
 // IMK bootstrap. The connection name MUST match Info.plist; IMK finds our
 // controller via InputMethodServerControllerClass = RimeBufferController.
+// Start enabled built-in observers before the first controller can receive a
+// key. The registry is discovery/enablement only; external Action Plugin
+// execution and revocation remain owned by ActionPluginHost/Manager.
+let pluginRegistry = PluginRegistry.shared
+BufferPluginSelectionStore.shared.migrateDefaultIfNeeded(
+    from: pluginRegistry.plugins(capability: .bufferAction)
+)
+let bufferPluginSelectionObserver = NotificationCenter.default.addObserver(
+    forName: .activeBufferPluginDidChange,
+    object: BufferPluginSelectionStore.shared,
+    queue: .main
+) { _ in
+    ActionPluginHost.shared.bufferPluginSelectionDidChange()
+    BufferWindowController.shared.refresh()
+}
 IMELog.reset("=== Enter输入法 (ETInput) IME launch ===")
 let connectionName = (Bundle.main.infoDictionary?["InputMethodConnectionName"] as? String)
     ?? "RimeBuffer_1_Connection"
@@ -153,6 +225,10 @@ if imkServer == nil {
     IMELog.write("FATAL: IMKServer(name: \(connectionName)) returned nil — exiting")
     exit(1)
 }
+// A Carbon hot key is process-global and remains independent from IMK's normal
+// Command-key passthrough. Retain the controller for the entire server lifetime.
+let globalHotKeyController = GlobalHotKeyController.shared
+_ = globalHotKeyController.install()
 // Warm the engine so the first keystroke isn't slow / so failures surface early.
 _ = rimeEngine.start()
 
@@ -183,10 +259,15 @@ BufferModel.shared.onChange = {
     }
 }
 InputFocusCoordinator.shared.onChange = {
+    ActionPluginHost.shared.focusDidChange()
     BufferWindowController.shared.refresh()
 }
 InputFocusCoordinator.shared.onInvalidated = { owner in
     candidateWindow.hide(owner: owner)
+    ActionPluginHost.shared.focusInvalidated(owner)
+}
+ActionPluginHost.shared.onChange = {
+    BufferWindowController.shared.refresh()
 }
 BufferWindowController.shared.showOnLaunchIfNeeded()
 
@@ -327,7 +408,7 @@ NotificationCenter.default.addObserver(
     object: NSApp,
     queue: .main
 ) { _ in
-    KeyFrequencyStore.shared.saveNow()
+    InputMetricsPersistence.saveNow()
 }
 
 IMELog.write("bootstrap done: server=\(imkServer != nil) engineHealthy=\(rimeEngine.isHealthy)")
@@ -625,6 +706,254 @@ func runEngineSmokeTest() -> Bool {
         print("FAILED: cannot return to my_combo")
         return false
     }
+    engine.clearComposition(session: session)
+    engine.setOption("ascii_mode", true, session: session)
+    let asciiLetterHandled = engine.processKey(0x61, session: session)
+    let asciiLetterContext = engine.getContext(session: session)
+    let asciiLetterCommit = engine.takeCommit(session: session)
+    guard !FlyChordRoutingRules.shouldStage(schemaID: "my_combo", asciiMode: true),
+          !asciiLetterHandled,
+          asciiLetterContext.input.isEmpty,
+          asciiLetterCommit == nil else {
+        print("FAILED: my_combo ASCII mode must pass Latin keys through immediately",
+              asciiLetterHandled, asciiLetterContext.input,
+              asciiLetterCommit ?? "<nil>")
+        return false
+    }
+    engine.setOption("ascii_mode", false, session: session)
+
+    func typeFlyChordStrokes(_ strokes: [String], clearComposition: Bool = true)
+        -> (context: RimeContextModel, allPressesHandled: Bool) {
+        if clearComposition {
+            engine.clearComposition(session: session)
+        }
+        var allPressesHandled = true
+        var pairing = FlyChordMutualPairingState()
+        for stroke in strokes {
+            let keys = stroke.unicodeScalars.map {
+                FlyChordKeyEvent(keycode: Int32($0.value), mask: 0)
+            }
+            let shapedKeys = keys.map { (keycode: $0.keycode, mask: $0.mask) }
+            guard let shape = FlyChordBatchShape(keys: shapedKeys) else {
+                return (engine.getContext(session: session), false)
+            }
+            let contextBefore = engine.getContext(session: session)
+            var engineKeys = keys
+            var boundaryPlan = FlyChordBoundaryRules.plan(for: contextBefore)
+            if let previousLeft = pairing.takeComplement(
+                before: shape,
+                policy: .independentHalves,
+                currentContext: contextBefore
+            ) {
+                for _ in 0..<previousLeft.insertedScalarCount {
+                    if !engine.processKey(RimeKey.backspace, session: session) {
+                        allPressesHandled = false
+                    }
+                }
+                guard engine.getContext(session: session).input == previousLeft.baseInput else {
+                    return (engine.getContext(session: session), false)
+                }
+                engineKeys = previousLeft.keys + keys
+                boundaryPlan = previousLeft.boundaryPlan
+            }
+            if boundaryPlan.before,
+               !engine.processKey(FlyChordBoundaryRules.delimiterKeycode,
+                                  session: session) {
+                allPressesHandled = false
+            }
+            for key in engineKeys {
+                if !engine.processKey(key.keycode, mask: key.mask, session: session) {
+                    allPressesHandled = false
+                }
+            }
+            for key in engineKeys {
+                if !engine.processKey(key.keycode,
+                                      mask: key.mask | RimeKey.releaseMask,
+                                      session: session) {
+                    allPressesHandled = false
+                }
+            }
+            if boundaryPlan.after,
+               !engine.processKey(FlyChordBoundaryRules.delimiterKeycode,
+                                  session: session) {
+                allPressesHandled = false
+            }
+            pairing.recordSettledLeft(
+                keys: keys,
+                baseInput: contextBefore.input,
+                settledContext: engine.getContext(session: session),
+                boundaryPlan: boundaryPlan,
+                policy: .independentHalves,
+                shape: shape
+            )
+        }
+        return (engine.getContext(session: session), allPressesHandled)
+    }
+
+    let flyYaoCases: [(name: String, combined: [String], split: [String], expected: String)] = [
+        ("compound initial", ["dvi"], ["dv", "i"], "你"),
+        ("exact alias segmentation", ["fo"], ["f", "o"], "佛"),
+        ("contextual ing/uai", ["gy"], ["g", "y"], "怪"),
+        ("contextual ong/iong", ["qkm"], ["q", "km"], "穷"),
+        ("compound final", ["efuo"], ["ef", "uo"], "双"),
+        ("literal period", ["qm."], ["q", "m."], "却"),
+        ("zero initial", ["xvo"], ["xv", "o"], "哦"),
+        ("contextual zero initial", ["eui"], ["e", "ui"], "而"),
+        ("closed alias lve", ["sdm."], ["sd", "m."], "略"),
+        ("multi-syllable boundary", ["qkm", "dvi"], ["q", "km", "dv", "i"], "穷你"),
+    ]
+    let forbiddenAlternateSegmentation: [String: Set<String>] = [
+        "exact alias segmentation": ["服", "夫", "父"],
+        "zero initial": ["欧", "偶", "呕"],
+        "closed alias lve": ["路", "露", "卤鹅"],
+    ]
+    for test in flyYaoCases {
+        let combined = typeFlyChordStrokes(test.combined)
+        let split = typeFlyChordStrokes(test.split)
+        let combinedTexts = combined.context.candidates.map(\.text)
+        let splitTexts = split.context.candidates.map(\.text)
+        print("FlyYao \(test.name): combined=\(combined.context.preedit) split=\(split.context.preedit)")
+        guard combined.allPressesHandled,
+              split.allPressesHandled,
+              combined.context.input == split.context.input,
+              combined.context.preedit == split.context.preedit,
+              combinedTexts == splitTexts,
+              forbiddenAlternateSegmentation[test.name, default: []]
+                .isDisjoint(with: splitTexts),
+              combinedTexts.contains(test.expected),
+              splitTexts.contains(test.expected) else {
+            print("FAILED: FlyYao combined/split mismatch",
+                  test.combined, test.split, test.expected,
+                  combinedTexts, splitTexts)
+            return false
+        }
+    }
+
+    let explicitTwoSyllables = typeFlyChordStrokes(["fu", "xvo"])
+    guard explicitTwoSyllables.allPressesHandled,
+          explicitTwoSyllables.context.preedit == "fu'o",
+          !explicitTwoSyllables.context.input.contains("J"),
+          !explicitTwoSyllables.context.candidates.map(\.text).contains("佛") else {
+        print("FAILED: FlyYao preserved-stroke boundary for fu'o",
+              explicitTwoSyllables.context.preedit,
+              explicitTwoSyllables.context.candidates.map(\.text))
+        return false
+    }
+
+    let ambiguousSyllableBoundaries: [(
+        combined: [String], split: [String], expected: String
+    )] = [
+        (["dvi", "an"], ["dv", "i", "a", "n"], "ni'an"),
+        (["ah", "ah"], ["a", "h", "a", "h"], "ang'ang"),
+    ]
+    for test in ambiguousSyllableBoundaries {
+        let combined = typeFlyChordStrokes(test.combined)
+        let split = typeFlyChordStrokes(test.split)
+        guard combined.allPressesHandled,
+              split.allPressesHandled,
+              combined.context.input == test.expected,
+              split.context.input == test.expected,
+              combined.context.preedit == test.expected,
+              split.context.preedit == test.expected,
+              combined.context.candidates.map(\.text)
+                == split.context.candidates.map(\.text) else {
+            print("FAILED: FlyYao explicit syllable boundary",
+                  test.combined, test.split, test.expected,
+                  combined.context.input, split.context.input,
+                  combined.context.preedit, split.context.preedit)
+            return false
+        }
+    }
+
+    _ = typeFlyChordStrokes(["an"])
+    guard engine.processKey(RimeKey.home, session: session) else {
+        print("FAILED: FlyYao cursor smoke cannot move Home")
+        return false
+    }
+    let insertedAtStart = typeFlyChordStrokes(["dvi"], clearComposition: false)
+    guard insertedAtStart.allPressesHandled,
+          insertedAtStart.context.input == "ni'an",
+          insertedAtStart.context.preedit == "ni'an" else {
+        print("FAILED: FlyYao leading cursor syllable boundary",
+              insertedAtStart.context.input, insertedAtStart.context.preedit)
+        return false
+    }
+
+    _ = typeFlyChordStrokes(["an"])
+    guard engine.processKey(RimeKey.home, session: session),
+          engine.processKey(RimeKey.right, session: session) else {
+        print("FAILED: FlyYao cursor smoke cannot move into raw input")
+        return false
+    }
+    let insertedInMiddle = typeFlyChordStrokes(["dvi"], clearComposition: false)
+    guard insertedInMiddle.allPressesHandled,
+          insertedInMiddle.context.input == "a'ni'n",
+          insertedInMiddle.context.preedit == "a'ni'n" else {
+        print("FAILED: FlyYao two-sided cursor syllable boundary",
+              insertedInMiddle.context.input, insertedInMiddle.context.preedit)
+        return false
+    }
+
+    do {
+        let schema = try FlyChordSchemaParser.loadDefault()
+        let crossMappings = schema.mappings.filter { mapping in
+            let halves = Set(mapping.chord.unicodeScalars.compactMap {
+                FlyChordLayout.half(for: Int32($0.value))
+            })
+            return halves == Set([.left, .right])
+        }
+        guard crossMappings.count > 300 else {
+            print("FAILED: FlyYao exhaustive mapping set is incomplete", crossMappings.count)
+            return false
+        }
+        for mapping in crossMappings {
+            let left = String(mapping.chord.filter { character in
+                let scalar = String(character).unicodeScalars.first!
+                return FlyChordLayout.half(for: Int32(scalar.value)) == .left
+            })
+            let right = String(mapping.chord.filter { character in
+                let scalar = String(character).unicodeScalars.first!
+                return FlyChordLayout.half(for: Int32(scalar.value)) == .right
+            })
+            let combined = typeFlyChordStrokes([mapping.chord])
+            let split = typeFlyChordStrokes([left, right])
+            let combinedTexts = combined.context.candidates.map(\.text)
+            let splitTexts = split.context.candidates.map(\.text)
+            guard combined.allPressesHandled,
+                  split.allPressesHandled,
+                  combined.context.input == split.context.input,
+                  combined.context.preedit == split.context.preedit,
+                  combinedTexts == splitTexts else {
+                print("FAILED: FlyYao exhaustive combined/split mismatch",
+                      mapping.chord, mapping.output,
+                      combined.context.preedit, split.context.preedit,
+                      combined.context.candidates.map(\.text),
+                      split.context.candidates.map(\.text))
+                return false
+            }
+        }
+        print("FlyYao exhaustive combined/split mappings:", crossMappings.count)
+    } catch {
+        print("FAILED: FlyYao exhaustive schema parse", error)
+        return false
+    }
+
+    let splitBeforeBackspace = typeFlyChordStrokes(["f", "o"])
+    let splitBackspaceHandled = engine.processKey(RimeKey.backspace, session: session)
+    let splitAfterBackspace = engine.getContext(session: session)
+    let combinedBeforeBackspace = typeFlyChordStrokes(["fo"])
+    let combinedBackspaceHandled = engine.processKey(RimeKey.backspace, session: session)
+    let combinedAfterBackspace = engine.getContext(session: session)
+    guard splitBeforeBackspace.context.input == combinedBeforeBackspace.context.input,
+          splitBackspaceHandled == combinedBackspaceHandled,
+          splitAfterBackspace.input == combinedAfterBackspace.input,
+          splitAfterBackspace.preedit == combinedAfterBackspace.preedit,
+          splitAfterBackspace.candidates.map(\.text)
+            == combinedAfterBackspace.candidates.map(\.text) else {
+        print("FAILED: FlyYao split/combo BackSpace semantics",
+              splitAfterBackspace.input, combinedAfterBackspace.input)
+        return false
+    }
 
     // F4 owns schema switching. The configured members/order were asserted
     // above; this additionally proves the switcher key enters Rime's menu.
@@ -648,6 +977,244 @@ func runSchemaListStoreSmokeTest() -> Bool {
         .appendingPathComponent("rimebuffer-schema-list-\(UUID().uuidString)")
     let config = root.appendingPathComponent("default.custom.yaml")
     defer { try? FileManager.default.removeItem(at: root) }
+
+    let expectedProfiles: [(InputConfiguration, String, RuntimeInputProfile.LexiconFamily)] = [
+        (.init(encoding: .naturalDoublePinyin, keyingMode: .sequential),
+         "double_pinyin", .chinese),
+        (.init(encoding: .fullPinyin, keyingMode: .sequential),
+         "rime_ice", .chinese),
+        (.init(encoding: .fullPinyin, keyingMode: .chord),
+         "my_combo", .chinese),
+        (.init(encoding: .fullPinyin, keyingMode: .mutual),
+         "my_combo", .chinese),
+        (.init(encoding: .english, keyingMode: .sequential),
+         "english", .english),
+    ]
+    for (configuration, schemaID, lexicon) in expectedProfiles {
+        guard let profile = InputConfigurationResolver.profile(for: configuration),
+              profile.schemaID == schemaID,
+              profile.lexiconFamily == lexicon else {
+            print("FAILED: input configuration mapping", configuration, schemaID)
+            return false
+        }
+    }
+    let chordSelection = InputConfigurationResolver.selecting(
+        .chord,
+        from: .init(encoding: .english, keyingMode: .sequential)
+    )
+    let naturalSelection = InputConfigurationResolver.selecting(
+        .naturalDoublePinyin,
+        from: .init(encoding: .fullPinyin, keyingMode: .chord)
+    )
+    let mutualSelection = InputConfigurationResolver.selecting(
+        .mutual,
+        from: .init(encoding: .english, keyingMode: .sequential)
+    )
+    guard chordSelection == .init(encoding: .fullPinyin, keyingMode: .chord),
+          naturalSelection == .init(encoding: .naturalDoublePinyin,
+                                    keyingMode: .sequential),
+          mutualSelection == .init(encoding: .fullPinyin, keyingMode: .mutual),
+          InputConfigurationResolver.profile(schemaID: "my_combo")?.configuration
+            == .init(encoding: .fullPinyin, keyingMode: .mutual) else {
+        print("FAILED: input configuration reducer")
+        return false
+    }
+
+    func chordKey(_ character: Character) -> FlyChordKeyEvent {
+        FlyChordKeyEvent(
+            keycode: Int32(String(character).unicodeScalars.first!.value),
+            mask: 0
+        )
+    }
+    let leftQ = chordKey("q")
+    let rightY = chordKey("y")
+    var strictLeftOnly = FlyChordBatchState()
+    let strictLeftDecision = strictLeftOnly.stage(leftQ, policy: .bothHalvesRequired)
+    let strictLeftReplay = strictLeftOnly.settle()
+
+    var strictCross = FlyChordBatchState()
+    let strictFirstDecision = strictCross.stage(leftQ, policy: .bothHalvesRequired)
+    let strictSecondDecision = strictCross.stage(rightY, policy: .bothHalvesRequired)
+    strictCross.noteHandled(leftQ)
+    strictCross.noteHandled(rightY)
+    let strictCrossReplay = strictCross.settle()
+
+    var mutualLeft = FlyChordBatchState()
+    let mutualLeftDecision = mutualLeft.stage(leftQ, policy: .independentHalves)
+    mutualLeft.noteHandled(leftQ)
+    let mutualLeftReplay = mutualLeft.settle()
+
+    var mutualRight = FlyChordBatchState()
+    let mutualRightDecision = mutualRight.stage(rightY, policy: .independentHalves)
+    mutualRight.noteHandled(rightY)
+    let mutualRightReplay = mutualRight.settle()
+    var pairingBoundary = FlyChordMutualPairingState()
+    var settledLeftContext = RimeContextModel()
+    settledLeftContext.input = "q"
+    settledLeftContext.preedit = "q"
+    settledLeftContext.cursorPos = 1
+    settledLeftContext.selStart = 1
+    settledLeftContext.selEnd = 1
+    pairingBoundary.recordSettledLeft(
+        keys: [leftQ],
+        baseInput: "",
+        settledContext: settledLeftContext,
+        boundaryPlan: .init(before: false, after: false),
+        policy: .independentHalves,
+        shape: .leftOnly
+    )
+    let immediateComplement = pairingBoundary.takeComplement(
+        before: .rightOnly,
+        policy: .independentHalves,
+        currentContext: settledLeftContext
+    )
+    pairingBoundary.recordSettledLeft(
+        keys: [leftQ],
+        baseInput: "",
+        settledContext: settledLeftContext,
+        boundaryPlan: .init(before: false, after: false),
+        policy: .independentHalves,
+        shape: .leftOnly
+    )
+    pairingBoundary.reset() // models apostrophe/edit/candidate/focus boundary
+    let complementAfterBoundary = pairingBoundary.takeComplement(
+        before: .rightOnly,
+        policy: .independentHalves,
+        currentContext: settledLeftContext
+    )
+    var pairingAfterCursorMove = FlyChordMutualPairingState()
+    pairingAfterCursorMove.recordSettledLeft(
+        keys: [leftQ],
+        baseInput: "",
+        settledContext: settledLeftContext,
+        boundaryPlan: .init(before: false, after: false),
+        policy: .independentHalves,
+        shape: .leftOnly
+    )
+    var movedCursorContext = settledLeftContext
+    movedCursorContext.cursorPos = 0
+    movedCursorContext.selStart = 0
+    movedCursorContext.selEnd = 0
+    let complementAfterCursorMove = pairingAfterCursorMove.takeComplement(
+        before: .rightOnly,
+        policy: .independentHalves,
+        currentContext: movedCursorContext
+    )
+    let expectedComplement = FlyChordMutualPairingState.SettledLeft(
+        keys: [leftQ],
+        baseInput: "",
+        settledInput: "q",
+        settledCursorPos: 1,
+        settledSelStart: 1,
+        settledSelEnd: 1,
+        boundaryPlan: .init(before: false, after: false),
+        insertedScalarCount: 1
+    )
+
+    guard FlyChordLayout.half(for: leftQ.keycode) == .left,
+          FlyChordLayout.half(for: rightY.keycode) == .right,
+          FlyChordLayout.half(for: RimeKey.space) == nil,
+          strictLeftDecision == .consume,
+          strictLeftReplay.isEmpty,
+          strictFirstDecision == .consume,
+          strictSecondDecision == .process([leftQ, rightY]),
+          strictCrossReplay == [leftQ, rightY],
+          mutualLeftDecision == .process([leftQ]),
+          mutualLeftReplay == [leftQ],
+          mutualRightDecision == .process([rightY]),
+          mutualRightReplay == [rightY],
+          immediateComplement == expectedComplement,
+          complementAfterBoundary == nil,
+          complementAfterCursorMove == nil,
+          FlyChordRoutingRules.shouldStage(schemaID: "my_combo", asciiMode: false),
+          !FlyChordRoutingRules.shouldStage(schemaID: "my_combo", asciiMode: true),
+          !FlyChordRoutingRules.shouldStage(schemaID: "english", asciiMode: false),
+          FlyChordBoundaryRules.plan(for: settledLeftContext)
+            == .init(before: true, after: false),
+          FlyChordBoundaryRules.plan(for: movedCursorContext)
+            == .init(before: false, after: true),
+          FlyChordInputRollback.insertedScalarCount(before: "ni", after: "nshi") == 2,
+          FlyChordInputRollback.insertedScalarCount(before: "ni", after: "ni") == 0,
+          FlyChordInputRollback.insertedScalarCount(before: "ni", after: "n") == nil,
+          FlyChordInputRollback.insertedScalarCount(before: "ni", after: "na") == nil else {
+        print("FAILED: FlyYao chord/mutual batching policy")
+        return false
+    }
+
+    let defaultsName = "RimeBuffer.InputConfigurationSmoke.\(UUID().uuidString)"
+    guard let defaults = UserDefaults(suiteName: defaultsName) else {
+        print("FAILED: input configuration defaults suite")
+        return false
+    }
+    defer { defaults.removePersistentDomain(forName: defaultsName) }
+    let canonicalLegacyProfiles: [(String, InputConfiguration)] = [
+        ("double_pinyin", .init(encoding: .naturalDoublePinyin,
+                                keyingMode: .sequential)),
+        ("rime_ice", .init(encoding: .fullPinyin, keyingMode: .sequential)),
+        ("my_combo", .init(encoding: .fullPinyin, keyingMode: .mutual)),
+        ("english", .init(encoding: .english, keyingMode: .sequential)),
+    ]
+    for (schemaID, configuration) in canonicalLegacyProfiles {
+        defaults.removePersistentDomain(forName: defaultsName)
+        defaults.set(schemaID, forKey: "preferredSchema")
+        let store = InputConfigurationStore(defaults: defaults)
+        guard store.configuration == configuration,
+              store.runtimeProfile.schemaID == schemaID else {
+            print("FAILED: legacy preferredSchema migration", schemaID)
+            return false
+        }
+    }
+
+    // A v1 FlyYao selection was necessarily labelled chord.  It migrates once
+    // to mutual; an explicit strict-chord choice made under v2 remains strict.
+    defaults.removePersistentDomain(forName: defaultsName)
+    defaults.set(InputEncoding.fullPinyin.rawValue,
+                 forKey: "input.configuration.encoding.v1")
+    defaults.set(KeyingMode.chord.rawValue,
+                 forKey: "input.configuration.keyingMode.v1")
+    defaults.set("my_combo", forKey: "preferredSchema")
+    let migratedFlyYaoStore = InputConfigurationStore(defaults: defaults)
+    guard migratedFlyYaoStore.configuration
+            == .init(encoding: .fullPinyin, keyingMode: .mutual) else {
+        print("FAILED: legacy FlyYao chord-to-mutual migration")
+        return false
+    }
+
+    defaults.removePersistentDomain(forName: defaultsName)
+    defaults.set(InputEncoding.fullPinyin.rawValue,
+                 forKey: "input.configuration.encoding.v1")
+    defaults.set(KeyingMode.chord.rawValue,
+                 forKey: "input.configuration.keyingMode.v1")
+    defaults.set(99, forKey: "input.configuration.keyingMode.semantics.v2")
+    defaults.set("my_combo", forKey: "preferredSchema")
+    let strictFlyYaoStore = InputConfigurationStore(defaults: defaults)
+    guard strictFlyYaoStore.configuration
+            == .init(encoding: .fullPinyin, keyingMode: .chord),
+          strictFlyYaoStore.adoptRuntimeSchema("my_combo"),
+          strictFlyYaoStore.configuration
+            == .init(encoding: .fullPinyin, keyingMode: .chord),
+          defaults.integer(forKey: "input.configuration.keyingMode.semantics.v2") == 99,
+          InputConfigurationStore(defaults: defaults).configuration
+            == .init(encoding: .fullPinyin, keyingMode: .chord),
+          strictFlyYaoStore.adoptRuntimeSchema("rime_ice"),
+          strictFlyYaoStore.configuration
+            == .init(encoding: .fullPinyin, keyingMode: .sequential),
+          strictFlyYaoStore.adoptRuntimeSchema("my_combo"),
+          strictFlyYaoStore.configuration
+            == .init(encoding: .fullPinyin, keyingMode: .mutual) else {
+        print("FAILED: explicit strict FlyYao selection was not preserved")
+        return false
+    }
+
+    defaults.removePersistentDomain(forName: defaultsName)
+    defaults.set("unknown", forKey: "preferredSchema")
+    let fallbackStore = InputConfigurationStore(defaults: defaults)
+    guard fallbackStore.configuration == .defaultValue,
+          fallbackStore.select(keyingMode: .mutual),
+          fallbackStore.configuration == .defaultValue else {
+        print("FAILED: invalid configuration fallback")
+        return false
+    }
 
     do {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -934,9 +1501,10 @@ func runInboundBusSmokeTest() -> Bool {
     model.enabled = true
     model.discardForPrivacy(); bus.clear()
 
-    // Trust defaults: mcp/http = ask, marine = trusted.
+    // Trust defaults: mcp/http/plugin = ask, marine = trusted.
     guard bus.trust(for: .mcp(client: "x")) == .ask,
           bus.trust(for: .http(source: "s")) == .ask,
+          bus.trust(for: .plugin(id: "example")) == .ask,
           bus.trust(for: .marine) == .trusted else {
         print("FAILED: trust defaults wrong")
         return false
@@ -1012,12 +1580,1194 @@ func runInboundBusSmokeTest() -> Bool {
     return true
 }
 
+private final class ActionPluginURLProtocolStub: URLProtocol {
+    static var handler: ((URLRequest) throws -> (Int, Data))?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        do {
+            guard let handler = Self.handler,
+                  let url = request.url else {
+                throw ActionPluginHTTPError.invalidResponse
+            }
+            let (status, data) = try handler(request)
+            let response = HTTPURLResponse(url: url,
+                                           statusCode: status,
+                                           httpVersion: "HTTP/1.1",
+                                           headerFields: ["Content-Type": "application/json"])!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+}
+
+private final class ActionPluginTransportStub: ActionPluginTransport {
+    var statusResult: Result<ActionPluginStatus, Error>
+    var invokeResult: Result<ActionPluginInvokeResponse, Error>
+    var holdInvoke = false
+    var holdStatus = false
+    private(set) var statusRequestCount = 0
+    private(set) var invokeRequestCount = 0
+    private(set) var statusBindings: [ActionPluginRuntimeBinding?] = []
+    private(set) var invokeBindings: [ActionPluginRuntimeBinding] = []
+    let defaultBinding: ActionPluginRuntimeBinding
+    private var pendingInvokes: [(
+        completion: (Result<ActionPluginInvokeResponse, Error>) -> Void,
+        result: Result<ActionPluginInvokeResponse, Error>
+    )] = []
+    private var pendingStatus: (
+        completion: (Result<ActionPluginStatusSnapshot, Error>) -> Void,
+        result: Result<ActionPluginStatusSnapshot, Error>
+    )?
+
+    init(status: ActionPluginStatus,
+         response: ActionPluginInvokeResponse,
+         binding: ActionPluginRuntimeBinding? = nil) {
+        statusResult = .success(status)
+        invokeResult = .success(response)
+        defaultBinding = binding ?? ActionPluginRuntimeBinding(
+            config: ActionPluginRuntimeConfig(pluginId: "example",
+                                              apiBase: "http://127.0.0.1:47701/v1/plugin",
+                                              token: "stub-token",
+                                              updatedAt: 1,
+                                              instanceId: "stub-instance",
+                                              processId: 1)
+        )
+    }
+
+    func fetchStatus(plugin: InstalledActionPlugin,
+                     action: ActionPluginDefinition,
+                     binding: ActionPluginRuntimeBinding?,
+                     completion: @escaping (Result<ActionPluginStatusSnapshot, Error>) -> Void) {
+        statusRequestCount += 1
+        statusBindings.append(binding)
+        let resolvedBinding = binding ?? defaultBinding
+        let result = statusResult.map {
+            ActionPluginStatusSnapshot(value: $0, binding: resolvedBinding)
+        }
+        if holdStatus {
+            pendingStatus = (completion, result)
+        } else {
+            completion(result)
+        }
+    }
+
+    func invoke(plugin: InstalledActionPlugin,
+                action: ActionPluginDefinition,
+                binding: ActionPluginRuntimeBinding,
+                request payload: ActionPluginInvokeRequest,
+                onStreamEvent: @escaping (ActionPluginStreamEvent) -> Void,
+                completion: @escaping (Result<ActionPluginInvokeResponse, Error>) -> Void)
+        -> ActionPluginInvocationCancellable? {
+        invokeRequestCount += 1
+        invokeBindings.append(binding)
+        let result = invokeResult.map { template in
+            ActionPluginInvokeResponse(requestId: payload.requestId,
+                                       actionId: payload.actionId,
+                                       contextId: payload.contextId,
+                                       blocks: template.blocks,
+                                       targetSummary: template.targetSummary)
+        }
+        if holdInvoke {
+            pendingInvokes.append((completion, result))
+        } else {
+            completion(result)
+        }
+        return nil
+    }
+
+    func completeHeldInvoke() {
+        guard !pendingInvokes.isEmpty else { return }
+        let pending = pendingInvokes.removeFirst()
+        pending.completion(pending.result)
+    }
+
+    func completeHeldStatus() {
+        let pending = pendingStatus
+        pendingStatus = nil
+        guard let pending else { return }
+        pending.completion(pending.result)
+    }
+}
+
+private final class ActionPluginFocusBox {
+    var token: FocusToken?
+    var secureInput = false
+
+    var access: ActionPluginFocusAccess {
+        ActionPluginFocusAccess(
+            currentToken: { [weak self] in self?.token },
+            isValid: { [weak self] expected in self?.token == expected },
+            secureInputEnabled: { [weak self] in self?.secureInput ?? true }
+        )
+    }
+}
+
+private final class ActionPluginLoaderBox {
+    var plugins: [InstalledActionPlugin]
+
+    init(_ plugins: [InstalledActionPlugin]) {
+        self.plugins = plugins
+    }
+
+    func load(_: URL) -> [InstalledActionPlugin] { plugins }
+}
+
+private func runMainLoopUntil(timeout: TimeInterval = 1,
+                              _ predicate: () -> Bool) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    repeat {
+        if predicate() { return true }
+        _ = RunLoop.main.run(mode: .default,
+                             before: min(deadline, Date().addingTimeInterval(0.01)))
+    } while Date() < deadline
+    return predicate()
+}
+
+private func runContextualActionPresentationSmokeTest() -> Bool {
+    let presentationId = "contextual.generate-comment"
+    let presentationKey = ActionPluginPresentationKey(
+        pluginId: "contextual",
+        presentationId: presentationId
+    )
+    let directAction = ActionPluginDefinition(
+        id: "contextual.generate-direct",
+        title: "生成直评",
+        symbol: "bubble.left.and.text.bubble.right",
+        statusPath: "/status",
+        invokePath: "/invoke",
+        modes: ["direct"],
+        presentationId: presentationId,
+        presentationTitle: "生成评论"
+    )
+    let replyAction = ActionPluginDefinition(
+        id: "contextual.generate-reply",
+        title: "生成回复",
+        symbol: "arrowshape.turn.up.left",
+        statusPath: "/status",
+        invokePath: "/invoke",
+        modes: ["reply"],
+        presentationId: presentationId,
+        presentationTitle: "生成评论"
+    )
+    let manifest = ActionPluginManifest(
+        schemaVersion: 1,
+        id: "contextual",
+        name: "Contextual",
+        version: "1",
+        runtimeConfigPaths: ["runtime.json"],
+        actions: [directAction, replyAction]
+    )
+    guard ActionPluginManifestLoader.validate(manifest) else {
+        print("FAILED: contextual presentation manifest validation")
+        return false
+    }
+    let overlappingAction = ActionPluginDefinition(
+        id: "contextual.generate-overlap",
+        title: "错误重叠动作",
+        symbol: "exclamationmark.triangle",
+        statusPath: "/status",
+        invokePath: "/invoke",
+        modes: ["direct"],
+        presentationId: presentationId,
+        presentationTitle: "生成评论"
+    )
+    let overlappingManifest = ActionPluginManifest(
+        schemaVersion: manifest.schemaVersion,
+        id: manifest.id,
+        name: manifest.name,
+        version: manifest.version,
+        runtimeConfigPaths: manifest.runtimeConfigPaths,
+        actions: [directAction, overlappingAction]
+    )
+    guard !ActionPluginManifestLoader.validate(overlappingManifest) else {
+        print("FAILED: contextual presentation accepted overlapping modes")
+        return false
+    }
+    let plugin = InstalledActionPlugin(
+        manifest: manifest,
+        directory: URL(fileURLWithPath: "/tmp/contextual.etplugin", isDirectory: true)
+    )
+    let binding = ActionPluginRuntimeBinding(config: ActionPluginRuntimeConfig(
+        pluginId: "contextual",
+        apiBase: "http://127.0.0.1:47701/v1/plugin",
+        token: "contextual-token",
+        updatedAt: 1,
+        instanceId: "contextual-instance",
+        processId: 1
+    ))
+    func status(available: Bool,
+                contextId: String?,
+                mode: String?,
+                actionId: String,
+                label: String) -> ActionPluginStatus {
+        ActionPluginStatus(available: available,
+                           contextId: contextId,
+                           mode: mode,
+                           actionId: actionId,
+                           label: label,
+                           targetSummary: "目标评论",
+                           updatedAt: Date().timeIntervalSince1970)
+    }
+    let unavailable = status(available: false,
+                             contextId: nil,
+                             mode: nil,
+                             actionId: directAction.id,
+                             label: "等待评论框")
+    let response = ActionPluginInvokeResponse(
+        requestId: "template",
+        actionId: directAction.id,
+        contextId: "ctx-direct",
+        blocks: [ActionPluginResultBlock(text: "生成内容", title: nil)],
+        targetSummary: "目标评论"
+    )
+    let transport = ActionPluginTransportStub(status: unavailable,
+                                              response: response,
+                                              binding: binding)
+    let focusBox = ActionPluginFocusBox()
+    var epochs = FocusEpochState()
+    focusBox.token = epochs.activate()
+    let model = BufferModel()
+    let host = ActionPluginHost(
+        rootURL: URL(fileURLWithPath: "/tmp/contextual-plugin-root", isDirectory: true),
+        client: transport,
+        focus: focusBox.access,
+        bufferModel: model,
+        inboundBus: InboundBus(),
+        pluginLoader: { _ in [plugin] },
+        runtimeBindingIsCurrent: { _, candidate in candidate == binding }
+    )
+    var changeCount = 0
+    host.onChange = { changeCount += 1 }
+    host.refreshStatuses(force: true)
+    guard runMainLoopUntil({ changeCount > 0 }),
+          host.presentations.count == 1,
+          host.presentations[0].title == "生成评论",
+          host.presentations[0].presentationKey == presentationKey,
+          host.presentations[0].key.actionId == directAction.id,
+          host.presentations[0].canInvoke == false else {
+        print("FAILED: contextual action must remain one disabled control without a target")
+        return false
+    }
+
+    transport.statusResult = .success(status(available: true,
+                                             contextId: "ctx-direct",
+                                             mode: "direct",
+                                             actionId: directAction.id,
+                                             label: "生成直评"))
+    host.refreshStatuses(force: true)
+    guard runMainLoopUntil({
+        host.presentations.count == 1
+            && host.presentations[0].canInvoke
+            && host.presentations[0].presentationKey == presentationKey
+            && host.presentations[0].key.actionId == directAction.id
+    }) else {
+        print("FAILED: contextual presentation did not select direct action")
+        return false
+    }
+
+    transport.statusResult = .success(status(available: true,
+                                             contextId: "ctx-reply",
+                                             mode: "reply",
+                                             actionId: replyAction.id,
+                                             label: "生成回复"))
+    host.refreshStatuses(force: true)
+    guard runMainLoopUntil({
+        host.presentations.count == 1
+            && host.presentations[0].title == "生成评论"
+            && host.presentations[0].canInvoke
+            && host.presentations[0].presentationKey == presentationKey
+            && host.presentations[0].key.actionId == replyAction.id
+    }) else {
+        print("FAILED: contextual presentation did not switch its action id")
+        return false
+    }
+
+    host.invoke(host.presentations[0].key)
+    guard runMainLoopUntil({ model.blocks.count == 1 }),
+          model.blocks[0].pluginMetadata?.actionId == replyAction.id else {
+        print("FAILED: unified contextual control invoked the wrong action")
+        return false
+    }
+    return true
+}
+
+func runActionPluginSmokeTest() -> Bool {
+    print("== RimeBuffer action plugin smoke test ==")
+    guard runActionPluginManagerSmokeTest() else { return false }
+    guard runActionPluginStreamSmokeTest() else { return false }
+    guard runContextualActionPresentationSmokeTest() else { return false }
+    let fileManager = FileManager.default
+    let root = fileManager.temporaryDirectory
+        .appendingPathComponent("rimebuffer-plugin-smoke-\(UUID().uuidString)",
+                                isDirectory: true)
+    let pluginDirectory = root.appendingPathComponent("example.etplugin", isDirectory: true)
+    let fakeHome = root.appendingPathComponent("home", isDirectory: true)
+    do {
+        try fileManager.createDirectory(at: pluginDirectory,
+                                        withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: fakeHome,
+                                        withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: root) }
+
+        let manifest = #"""
+        {
+          "schemaVersion": 1,
+          "id": "example",
+          "name": "Example",
+          "version": "1.0.0",
+          "runtimeConfigPaths": ["symlink-runtime.json", "borrowed-runtime.json", "runtime.json", "old-runtime.json"],
+          "actions": [{
+            "id": "example.generate",
+            "title": "生成",
+            "symbol": "sparkles",
+            "statusPath": "/status",
+            "invokePath": "/invoke",
+            "modes": ["direct", "reply"]
+          }]
+        }
+        """#
+        try Data(manifest.utf8).write(
+            to: pluginDirectory.appendingPathComponent("manifest.json"),
+            options: .atomic
+        )
+        try Data(#"{"pluginId":"example","apiBase":"http://localhost:47701/v1/plugin","token":"old","updatedAt":1}"#.utf8)
+            .write(to: fakeHome.appendingPathComponent("old-runtime.json"), options: .atomic)
+        try Data(#"{"pluginId":"example","apiBase":"http://localhost:47701/v1/plugin","token":"old","updatedAt":1}"#.utf8)
+            .write(to: pluginDirectory.appendingPathComponent("old-runtime.json"), options: .atomic)
+        try Data(#"{"pluginId":"example","apiBase":"http://127.0.0.1:47701/v1/plugin","token":"new","updatedAt":2}"#.utf8)
+            .write(to: pluginDirectory.appendingPathComponent("runtime.json"), options: .atomic)
+        try Data(#"{"pluginId":"other","apiBase":"http://127.0.0.1:47701/v1/plugin","token":"borrowed","updatedAt":3}"#.utf8)
+            .write(to: pluginDirectory.appendingPathComponent("borrowed-runtime.json"), options: .atomic)
+        try fileManager.createSymbolicLink(
+            at: pluginDirectory.appendingPathComponent("symlink-runtime.json"),
+            withDestinationURL: pluginDirectory.appendingPathComponent("runtime.json")
+        )
+        let invalidDirectory = root.appendingPathComponent("invalid.etplugin", isDirectory: true)
+        try fileManager.createDirectory(at: invalidDirectory, withIntermediateDirectories: true)
+        try Data(#"{"schemaVersion":2,"id":"invalid","name":"Invalid","runtimeConfigPaths":["runtime.json"],"actions":[{"id":"invalid.action","title":"Invalid","symbol":"xmark","statusPath":"/status","invokePath":"/invoke","modes":[]}] }"#.utf8)
+            .write(to: invalidDirectory.appendingPathComponent("manifest.json"), options: .atomic)
+
+        let loaded = ActionPluginManifestLoader.load(from: root)
+        guard loaded.count == 1,
+              loaded[0].manifest.id == "example",
+              loaded[0].manifest.actions.count == 1,
+              let config = ActionPluginManifestLoader.runtimeConfig(
+                for: loaded[0], homeDirectory: fakeHome
+              ),
+              config.pluginId == "example",
+              config.token == "new",
+              config.updatedAt == 2 else {
+            print("FAILED: manifest discovery/runtime config precedence")
+            return false
+        }
+
+        guard ActionPluginManifestLoader.expandedPath(
+                "~/old-runtime.json",
+                pluginDirectory: pluginDirectory,
+                homeDirectory: fakeHome
+              ) == fakeHome.appendingPathComponent("old-runtime.json"),
+              ActionPluginManifestLoader.expandedPath(
+                "../escaped-runtime.json",
+                pluginDirectory: pluginDirectory,
+                homeDirectory: fakeHome
+              ) == nil,
+              ActionPluginManifestLoader.expandedPath(
+                "nested/../runtime.json",
+                pluginDirectory: pluginDirectory,
+                homeDirectory: fakeHome
+              ) == pluginDirectory.appendingPathComponent("runtime.json").standardizedFileURL,
+              ActionPluginHTTPClient.isAllowedLoopbackBase(config.apiBase),
+              !ActionPluginHTTPClient.isAllowedLoopbackBase("https://example.com/plugin"),
+              !ActionPluginHTTPClient.isAllowedLoopbackBase("http://localhost.evil.test/plugin"),
+              !ActionPluginHTTPClient.isAllowedLoopbackBase("http://localhost:99999/plugin"),
+              !ActionPluginHTTPClient.isAllowedLoopbackBase("http://localhost/plugin?redirect=evil"),
+              let request = ActionPluginHTTPClient.makeRequest(
+                config: config,
+                path: "/status",
+                method: "GET",
+                timeout: 1.5
+              ),
+              request.url?.absoluteString == "http://127.0.0.1:47701/v1/plugin/status",
+              request.cachePolicy == .reloadIgnoringLocalCacheData,
+              request.httpShouldHandleCookies == false,
+              request.value(forHTTPHeaderField: "Cache-Control") == "no-store",
+              request.value(forHTTPHeaderField: "Authorization") == "Bearer new" else {
+            print("FAILED: tilde expansion/loopback/Bearer request contract")
+            return false
+        }
+
+        var responseBuffer = ActionPluginResponseBuffer()
+        let maximumResponseBytes = ActionPluginHTTPClient.maximumResponseBytes
+        guard responseBuffer.append(Data(repeating: 0x61,
+                                         count: maximumResponseBytes),
+                                    maximumBytes: maximumResponseBytes),
+              !responseBuffer.append(Data([0x62]),
+                                     maximumBytes: maximumResponseBytes),
+              responseBuffer.data.count == maximumResponseBytes else {
+            print("FAILED: streaming response cap must reject before appending overflow")
+            return false
+        }
+
+        let status = try JSONDecoder().decode(
+            ActionPluginStatus.self,
+            from: Data(#"{"available":true,"contextId":"ctx-1","mode":"reply","actionId":"example.generate","label":"回复 @用户","targetSummary":"原评论","updatedAt":3}"#.utf8)
+        )
+        let action = loaded[0].manifest.actions[0]
+        var focusEpochs = FocusEpochState()
+        let firstFocus = focusEpochs.activate()
+        let secondFocus = focusEpochs.activate()
+        guard ActionPluginRoutingRules.statusMatches(status,
+                                                     action: action,
+                                                     contextId: "ctx-1"),
+              !ActionPluginRoutingRules.statusMatches(status,
+                                                      action: action,
+                                                      contextId: "ctx-2"),
+              ActionPluginRoutingRules.focusBindingMatches(
+                bound: secondFocus,
+                current: secondFocus
+              ),
+              !ActionPluginRoutingRules.focusBindingMatches(
+                bound: firstFocus,
+                current: secondFocus
+              ),
+              !ActionPluginRoutingRules.focusBindingMatches(
+                bound: nil,
+                current: secondFocus
+              ) else {
+            print("FAILED: status/action/context/focus matching")
+            return false
+        }
+
+        let response = try JSONDecoder().decode(
+            ActionPluginInvokeResponse.self,
+            from: Data(#"{"requestId":"req-1","actionId":"example.generate","contextId":"ctx-1","blocks":[{"text":"生成的话术","title":"回复 @用户"}],"targetSummary":"原评论"}"#.utf8)
+        )
+        guard response.blocks.first?.text == "生成的话术",
+              ActionPluginRoutingRules.shouldStageDirect(
+                responseMatches: true,
+                focusValid: true,
+                currentStatusMatches: true,
+                invocationMarkedStale: false
+              ),
+              !ActionPluginRoutingRules.shouldStageDirect(
+                responseMatches: true,
+                focusValid: false,
+                currentStatusMatches: true,
+                invocationMarkedStale: false
+              ),
+              !ActionPluginRoutingRules.shouldStageDirect(
+                responseMatches: true,
+                focusValid: true,
+                currentStatusMatches: false,
+                invocationMarkedStale: false
+              ),
+              !ActionPluginRoutingRules.shouldStageDirect(
+                responseMatches: false,
+                focusValid: true,
+                currentStatusMatches: true,
+                invocationMarkedStale: false
+              ) else {
+            print("FAILED: safe result routing predicate")
+            return false
+        }
+
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.protocolClasses = [ActionPluginURLProtocolStub.self]
+        let httpClient = ActionPluginHTTPClient(
+            session: URLSession(configuration: sessionConfiguration)
+        )
+        func bodyData(from request: URLRequest) -> Data? {
+            if let body = request.httpBody { return body }
+            guard let stream = request.httpBodyStream else { return nil }
+            stream.open()
+            defer { stream.close() }
+            var data = Data()
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            while stream.hasBytesAvailable {
+                let count = stream.read(&buffer, maxLength: buffer.count)
+                guard count >= 0 else { return nil }
+                if count == 0 { break }
+                data.append(buffer, count: count)
+            }
+            return data
+        }
+        let requestLock = NSLock()
+        var observedHTTPRequests: [String] = []
+        ActionPluginURLProtocolStub.handler = { request in
+            let authorization = request.value(forHTTPHeaderField: "Authorization") ?? ""
+            requestLock.lock()
+            observedHTTPRequests.append("\(request.httpMethod ?? "") \(request.url?.host ?? "") \(authorization)")
+            requestLock.unlock()
+            switch (request.httpMethod, request.url?.path) {
+            case ("GET", "/v1/plugin/status"):
+                if authorization == "Bearer new" {
+                    return (401, Data(#"{"error":"stale runtime"}"#.utf8))
+                }
+                guard authorization == "Bearer old" else {
+                    return (401, Data(#"{"error":"unauthorized"}"#.utf8))
+                }
+                return (200, Data(#"{"available":true,"contextId":"ctx-1","mode":"reply","actionId":"example.generate","label":"回复 @用户","targetSummary":"原评论","updatedAt":3}"#.utf8))
+            case ("POST", "/v1/plugin/invoke"):
+                guard authorization == "Bearer old",
+                      request.url?.host == "localhost",
+                      let body = bodyData(from: request),
+                      let payload = try? JSONDecoder().decode(ActionPluginInvokeRequest.self,
+                                                              from: body),
+                      payload == ActionPluginInvokeRequest(requestId: "req-1",
+                                                           actionId: "example.generate",
+                                                           contextId: "ctx-1") else {
+                    return (400, Data(#"{"error":"bad request"}"#.utf8))
+                }
+                return (200, Data(#"{"requestId":"req-1","actionId":"example.generate","contextId":"ctx-1","blocks":[{"text":"生成的话术","title":"回复 @用户"}],"targetSummary":"原评论"}"#.utf8))
+            default:
+                return (404, Data(#"{"error":"not found"}"#.utf8))
+            }
+        }
+        defer { ActionPluginURLProtocolStub.handler = nil }
+
+        let statusSemaphore = DispatchSemaphore(value: 0)
+        var fetchedSnapshot: ActionPluginStatusSnapshot?
+        httpClient.fetchStatus(plugin: loaded[0], action: action, binding: nil) { result in
+            fetchedSnapshot = try? result.get()
+            statusSemaphore.signal()
+        }
+        guard statusSemaphore.wait(timeout: .now() + 2) == .success,
+              fetchedSnapshot?.value == status,
+              fetchedSnapshot?.binding.config.token == "old",
+              observedHTTPRequests.prefix(2).elementsEqual([
+                "GET 127.0.0.1 Bearer new",
+                "GET localhost Bearer old",
+              ]) else {
+            print("FAILED: status must fall back newest-to-oldest and retain successful binding")
+            return false
+        }
+
+        // A new runtime file appearing after status cannot redirect the invoke
+        // to another Marine instance; the successful status binding is exact.
+        try Data(#"{"pluginId":"example","apiBase":"http://127.0.0.1:47701/v1/plugin","token":"newest","updatedAt":99}"#.utf8)
+            .write(to: pluginDirectory.appendingPathComponent("runtime.json"), options: .atomic)
+
+        let invokeSemaphore = DispatchSemaphore(value: 0)
+        var fetchedResponse: ActionPluginInvokeResponse?
+        _ = httpClient.invoke(
+            plugin: loaded[0],
+            action: action,
+            binding: fetchedSnapshot!.binding,
+            request: ActionPluginInvokeRequest(requestId: "req-1",
+                                               actionId: "example.generate",
+                                               contextId: "ctx-1")
+        ) { _ in
+            // Legacy JSON invokes must not produce incremental events.
+        } completion: { result in
+            fetchedResponse = try? result.get()
+            invokeSemaphore.signal()
+        }
+        guard invokeSemaphore.wait(timeout: .now() + 2) == .success,
+              fetchedResponse == response,
+              observedHTTPRequests.last == "POST localhost Bearer old" else {
+            print("FAILED: invoke must use the exact successful status binding")
+            return false
+        }
+
+        // Exercise the real host lifecycle with injectable focus/transport.
+        // No request may run merely because the workbench or browser target
+        // appeared; invocation remains an explicit user action.
+        let isolatedModel = BufferModel()
+        let isolatedBus = InboundBus()
+        let focusBox = ActionPluginFocusBox()
+        let transport = ActionPluginTransportStub(status: status, response: response)
+        let workbenchFirst = ActionPluginHost(rootURL: root,
+                                              client: transport,
+                                              focus: focusBox.access,
+                                              bufferModel: isolatedModel,
+                                              inboundBus: isolatedBus,
+                                              runtimeBindingIsCurrent: { _, candidate in
+                                                  candidate == transport.defaultBinding
+                                              })
+        var hostChangeCount = 0
+        workbenchFirst.onChange = { hostChangeCount += 1 }
+
+        workbenchFirst.refreshStatuses(force: true)
+        guard runMainLoopUntil(timeout: 1, { hostChangeCount > 0 }),
+              workbenchFirst.presentations.first?.canInvoke == false,
+              transport.invokeRequestCount == 0 else {
+            print("FAILED: workbench-first must wait for a focused target")
+            return false
+        }
+
+        focusBox.token = firstFocus
+        workbenchFirst.focusDidChange()
+        workbenchFirst.refreshStatuses(force: true)
+        guard runMainLoopUntil(timeout: 1, {
+            workbenchFirst.presentations.first?.canInvoke == true
+        }), transport.invokeRequestCount == 0 else {
+            print("FAILED: workbench-first target should enable without auto-invoking")
+            return false
+        }
+
+        // Target-first: constructing/showing the host after focus exists must
+        // converge to the same enabled action.
+        let targetFirstModel = BufferModel()
+        let targetFirstBus = InboundBus()
+        let targetFirstTransport = ActionPluginTransportStub(status: status,
+                                                             response: response)
+        var targetRuntimeIsCurrent = true
+        var targetFirstPluginSelected = true
+        let targetFirst = ActionPluginHost(rootURL: root,
+                                           client: targetFirstTransport,
+                                           focus: focusBox.access,
+                                           bufferModel: targetFirstModel,
+                                           inboundBus: targetFirstBus,
+                                           pluginIsSelected: { _ in
+                                               targetFirstPluginSelected
+                                           },
+                                           runtimeBindingIsCurrent: { _, candidate in
+                                               targetRuntimeIsCurrent
+                                                   && candidate == targetFirstTransport.defaultBinding
+                                           })
+        targetFirst.refreshStatuses(force: true)
+        guard runMainLoopUntil(timeout: 1, {
+            targetFirst.presentations.first?.canInvoke == true
+        }), targetFirstTransport.invokeRequestCount == 0,
+           let targetFirstKey = targetFirst.presentations.first?.key else {
+            print("FAILED: target-first should enable without auto-invoking")
+            return false
+        }
+
+        // A cached context observed under focus A is unusable under focus B,
+        // even before the next status poll completes.
+        focusBox.token = secondFocus
+        targetFirst.focusDidChange()
+        let invokesBeforeStaleTap = targetFirstTransport.invokeRequestCount
+        targetFirst.invoke(targetFirstKey)
+        guard targetFirst.presentations.first?.canInvoke == false,
+              targetFirstTransport.invokeRequestCount == invokesBeforeStaleTap else {
+            print("FAILED: cached status crossed a focus epoch")
+            return false
+        }
+
+        targetFirst.refreshStatuses(force: true)
+        guard runMainLoopUntil(timeout: 1, {
+            targetFirst.presentations.first?.canInvoke == true
+        }) else {
+            print("FAILED: fresh status did not bind to the new focus")
+            return false
+        }
+
+        targetFirst.invoke(targetFirstKey)
+        guard runMainLoopUntil(timeout: 1, { targetFirstModel.blocks.count == 1 }),
+              targetFirstTransport.invokeRequestCount == invokesBeforeStaleTap + 1,
+              targetFirstModel.blocks[0].text == "生成的话术",
+              targetFirstModel.blocks[0].pluginMetadata?.stale == false,
+              targetFirstBus.pendingCount == 0 else {
+            print("FAILED: matching invoke/final-status should stage one buffer block")
+            return false
+        }
+
+        guard let generatedMetadata = targetFirstModel.blocks[0].pluginMetadata else {
+            print("FAILED: generated plugin block is missing target metadata")
+            return false
+        }
+        var deliveryDecision: ActionPluginDeliveryDecision?
+        targetFirst.validateForDelivery(metadata: generatedMetadata,
+                                        expectedFocusToken: secondFocus) {
+            deliveryDecision = $0
+        }
+        let lastValidationBinding = targetFirstTransport.statusBindings.last ?? nil
+        guard runMainLoopUntil(timeout: 1, { deliveryDecision != nil }),
+              deliveryDecision == .allowed,
+              lastValidationBinding == targetFirstTransport.defaultBinding else {
+            print("FAILED: send-time validation must re-check the original runtime binding")
+            return false
+        }
+
+        // Changing the current workbench owner hides and cancels the old
+        // plugin's controls, but a completed target-bound block still carries
+        // a valid authority record and must remain deliverable. Selection is
+        // not installation or runtime revocation.
+        targetFirstPluginSelected = false
+        targetFirst.bufferPluginSelectionDidChange()
+        guard targetFirst.presentations.isEmpty else {
+            print("FAILED: deselected plugin remained visible in workbench")
+            return false
+        }
+        var switchedOwnerDeliveryDecision: ActionPluginDeliveryDecision?
+        targetFirst.validateForDelivery(metadata: generatedMetadata,
+                                        expectedFocusToken: secondFocus) {
+            switchedOwnerDeliveryDecision = $0
+        }
+        guard runMainLoopUntil(timeout: 1, { switchedOwnerDeliveryDecision != nil }),
+              switchedOwnerDeliveryDecision == .allowed else {
+            print("FAILED: owner switch revoked a completed plugin block")
+            return false
+        }
+        targetFirst.pluginConfigurationDidChange(changedPluginID: "new-owner")
+        var enabledOwnerDeliveryDecision: ActionPluginDeliveryDecision?
+        targetFirst.validateForDelivery(metadata: generatedMetadata,
+                                        expectedFocusToken: secondFocus) {
+            enabledOwnerDeliveryDecision = $0
+        }
+        guard runMainLoopUntil(timeout: 1, { enabledOwnerDeliveryDecision != nil }),
+              enabledOwnerDeliveryDecision == .allowed else {
+            print("FAILED: enabling another plugin revoked completed authority")
+            return false
+        }
+        targetFirstPluginSelected = true
+        targetFirst.bufferPluginSelectionDidChange()
+
+        // Runtime rotation revokes legacy JSON results too. The old local
+        // service may still answer, but its binding can no longer authorize a
+        // block minted by the previous instance.
+        targetRuntimeIsCurrent = false
+        var rotatedDeliveryDecision: ActionPluginDeliveryDecision?
+        targetFirst.validateForDelivery(metadata: generatedMetadata,
+                                        expectedFocusToken: secondFocus) {
+            rotatedDeliveryDecision = $0
+        }
+        guard runMainLoopUntil(timeout: 1, { rotatedDeliveryDecision != nil }),
+              rotatedDeliveryDecision == .rejected(.stale) else {
+            print("FAILED: legacy delivery survived runtime rotation")
+            return false
+        }
+        targetRuntimeIsCurrent = true
+
+        // A disable/uninstall notification must revoke a validation that is
+        // already waiting on the plugin's status response.
+        let validationRoot = root.appendingPathComponent("validation-race", isDirectory: true)
+        let validationLoader = ActionPluginLoaderBox([loaded[0]])
+        let validationModel = BufferModel()
+        let validationBus = InboundBus()
+        let validationFocus = ActionPluginFocusBox()
+        validationFocus.token = secondFocus
+        let validationTransport = ActionPluginTransportStub(status: status,
+                                                             response: response)
+        let validationHost = ActionPluginHost(
+            rootURL: validationRoot,
+            client: validationTransport,
+            focus: validationFocus.access,
+            bufferModel: validationModel,
+            inboundBus: validationBus,
+            pluginLoader: validationLoader.load,
+            runtimeBindingIsCurrent: { _, candidate in
+                candidate == validationTransport.defaultBinding
+            }
+        )
+        validationHost.refreshStatuses(force: true)
+        guard runMainLoopUntil(timeout: 1, {
+            validationHost.presentations.first?.canInvoke == true
+        }), let validationKey = validationHost.presentations.first?.key else {
+            print("FAILED: validation-race host did not become ready")
+            return false
+        }
+        validationHost.invoke(validationKey)
+        guard runMainLoopUntil(timeout: 1, { validationModel.blocks.count == 1 }),
+              let validationMetadata = validationModel.blocks.first?.pluginMetadata else {
+            print("FAILED: validation-race fixture did not stage a bound block")
+            return false
+        }
+        validationTransport.holdStatus = true
+        var revokedValidation: ActionPluginDeliveryDecision?
+        validationHost.validateForDelivery(metadata: validationMetadata,
+                                             expectedFocusToken: secondFocus) {
+            revokedValidation = $0
+        }
+        guard revokedValidation == nil else {
+            print("FAILED: held delivery validation completed synchronously")
+            return false
+        }
+        validationLoader.plugins = []
+        NotificationCenter.default.post(
+            name: ActionPluginManager.didChangeNotification,
+            object: nil,
+            userInfo: [
+                ActionPluginManager.rootPathUserInfoKey:
+                    validationRoot.standardizedFileURL.path,
+            ]
+        )
+        validationTransport.completeHeldStatus()
+        guard runMainLoopUntil(timeout: 1, { revokedValidation != nil }),
+              revokedValidation == .rejected(.stale),
+              validationModel.blocks.count == 1 else {
+            print("FAILED: disable during held send-validation must reject as stale")
+            return false
+        }
+
+        func upgradedPlugin(version: String, title: String) -> InstalledActionPlugin {
+            let original = loaded[0]
+            let originalAction = original.manifest.actions[0]
+            let upgradedAction = ActionPluginDefinition(
+                id: originalAction.id,
+                title: title,
+                symbol: originalAction.symbol,
+                statusPath: originalAction.statusPath,
+                invokePath: originalAction.invokePath,
+                modes: originalAction.modes
+            )
+            let upgradedManifest = ActionPluginManifest(
+                schemaVersion: original.manifest.schemaVersion,
+                id: original.manifest.id,
+                name: original.manifest.name,
+                version: version,
+                runtimeConfigPaths: original.manifest.runtimeConfigPaths,
+                actions: [upgradedAction]
+            )
+            return InstalledActionPlugin(manifest: upgradedManifest,
+                                         directory: original.directory)
+        }
+
+        // Keeping plugin/action IDs stable across an upgrade must not let the
+        // old generation's invoke callback or final-status callback stage text.
+        let upgradeRoot = root.appendingPathComponent("upgrade-race", isDirectory: true)
+        let upgradeLoader = ActionPluginLoaderBox([loaded[0]])
+        let upgradeModel = BufferModel()
+        let upgradeBus = InboundBus()
+        let upgradeFocus = ActionPluginFocusBox()
+        upgradeFocus.token = secondFocus
+        let upgradeTransport = ActionPluginTransportStub(status: status,
+                                                          response: response)
+        let upgradeHost = ActionPluginHost(
+            rootURL: upgradeRoot,
+            client: upgradeTransport,
+            focus: upgradeFocus.access,
+            bufferModel: upgradeModel,
+            inboundBus: upgradeBus,
+            pluginLoader: upgradeLoader.load,
+            runtimeBindingIsCurrent: { _, candidate in
+                candidate == upgradeTransport.defaultBinding
+            }
+        )
+        upgradeHost.refreshStatuses(force: true)
+        guard runMainLoopUntil(timeout: 1, {
+            upgradeHost.presentations.first?.canInvoke == true
+        }), let upgradeKey = upgradeHost.presentations.first?.key else {
+            print("FAILED: upgrade-race host did not become ready")
+            return false
+        }
+        upgradeTransport.holdInvoke = true
+        upgradeHost.invoke(upgradeKey)
+        guard upgradeTransport.invokeRequestCount == 1,
+              upgradeModel.loadingMessage != nil else {
+            print("FAILED: upgrade-race invoke was not held")
+            return false
+        }
+        let version2 = upgradedPlugin(version: "2.0.0", title: "生成 v2")
+        upgradeLoader.plugins = [version2]
+        NotificationCenter.default.post(
+            name: ActionPluginManager.didChangeNotification,
+            object: nil,
+            userInfo: [
+                ActionPluginManager.rootPathUserInfoKey:
+                    upgradeRoot.standardizedFileURL.path,
+            ]
+        )
+        upgradeTransport.completeHeldInvoke()
+        guard runMainLoopUntil(timeout: 1, {
+            upgradeHost.presentations.first?.title == "生成 v2"
+                && upgradeHost.presentations.first?.canInvoke == true
+        }), upgradeModel.loadingMessage == nil,
+           upgradeModel.blocks.isEmpty,
+           upgradeBus.pendingCount == 0 else {
+            print("FAILED: same-key manifest upgrade accepted an old invoke callback")
+            return false
+        }
+
+        // Also cover the narrower window after invoke succeeded but its final
+        // target status is still in flight. Here the management notification is
+        // deliberately delayed; the loader read-through must still reject v2.
+        upgradeTransport.holdInvoke = false
+        upgradeTransport.holdStatus = true
+        let statusRequestsBeforeFinalRace = upgradeTransport.statusRequestCount
+        upgradeHost.invoke(upgradeKey)
+        guard runMainLoopUntil(timeout: 1, {
+            upgradeTransport.statusRequestCount > statusRequestsBeforeFinalRace
+                && upgradeModel.loadingMessage != nil
+        }) else {
+            print("FAILED: final-status upgrade race was not held")
+            return false
+        }
+        upgradeLoader.plugins = [upgradedPlugin(version: "3.0.0", title: "生成 v3")]
+        upgradeTransport.completeHeldStatus()
+        guard runMainLoopUntil(timeout: 1, { upgradeModel.loadingMessage == nil }),
+              upgradeModel.blocks.isEmpty,
+              upgradeBus.pendingCount == 0 else {
+            print("FAILED: same-key upgrade accepted an old final-status callback")
+            return false
+        }
+
+        // Exercise the real coordinator gate without an IMK client: validation
+        // begins for focus A, focus changes to B, then even an "allowed" late
+        // callback must not reach the injected delivery closure.
+        var deliveryEpochs = FocusEpochState()
+        let deliveryFocusA = deliveryEpochs.activate()
+        let deliveryFocusB = deliveryEpochs.activate()
+        var currentDeliveryFocus: FocusToken? = deliveryFocusA
+        var insertedTexts: [String] = []
+        var heldDeliveryValidation: ((ActionPluginDeliveryDecision) -> Void)?
+        var asyncSendResult: BufferDeliveryCoordinator.SendResult?
+        let deliveryCoordinator = BufferDeliveryCoordinator(
+            model: targetFirstModel,
+            dependencies: .init(
+                resolveTarget: { expected in
+                    guard let currentDeliveryFocus,
+                          expected == nil || expected == currentDeliveryFocus else { return nil }
+                    return .init(
+                        token: currentDeliveryFocus,
+                        compositionActive: false,
+                        resolveComposition: {},
+                        deliver: { block in
+                            insertedTexts.append(block.text)
+                            return true
+                        }
+                    )
+                },
+                secureInputEnabled: { false },
+                validatePlugin: { _, _, completion in
+                    heldDeliveryValidation = completion
+                },
+                refreshUI: {}
+            )
+        )
+        // The isolated block was generated under secondFocus; copy it with the
+        // test focus token so the coordinator reaches the asynchronous gate.
+        targetFirstModel.discardForPrivacy()
+        let deliveryMetadata = BufferModel.PluginMetadata(
+            pluginId: generatedMetadata.pluginId,
+            actionId: generatedMetadata.actionId,
+            requestId: generatedMetadata.requestId,
+            contextId: generatedMetadata.contextId,
+            focusToken: deliveryFocusA,
+            runtimeIdentity: generatedMetadata.runtimeIdentity,
+            title: generatedMetadata.title,
+            targetSummary: generatedMetadata.targetSummary,
+            stale: false
+        )
+        targetFirstModel.stageExternal("生成的话术",
+                                       origin: .plugin(id: generatedMetadata.pluginId),
+                                       pluginMetadata: deliveryMetadata)
+        let deferredResult = deliveryCoordinator.sendNext(
+            expectedToken: deliveryFocusA,
+            completion: { asyncSendResult = $0 }
+        )
+        guard deferredResult.deferred,
+              heldDeliveryValidation != nil else {
+            print("FAILED: plugin delivery must defer for fresh target validation")
+            return false
+        }
+        currentDeliveryFocus = deliveryFocusB
+        heldDeliveryValidation?(.allowed)
+        guard insertedTexts.isEmpty,
+              targetFirstModel.blocks.count == 1,
+              targetFirstModel.blocks[0].pluginMetadata?.stale == true,
+              asyncSendResult?.blockedReason == .pluginTargetChanged else {
+            print("FAILED: focus A result must never insert after switching to focus B")
+            return false
+        }
+
+        // If focus changes while generation is in flight, a byte-for-byte
+        // matching response still must wait in the inbox for review.
+        targetFirstModel.discardForPrivacy()
+        targetFirstTransport.holdInvoke = true
+        targetFirst.invoke(targetFirstKey)
+        var moreFocusEpochs = FocusEpochState()
+        let replacementFocus = moreFocusEpochs.activate()
+        focusBox.token = replacementFocus
+        targetFirst.focusDidChange()
+        targetFirst.refreshStatuses(force: true)
+        guard runMainLoopUntil(timeout: 1, {
+            targetFirst.presentations.first?.canInvoke == true
+        }) else {
+            print("FAILED: stale legacy invocation still occupied the foreground slot")
+            return false
+        }
+        targetFirstTransport.completeHeldInvoke()
+        guard runMainLoopUntil(timeout: 1, { targetFirstBus.pendingCount == 1 }),
+              targetFirstModel.blocks.isEmpty,
+              targetFirstBus.pending[0].pluginMetadata?.stale == true else {
+            print("FAILED: focus-changed result must route to the inbox")
+            return false
+        }
+
+        // The same revocation applies before a legacy terminal callback is
+        // routed. A still-live old endpoint cannot place its late result into
+        // either the workbench or the review inbox after runtime rotation.
+        targetFirst.refreshStatuses(force: true)
+        guard runMainLoopUntil(timeout: 1, {
+            targetFirst.presentations.first?.canInvoke == true
+        }) else {
+            print("FAILED: legacy runtime-rotation fixture did not become ready")
+            return false
+        }
+        let inboxCountBeforeRotation = targetFirstBus.pendingCount
+        targetFirst.invoke(targetFirstKey)
+        targetRuntimeIsCurrent = false
+        targetFirstTransport.completeHeldInvoke()
+        guard runMainLoopUntil(timeout: 1, {
+            targetFirstModel.loadingMessage == nil
+        }), targetFirstModel.blocks.isEmpty,
+           targetFirstBus.pendingCount == inboxCountBeforeRotation else {
+            print("FAILED: legacy terminal result survived runtime rotation")
+            return false
+        }
+        targetRuntimeIsCurrent = true
+
+        // A full inbox must become a visible workbench notice rather than
+        // silently dropping a stale result. Keep a newer foreground request B
+        // running while parked A completes, so A cannot reuse or overwrite
+        // B's transient-loading ownership.
+        targetFirst.refreshStatuses(force: true)
+        guard runMainLoopUntil(timeout: 1, {
+            targetFirst.presentations.first?.canInvoke == true
+        }) else {
+            print("FAILED: replacement focus did not refresh before inbox-cap test")
+            return false
+        }
+        while targetFirstBus.pendingCount < InboundBus.maxPending {
+            _ = targetFirstBus.submit(origin: .mcp(client: "fill"),
+                                      text: "占位 \(targetFirstBus.pendingCount)")
+        }
+        targetFirstTransport.holdInvoke = true
+        targetFirst.invoke(targetFirstKey)
+        let postCapacityFocus = moreFocusEpochs.activate()
+        focusBox.token = postCapacityFocus
+        targetFirst.focusDidChange()
+        targetFirst.refreshStatuses(force: true)
+        guard runMainLoopUntil(timeout: 1, {
+            targetFirst.presentations.first?.canInvoke == true
+        }) else {
+            print("FAILED: full-inbox foreground B did not become ready")
+            return false
+        }
+        targetFirst.invoke(targetFirstKey)
+        targetFirstTransport.completeHeldInvoke()
+        guard runMainLoopUntil(timeout: 1, {
+            targetFirst.workbenchFailureMessage?.contains("收信箱已满") == true
+        }), targetFirstBus.pendingCount == InboundBus.maxPending,
+           targetFirstModel.blocks.isEmpty,
+           targetFirstModel.transientLoadingActive,
+           targetFirstModel.loadingMessage?.contains("收信箱已满") != true else {
+            print("FAILED: full inbox notice was lost behind foreground B")
+            return false
+        }
+        targetFirstTransport.completeHeldInvoke()
+        guard runMainLoopUntil(timeout: 1, { targetFirstModel.blocks.count == 1 }),
+              targetFirst.workbenchFailureMessage?.contains("收信箱已满") == true,
+              !targetFirstModel.transientLoadingActive else {
+            print("FAILED: foreground B completion erased the background retention notice")
+            return false
+        }
+        targetFirstTransport.holdInvoke = false
+        targetFirstModel.discardForPrivacy()
+        targetFirst.cancelActiveInvocationForWorkbench()
+
+        // Marine/runtime unavailable disables only this action host; existing
+        // Rime buffer state remains intact and no generation starts.
+        targetFirstTransport.statusResult = .failure(ActionPluginHTTPError.runtimeUnavailable)
+        targetFirst.refreshStatuses(force: true)
+        guard runMainLoopUntil(timeout: 1, {
+            targetFirst.presentations.first?.canInvoke == false
+        }) else {
+            print("FAILED: unavailable plugin runtime should disable its action")
+            return false
+        }
+
+        let bus = InboundBus.shared
+        let model = BufferModel.shared
+        let oldEnabled = model.enabled
+        defer {
+            model.discardForPrivacy()
+            bus.clear()
+            model.enabled = oldEnabled
+        }
+        model.discardForPrivacy()
+        bus.clear()
+        let metadata = BufferModel.PluginMetadata(
+            pluginId: "example",
+            actionId: "example.generate",
+            requestId: "req-1",
+            contextId: "ctx-1",
+            focusToken: secondFocus,
+            runtimeIdentity: "instance:stub-instance",
+            title: "回复 @用户",
+            targetSummary: "原评论",
+            stale: true
+        )
+        let pendingID = bus.submit(origin: .plugin(id: "example"),
+                                   text: "迟到结果",
+                                   title: "回复 @用户",
+                                   pluginMetadata: metadata)
+        guard let pendingID,
+              bus.pendingCount == 1,
+              model.blocks.isEmpty,
+              bus.pending[0].pluginMetadata == metadata else {
+            print("FAILED: stale plugin result must wait in inbound inbox")
+            return false
+        }
+        bus.accept(pendingID)
+        let reviewedMetadata = model.blocks.first?.pluginMetadata
+        guard bus.pendingCount == 0,
+              model.blocks.count == 1,
+              model.blocks[0].origin == .plugin(id: "example"),
+              reviewedMetadata?.pluginId == metadata.pluginId,
+              reviewedMetadata?.targetSummary == metadata.targetSummary,
+              reviewedMetadata?.stale == false,
+              reviewedMetadata?.reviewedAsPlainText == true else {
+            print("FAILED: accepting a stale plugin result must explicitly downgrade its binding")
+            return false
+        }
+        var reviewedValidationCalled = false
+        var reviewedInserted: [String] = []
+        let reviewedCoordinator = BufferDeliveryCoordinator(
+            model: model,
+            dependencies: .init(
+                resolveTarget: { expected in
+                    guard expected == nil || expected == secondFocus else { return nil }
+                    return .init(token: secondFocus,
+                                 compositionActive: false,
+                                 resolveComposition: {},
+                                 deliver: { block in
+                                     reviewedInserted.append(block.text)
+                                     return true
+                                 })
+                },
+                secureInputEnabled: { false },
+                validatePlugin: { _, _, completion in
+                    reviewedValidationCalled = true
+                    completion(.rejected(.stale))
+                },
+                refreshUI: {}
+            )
+        )
+        let reviewedSend = reviewedCoordinator.sendNext(expectedToken: secondFocus)
+        guard reviewedSend.succeeded,
+              reviewedInserted == ["迟到结果"],
+              !reviewedValidationCalled,
+              model.blocks.isEmpty else {
+            print("FAILED: a manually reviewed stale result must send only as ordinary text")
+            return false
+        }
+    } catch {
+        print("FAILED: action plugin smoke threw \(error)")
+        return false
+    }
+
+    print("action plugin smoke OK")
+    return true
+}
+
 func runOriginSmokeTest() -> Bool {
     print("== RimeBuffer origin/echo smoke test ==")
 
     // Only remote-peer origins are barred from mirroring; every other source
     // (local typing, agent drafts, network inbound) mirrors as before.
-    let mirrors: [Origin] = [.rime, .marine, .mcp(client: "x"),
+    let mirrors: [Origin] = [.rime, .marine, .plugin(id: "example"), .mcp(client: "x"),
                              .http(source: "s"), .sse(feed: "f"), .ssh(host: "h")]
     for o in mirrors where !o.allowsRemoteMirror {
         print("FAILED: \(o.tag) should mirror to remote")
@@ -1167,17 +2917,6 @@ func runBufferSmokeTest() -> Bool {
         return false
     }
 
-    // Editing a live block preserves its stable provenance, identity and time.
-    let editedBefore = model.blocks[1]
-    guard model.updateBlock(id: editedBefore.id, text: "二改"),
-          let edited = model.blocks.first(where: { $0.id == editedBefore.id }),
-          edited.origin == editedBefore.origin,
-          edited.createdAt == editedBefore.createdAt,
-          edited.text == "二改" else {
-        print("FAILED: block editing must preserve metadata")
-        return false
-    }
-
     model.beginTransientLoading(requestId: "pause-smoke", message: "处理中")
     model.pauseCapturePreservingContent()
     guard !model.enabled,
@@ -1203,41 +2942,84 @@ func runBufferSmokeTest() -> Bool {
 func runBufferWindowSmokeTest() -> Bool {
     print("== RimeBuffer buffer window smoke test ==")
 
+    let workbenchHotKeyID = WorkbenchGlobalHotKeyRouting.identifier
+    let unrelatedHotKeyID = EventHotKeyID(
+        signature: WorkbenchGlobalHotKeyRouting.signature,
+        id: WorkbenchGlobalHotKeyRouting.identifierValue + 1
+    )
+    guard WorkbenchGlobalHotKeyRouting.keyCode == UInt32(kVK_ANSI_B),
+          WorkbenchGlobalHotKeyRouting.modifiers == UInt32(cmdKey | shiftKey),
+          WorkbenchGlobalHotKeyRouting.route(
+            eventClass: OSType(kEventClassKeyboard),
+            eventKind: UInt32(kEventHotKeyPressed),
+            identifier: workbenchHotKeyID
+          ) == .openAndResume,
+          WorkbenchGlobalHotKeyRouting.route(
+            eventClass: OSType(kEventClassKeyboard),
+            eventKind: UInt32(kEventHotKeyReleased),
+            identifier: workbenchHotKeyID
+          ) == .ignore,
+          WorkbenchGlobalHotKeyRouting.route(
+            eventClass: OSType(kEventClassKeyboard),
+            eventKind: UInt32(kEventHotKeyPressed),
+            identifier: unrelatedHotKeyID
+          ) == .ignore else {
+        print("FAILED: Cmd+Shift+B global workbench hotkey routing")
+        return false
+    }
+
     let ready = BufferDeliveryCoordinator.Availability.ready
     let readyText = BufferWorkbenchStatusText.text(for: ready, secureInput: false)
     let readyHelp = BufferWorkbenchStatusText.help(for: ready, secureInput: false)
-    let firstID = UUID()
-    let secondID = UUID()
+    let standardSourceOffset = BufferWorkbenchMetrics.mainControlYOffset(
+        row: .source, mode: .standard
+    )
+    let standardTargetOffset = BufferWorkbenchMetrics.mainControlYOffset(
+        row: .target, mode: .standard
+    )
+    let translationSourceOffset = BufferWorkbenchMetrics.mainControlYOffset(
+        row: .source, mode: .translation
+    )
+    let translationTargetOffset = BufferWorkbenchMetrics.mainControlYOffset(
+        row: .target, mode: .translation
+    )
     guard BufferWorkbenchLayout.mainBar
             == [.dragHandle, .disclosure, .bufferRail, .send],
           BufferWorkbenchLayout.expandedShelf
-            == [.status, .edit, .captureSwitch, .close],
+            == [.status, .pluginActions, .refresh, .close],
           BufferWorkbenchLayout.dragControls == [.dragHandle],
           BufferWorkbenchLayout.dragCursor == .pointingHand,
           BufferWorkbenchMetrics.controlSize == 22,
           BufferWorkbenchMetrics.mainSpacing == 3,
           BufferWorkbenchMetrics.shelfSpacing == 4,
+          standardSourceOffset == 0,
+          standardTargetOffset == 0,
+          translationSourceOffset == -15.5,
+          translationTargetOffset == 15.5,
+          translationSourceOffset < 0,
+          translationTargetOffset > 0,
+          translationSourceOffset == -translationTargetOffset,
           !BufferWorkbenchLayout.windowBackgroundDraggable,
-          FirstMouseSwitch(frame: .zero).acceptsFirstMouse(for: nil),
-          BufferEditorRouting.request(
-            blockIDs: [], selectedBlockID: nil, secureInput: false
-          ) == .noContent,
-          BufferEditorRouting.request(
-            blockIDs: [secondID], selectedBlockID: nil, secureInput: false
-          ) == .edit(secondID),
-          BufferEditorRouting.request(
-            blockIDs: [firstID, secondID], selectedBlockID: firstID, secureInput: false
-          ) == .edit(firstID),
-          BufferEditorRouting.request(
-            blockIDs: [firstID], selectedBlockID: firstID, secureInput: true
-          ) == .blockedSecureInput,
+          FirstMouseButton(frame: .zero).acceptsFirstMouse(for: nil),
           readyText == "可发送",
           !readyText.contains("ChatGPT"),
           !readyText.contains("→"),
           !readyHelp.contains("ChatGPT"),
           !readyHelp.contains("发送到"),
           BufferWorkbenchStatusText.text(for: ready, secureInput: true)
-            == "安全输入，内容已隐藏" else {
+            == "安全输入，内容已隐藏",
+          BufferWorkbenchStatusText.text(
+            for: .blocked(.validatingPluginTarget), secureInput: false
+          ) == "正在确认目标",
+          BufferWorkbenchStatusText.text(
+            for: .blocked(.stalePluginResult), secureInput: false
+          ) == "插件结果已过期",
+          BufferWorkbenchStatusText.text(
+            for: .blocked(.pluginTargetChanged), secureInput: false
+          ) == "评论目标已变化",
+          BufferWorkbenchStatusText.text(
+            for: .blocked(.pluginUnavailable), secureInput: false
+          ) == "插件暂不可用" else {
         print("FAILED: simplified workbench control/status contract")
         return false
     }
@@ -1293,6 +3075,20 @@ func runBufferWindowSmokeTest() -> Bool {
             rimeComposing: false,
             secureInput: false
           ) == .normalPreedit,
+          HostMarkedTextPresentationRules.presentation(
+            bufferControlsActive: false,
+            capturesRimeCommits: false,
+            rimeComposing: true,
+            secureInput: false,
+            stagedChordGuardActive: true
+          ) == .bufferGuard(rimeComposing: true),
+          HostMarkedTextPresentationRules.presentation(
+            bufferControlsActive: false,
+            capturesRimeCommits: false,
+            rimeComposing: true,
+            secureInput: true,
+            stagedChordGuardActive: true
+          ) == .none,
           HostMarkedTextPresentationRules.presentation(
             bufferControlsActive: true,
             capturesRimeCommits: true,
@@ -1787,6 +3583,14 @@ func runBufferWindowSmokeTest() -> Bool {
     let rail = BufferInlineView()
     _ = rail.refresh()
     let renderedBeforeShield = !rail.isHidden && rail.renderedBlockCount == 1
+    model.failTransientLoading(requestId: "visible-error",
+                               message: "收信箱已满，插件结果未保存")
+    _ = rail.refresh()
+    let renderedErrorBesideContent = rail.renderedTextFragments.contains {
+        $0.contains("收信箱已满")
+    }
+    model.finishTransientLoading(requestId: "visible-error")
+    _ = rail.refresh()
     let stableRenderPass = rail.renderPassCount
     let rebuiltUnchangedRail = rail.refresh()
     let skippedUnchangedRail = !rebuiltUnchangedRail && rail.renderPassCount == stableRenderPass
@@ -1799,9 +3603,42 @@ func runBufferWindowSmokeTest() -> Bool {
     model.enabled = oldEnabled
     model.discardForPrivacy()
     model.onChange = oldOnChange
-    guard renderedBeforeShield, skippedUnchangedRail, showedEnterHoldProgress,
+    guard renderedBeforeShield, renderedErrorBesideContent,
+          skippedUnchangedRail, showedEnterHoldProgress,
           scrubbedByShield else {
         print("FAILED: buffer rail secure-input shielding behavior")
+        return false
+    }
+
+    let translationRail = BufferInlineView()
+    let sourcePreview = "上方原文缓冲"
+    let targetPreviewA = "下方译文"
+    let targetPreviewB = "第二块"
+    let translationPreview = TranslationRailSnapshot(
+        sourceText: sourcePreview,
+        outputBlocks: [
+            TranslationOutputBlock(id: UUID(), text: targetPreviewA),
+            TranslationOutputBlock(id: UUID(), text: targetPreviewB),
+        ],
+        phase: .ready
+    )
+    let renderedStackedTranslation = translationRail.renderTranslationForPreview(
+        translationPreview
+    )
+    let translationFragments = translationRail.renderedTextFragments
+    let sourcePosition = translationFragments.firstIndex(of: sourcePreview)
+    let targetPosition = translationFragments.firstIndex(of: targetPreviewA)
+    _ = translationRail.refresh(shielded: true)
+    let translationShielded = !translationRail.renderedTextFragments.contains(sourcePreview)
+        && !translationRail.renderedTextFragments.contains(targetPreviewA)
+    guard renderedStackedTranslation,
+          translationRail.translationRailCount == 0,
+          sourcePosition != nil,
+          targetPosition != nil,
+          sourcePosition! < targetPosition!,
+          !translationFragments.contains("→"),
+          translationShielded else {
+        print("FAILED: translation rail must render two stacked, independently shielded buffers")
         return false
     }
 
@@ -1860,6 +3697,34 @@ func runBufferWindowSmokeTest() -> Bool {
         visibleFrames: [primary],
         fallback: primary
     )
+    let translationCollapsed = BufferWindowGeometry.clampedFrame(
+        collapsedAgain,
+        mode: .translation,
+        visibleFrames: [primary],
+        fallback: primary
+    )
+    let translationExpanded = BufferWindowGeometry.clampedFrame(
+        translationCollapsed,
+        expanded: true,
+        mode: .translation,
+        visibleFrames: [primary],
+        fallback: primary
+    )
+    let standardAfterTranslation = BufferWindowGeometry.clampedFrame(
+        translationExpanded,
+        expanded: false,
+        mode: .standard,
+        visibleFrames: [primary],
+        fallback: primary
+    )
+    let standardCompactAnchor = BufferWindowGeometry.candidateAnchor(for: collapsedAgain)
+    let belowStandardCompact = CandidatePanelGeometry.origin(anchor: standardCompactAnchor,
+                                                              panelSize: candidateSize,
+                                                              visibleFrame: primary)
+    let translatedAnchor = BufferWindowGeometry.candidateAnchor(for: translationCollapsed)
+    let belowTranslatedBar = CandidatePanelGeometry.origin(anchor: translatedAnchor,
+                                                            panelSize: candidateSize,
+                                                            visibleFrame: primary)
     let aligned = BufferWindowGeometry.pixelAligned(
         NSRect(x: 10.24, y: 20.26, width: 680.24, height: 44),
         scale: 2
@@ -1871,11 +3736,18 @@ func runBufferWindowSmokeTest() -> Bool {
           expanded.minY == migratedOldCompact.minY,
           collapsedAgain.height == BufferWindowGeometry.collapsedHeight,
           collapsedAgain.minY == expanded.minY,
+          translationCollapsed.height == BufferWindowGeometry.translationCollapsedHeight,
+          translationCollapsed.minY == collapsedAgain.minY,
+          translationExpanded.height == BufferWindowGeometry.translationExpandedHeight,
+          translationExpanded.minY == translationCollapsed.minY,
+          standardAfterTranslation.height == BufferWindowGeometry.collapsedHeight,
+          standardAfterTranslation.minY == translationExpanded.minY,
           anchor.minY == migrated.minY,
           anchor.maxY == migrated.maxY,
           anchor.minX > migrated.minX,
           anchor.maxX < migrated.maxX,
           belowBar.y + candidateSize.height < anchor.minY,
+          belowTranslatedBar.y == belowStandardCompact.y,
           flippedAbove.y > bottomAnchor.maxY,
           clampedCandidate.x + candidateSize.width <= primary.maxX - 6,
           aligned.minX * 2 == (aligned.minX * 2).rounded(),

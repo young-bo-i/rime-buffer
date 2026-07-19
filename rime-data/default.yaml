@@ -10,7 +10,7 @@ config_version: '2025-02-24'
 # ETInput（Enter输入法）只向用户提供下面四个方案。melt_eng、radical_pinyin
 # 等文件继续作为词典/反查依赖随包提供，但不会出现在 F4 方案选单。
 schema_list:
-  - schema: my_combo               # 并击
+  - schema: my_combo               # 飞耀互击
   - schema: double_pinyin          # 自然码双拼
   - schema: rime_ice               # 雾凇拼音（全拼）
   - schema: english                # 英文

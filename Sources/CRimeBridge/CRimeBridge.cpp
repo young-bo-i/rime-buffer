@@ -128,6 +128,51 @@ struct RimeModule {
     void* (*get_api)(void);
 };
 
+// Prefix-compatible copy of librime 1.x's custom `levers` API. This is a
+// separate, versioned custom API returned by find_module("levers"); it is NOT
+// part of the load-bearing RimeApi vtable below. Keep field order identical to
+// rime_levers_api.h and check data_size before calling optional members.
+struct RimeUserDictIterator {
+    void* ptr;
+    size_t i;
+};
+
+struct RimeLeversApi {
+    int data_size;
+    void* (*custom_settings_init)(const char*, const char*);
+    void (*custom_settings_destroy)(void*);
+    Bool (*load_settings)(void*);
+    Bool (*save_settings)(void*);
+    Bool (*customize_bool)(void*, const char*, Bool);
+    Bool (*customize_int)(void*, const char*, int);
+    Bool (*customize_double)(void*, const char*, double);
+    Bool (*customize_string)(void*, const char*, const char*);
+    Bool (*is_first_run)(void*);
+    Bool (*settings_is_modified)(void*);
+    Bool (*settings_get_config)(void*, RimeConfig*);
+    void* (*switcher_settings_init)(void);
+    Bool (*get_available_schema_list)(void*, RimeSchemaList*);
+    Bool (*get_selected_schema_list)(void*, RimeSchemaList*);
+    void (*schema_list_destroy)(RimeSchemaList*);
+    const char* (*get_schema_id)(void*);
+    const char* (*get_schema_name)(void*);
+    const char* (*get_schema_version)(void*);
+    const char* (*get_schema_author)(void*);
+    const char* (*get_schema_description)(void*);
+    const char* (*get_schema_file_path)(void*);
+    Bool (*select_schemas)(void*, const char*[], int);
+    const char* (*get_hotkeys)(void*);
+    Bool (*set_hotkeys)(void*, const char*);
+    Bool (*user_dict_iterator_init)(RimeUserDictIterator*);
+    void (*user_dict_iterator_destroy)(RimeUserDictIterator*);
+    const char* (*next_user_dict)(RimeUserDictIterator*);
+    Bool (*backup_user_dict)(const char*);
+    Bool (*restore_user_dict)(const char*);
+    int (*export_user_dict)(const char*, const char*);
+    int (*import_user_dict)(const char*, const char*);
+    Bool (*customize_item)(void*, const char*, RimeConfig*);
+};
+
 struct RimeApi {
     int data_size;
     void (*setup)(RimeTraits*);
@@ -257,6 +302,22 @@ static std::vector<std::string> gCandComment(BB_MAX_CANDIDATES);
 static std::vector<std::string> gCandLabel(BB_MAX_CANDIDATES);
 static std::string gStatusSchemaId;
 static std::string gStatusSchemaName;
+
+template <typename Struct, typename Member>
+static bool apiHasMember(const Struct* api, Member Struct::*member) {
+    if (!api) return false;
+    const size_t offset = reinterpret_cast<const char*>(&(api->*member))
+        - reinterpret_cast<const char*>(api);
+    const size_t available = sizeof(api->data_size) + static_cast<size_t>(api->data_size);
+    return available >= offset + sizeof(api->*member);
+}
+
+static RimeLeversApi* leversApi() {
+    if (!gApi || !gApi->find_module) return nullptr;
+    RimeModule* module = gApi->find_module("levers");
+    if (!module || !module->get_api) return nullptr;
+    return reinterpret_cast<RimeLeversApi*>(module->get_api());
+}
 
 static bool loadDylib(const char* path, bool required) {
     void* handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
@@ -596,4 +657,89 @@ char* BBRimeCopyLastError(void) {
 
 void BBRimeFreeString(char* value) {
     free(value);
+}
+
+bool BBRimeSessionExists(uint64_t session) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    if (!gStarted || !gApi || !gApi->find_session || session == 0) return false;
+    return gApi->find_session(static_cast<RimeSessionId>(session)) != 0;
+}
+
+bool BBRimeHasUserDictionary(const char* dictName) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    if (!gStarted || !dictName || !*dictName) return false;
+    RimeLeversApi* api = leversApi();
+    if (!api
+        || !apiHasMember(api, &RimeLeversApi::user_dict_iterator_init)
+        || !apiHasMember(api, &RimeLeversApi::user_dict_iterator_destroy)
+        || !apiHasMember(api, &RimeLeversApi::next_user_dict)
+        || !api->user_dict_iterator_init
+        || !api->user_dict_iterator_destroy
+        || !api->next_user_dict) {
+        return false;
+    }
+
+    RimeUserDictIterator iterator = {nullptr, 0};
+    if (!api->user_dict_iterator_init(&iterator)) return false;
+    bool found = false;
+    while (const char* name = api->next_user_dict(&iterator)) {
+        if (strcmp(name, dictName) == 0) {
+            found = true;
+            break;
+        }
+    }
+    api->user_dict_iterator_destroy(&iterator);
+    return found;
+}
+
+int BBRimeExportUserDictionary(const char* dictName, const char* textFile) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    if (!gStarted || !gApi || !dictName || !*dictName || !textFile || !*textFile) {
+        return -1;
+    }
+    RimeLeversApi* api = leversApi();
+    if (!api
+        || !apiHasMember(api, &RimeLeversApi::export_user_dict)
+        || !api->export_user_dict
+        || !gApi->cleanup_all_sessions) {
+        return -1;
+    }
+
+    // UserDictManager's upstream contract requires the LevelDB to be closed.
+    // Every Swift controller has already received the maintenance notification
+    // and settled its composition before entering this bridge call.
+    gApi->cleanup_all_sessions();
+    return api->export_user_dict(dictName, textFile);
+}
+
+int BBRimeImportUserDictionary(const char* dictName, const char* textFile) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    if (!gStarted || !gApi || !dictName || !*dictName || !textFile || !*textFile) {
+        return -1;
+    }
+    RimeLeversApi* api = leversApi();
+    if (!api
+        || !apiHasMember(api, &RimeLeversApi::import_user_dict)
+        || !api->import_user_dict
+        || !gApi->cleanup_all_sessions) {
+        return -1;
+    }
+
+    gApi->cleanup_all_sessions();
+    return api->import_user_dict(dictName, textFile);
+}
+
+bool BBRimeRestoreUserDictionarySnapshot(const char* snapshotFile) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    if (!gStarted || !gApi || !snapshotFile || !*snapshotFile) return false;
+    RimeLeversApi* api = leversApi();
+    if (!api
+        || !apiHasMember(api, &RimeLeversApi::restore_user_dict)
+        || !api->restore_user_dict
+        || !gApi->cleanup_all_sessions) {
+        return false;
+    }
+
+    gApi->cleanup_all_sessions();
+    return api->restore_user_dict(snapshotFile) != 0;
 }

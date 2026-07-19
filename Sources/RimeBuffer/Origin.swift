@@ -10,6 +10,14 @@ enum Origin: Equatable {
     /// Marine local-agent draft (transitional; folds into `.mcp` once Marine
     /// moves onto the MCP gateway).
     case marine
+    /// A user-invoked workbench action supplied by an installed process-outside
+    /// plugin. The identifier comes from the plugin manifest and is display /
+    /// provenance data only; plugins never receive an IMK client reference.
+    case plugin(id: String)
+    /// A trusted in-process transform. The mirror bit is inherited from every
+    /// source block used to derive the result, preventing remote-peer text from
+    /// being translated and echoed back to the originating Mac.
+    case processor(id: String, allowsRemoteMirror: Bool)
     /// Model Context Protocol client (a local agent). `client` is its self-
     /// reported, unverified name — for display only.
     case mcp(client: String)
@@ -28,8 +36,11 @@ enum Origin: Equatable {
     /// Everything else (local typing, agent drafts, network sources) mirrors
     /// as before.
     var allowsRemoteMirror: Bool {
-        if case .remotePeer = self { return false }
-        return true
+        switch self {
+        case .remotePeer: return false
+        case let .processor(_, allowsRemoteMirror): return allowsRemoteMirror
+        default: return true
+        }
     }
 
     /// Short tag for logs — never the content, only the provenance.
@@ -37,6 +48,8 @@ enum Origin: Equatable {
         switch self {
         case .rime: return "rime"
         case .marine: return "marine"
+        case let .plugin(id): return "plugin:\(id)"
+        case let .processor(id, _): return "processor:\(id)"
         case .mcp: return "mcp"
         case .http: return "http"
         case .sse: return "sse"

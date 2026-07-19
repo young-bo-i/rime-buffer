@@ -2,12 +2,12 @@
 
 schema:
   schema_id: my_combo
-  name: 并击
-  version: '1.0'
+  name: 飞耀互击
+  version: '1.1'
   author:
     - 你的名字
   description: |
-    自定义并击输入方案
+    飞耀互击输入方案
     基于 Rime 输入法引擎
 
 switches:
@@ -65,12 +65,11 @@ chord_composer:
   algebra:
     # ===== 单个字母直接上屏（无隔音符号） =====
     - 'xform/^([qwertyuiopasdfghjklzxcvbnm,.])$/$1/'
-    
-    
+
     # ===== 按键顺序规范化（针对完整并击） =====
     # 第一步：将所有按键重新排序为标准顺序（左半区在前，右半区在后）
     # 这样无论用户按键顺序如何，都能正确匹配
-    
+
     # 重排序规则：提取左半区和右半区的键，然后重新组合
     # 左半区：qwertasdfgzxcvb
     # 右半区：yuiophjklnm,.
@@ -198,7 +197,7 @@ chord_composer:
     # q声母 + 组合韵母
     - 'xform/^qjl$/qiu/'      # qiu - 求、球、秋
     - 'xform/^qui$/quan/'     # quan - 全、权、圈
-    - 'xform/^qm.$/que/'     # que - 却、确、缺
+    - 'xform/^qm\.$/que/'     # que - 却、确、缺
     - 'xform/^qil$/qie/'      # qie - 切、且、茄
     - 'xform/^qlm$/qiao/'     # qiao - 桥、巧、敲
     - 'xform/^qk\.$/qia/'     # qia - 恰、恰、恰
@@ -304,7 +303,7 @@ chord_composer:
     - 'xform/^djl$/diu/'      # diu - 丢
     - 'xform/^dm,$/deng/'     # deng - 等、登、灯
     - 'xform/^dil$/die/'      # die - 爹、叠、蝶
-    - 'xform/^dk.$/dia/'     # dia - 嗲
+    - 'xform/^dk\.$/dia/'     # dia - 嗲
     
 
     # f声母 + 单键韵母
@@ -469,7 +468,7 @@ chord_composer:
     - 'xform/^dfij$/ye/'      # ye - 也、也、也
     - 'xform/^dfui$/yuan/'    # yuan - 原、圆、圆
     - 'xform/^dfkm$/yong/'    # yong - 用、用、用
-    - 'xform/^dfm.$/yue/'     # yue - 月、约、约
+    - 'xform/^dfm\.$/yue/'     # yue - 月、约、约
     - 'xform/^dfkl$/you/'     # you - 由、有、又
     - 'xform/^dfjk$/ya/'      # ya - 牙、雅、压
 
@@ -631,7 +630,7 @@ chord_composer:
     - 'xform/^sdlm$/liao/'    # liao - 了、料、聊
     - 'xform/^sdkl$/lou/'     # lou - 楼、搂、漏
     - 'xform/^sduo$/liang/'   # liang - 两、两、两
-    - 'xform/^sdk.$/lia/'     # lia - 俩
+    - 'xform/^sdk\.$/lia/'     # lia - 俩
     
 
     # dv组合(n声母) + 单键韵母
@@ -692,16 +691,62 @@ chord_composer:
     - 'xform/^em,$/eng/'     # eng - 嗯
     - 'xform/^ajk$/a/'       # a - 啊、阿、呵
     - 'xform/^eij$/e/'       # e - 额、鹅、饿
-    - 'xform/^xvo$/o/'       # o - 哦、喔
+    - 'xform/^xvo$/x*o/'     # o - 哦、喔（临时标记，避免命中右手 o）
     - 'xform/^an$/an/'       # an - 安、按、暗
     - 'xform/^en$/en/'       # en - 恩
     - 'xform/^xvu$/ou/'      # ou - 欧、偶、藕
     - 'xform/^em,$/eng/'     # eng - 嗯
     - 'xform/^ah$/ang/'      # ang - 昂、盎
-    - 'xform/^eui$/er/'      # er - 儿、耳、尔
-    
-    
+    - 'xform/^eui$/e*r/'     # er - 儿、耳、尔（临时标记，避免命中左手 er）
+
+    # ===== 互击：左右半区可独立结算 =====
+    # 位于完整音节之后，避免解码出的声母（如 sh）再次命中跨区规则。先处理
+    # 右侧，再处理左侧；少数上下文相关拼写由 speller.algebra 接受为等价码。
+    # Multi-key finals precede single keys so decoded `o -> uo` cannot cascade
+    # into the physical `uo -> uang` rule in the same algebra pipeline.
+    - 'xform/^jl$/iu/'
+    - 'xform/^ij$/e/'
+    - 'xform/^ui$/uan/'
+    - 'xform/^m\.$/ue/'
+    - 'xform/^jk$/a/'
+    - 'xform/^km$/ong/'
+    - 'xform/^uo$/uang/'
+    - 'xform/^io$/en/'
+    - 'xform/^m,$/eng/'
+    - 'xform/^oj$/ei/'
+    - 'xform/^il$/ie/'
+    - 'xform/^lm$/iao/'
+    - 'xform/^,\.$/ui/'
+    - 'xform/^kl$/ou/'
+    - 'xform/^k\.$/ia/'
+    - 'xform/^y$/ing/'
+    - 'xform/^u$/u/'
+    - 'xform/^i$/i/'
+    - 'xform/^o$/uo/'
+    - 'xform/^p$/un/'
+    - 'xform/^h$/ang/'
+    - 'xform/^j$/an/'
+    - 'xform/^k$/ao/'
+    - 'xform/^l$/ai/'
+    - 'xform/^n$/in/'
+    - 'xform/^m$/ian/'
+
+    - 'xform/^df$/y/'
+    - 'xform/^ef$/sh/'
+    - 'xform/^er$/ch/'
+    - 'xform/^xv$/o/'
+    - 'xform/^wr$/p/'
+    - 'xform/^xc$/h/'
+    - 'xform/^cv$/j/'
+    - 'xform/^sf$/k/'
+    - 'xform/^sd$/l/'
+    - 'xform/^dv$/n/'
+    - 'xform/^we$/m/'
+    - 'xform/^v$/zh/'
+
     # 还原临时标记，解决二次映射问题
+    - 'xform/^x\*o$/o/'      # 还原零声母 o
+    - 'xform/^e\*r$/er/'     # 还原零声母 er
     - 'xform/^w\*ei$/wei/'    # 还原 w*ei -> wei
     - 'xform/^w\*en$/wen/'    # 还原 w*en -> wen
     - 'xform/^g\*uo$/guo/'    # 还原 g*uo -> guo

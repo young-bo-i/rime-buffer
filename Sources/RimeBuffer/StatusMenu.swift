@@ -127,7 +127,7 @@ final class StatusMenu {
     }
 
     func moveBufferWindowToCurrentScreen() {
-        BufferWindowController.shared.show()
+        BufferWindowController.shared.openAndResume()
         BufferWindowController.shared.moveToCurrentScreen()
     }
 
@@ -152,7 +152,7 @@ final class StatusMenu {
             let ok = BBRimeDeploy()
             IMELog.write("input menu: deploy=\(ok), restarting")
             DispatchQueue.main.async {
-                KeyFrequencyStore.shared.saveNow()
+                InputMetricsPersistence.saveNow()
                 exit(0)
             }
         }
@@ -173,7 +173,7 @@ final class StatusMenu {
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
         RimeBufferController.active?.forceCommit()
-        KeyFrequencyStore.shared.saveNow()
+        InputMetricsPersistence.saveNow()
 
         let command = [
             "cd \(shellQuote(script.deletingLastPathComponent().path))",
@@ -193,7 +193,7 @@ final class StatusMenu {
     func restart() {
         IMELog.write("input menu: restart requested")
         RimeBufferController.active?.forceCommit()
-        KeyFrequencyStore.shared.saveNow()
+        InputMetricsPersistence.saveNow()
         exit(0)
     }
 

@@ -55,6 +55,7 @@ jobs:
           fi
           bash -n build_install.sh
           bash -n scripts/pkg/scripts/postinstall
+          python3 scripts/lint-log-privacy.py
 
       - name: Resolve version
         id: version
@@ -111,11 +112,33 @@ jobs:
           cp Resources/menubar-template.png "$APP/Contents/Resources/" 2>/dev/null || true  # status-bar glyph
           # --deep: sign the nested librime + plugin dylibs too.
           codesign --force --deep --sign - "$APP"
-          codesign --verify --verbose "$APP" || true
+          codesign --verify --deep --strict --verbose=2 "$APP"
           xattr -cr "$APP"
           echo "----- assembled bundle -----"
           file "$APP/Contents/MacOS/ETInput"
           du -sh "$APP"
+
+      # Unlike the stock debug CI runner, the assembled app now contains the
+      # exact librime/levers dylibs and SharedSupport shipped to users. Exercise
+      # both schema deployment and real LevelDB user-dictionary maintenance in
+      # disposable roots before packaging the release.
+      - name: Verify bundled Rime runtime and user dictionary bridge
+        run: |
+          APP="$GITHUB_WORKSPACE/ETInput.app"
+          BIN="$APP/Contents/MacOS/ETInput"
+          SHARED="$APP/Contents/SharedSupport"
+          FRAMEWORKS="$APP/Contents/Frameworks"
+          ENGINE_ROOT="$RUNNER_TEMP/rimebuffer-engine-smoke"
+          LEXICON_ROOT="$RUNNER_TEMP/rimebuffer-lexicon-smoke"
+          mkdir -p "$ENGINE_ROOT" "$LEXICON_ROOT"
+          RIMEBUFFER_USER_DIR="$ENGINE_ROOT" \
+          RIMEBUFFER_SHARED_DIR="$SHARED" \
+          RIMEBUFFER_FRAMEWORKS_DIR="$FRAMEWORKS" \
+            "$BIN" smoke
+          RIMEBUFFER_USER_DIR="$LEXICON_ROOT" \
+          RIMEBUFFER_SHARED_DIR="$SHARED" \
+          RIMEBUFFER_FRAMEWORKS_DIR="$FRAMEWORKS" \
+            "$BIN" user-lexicon-bridge-smoke
 
       - name: Package ZIP
         id: package

@@ -102,6 +102,21 @@ char* BBRimeCopySchema(uint64_t session);
 char* BBRimeCopyLastError(void);
 void BBRimeFreeString(char* value);
 
+// User-dictionary maintenance through librime's official `levers` module.
+// Export/import closes every live Rime session before touching the LevelDB;
+// the Swift caller MUST first settle composition and invalidate its cached
+// per-controller session ids. The operations are synchronous and return an
+// entry count, or -1 on failure. `dictName` is the translator's user_dict
+// name (currently `rime_ice` for Chinese and `english` for English).
+int BBRimeExportUserDictionary(const char* dictName, const char* textFile);
+int BBRimeImportUserDictionary(const char* dictName, const char* textFile);
+bool BBRimeRestoreUserDictionarySnapshot(const char* snapshotFile);
+bool BBRimeHasUserDictionary(const char* dictName);
+
+// Lets a controller distinguish a live session from a nonzero id invalidated
+// by dictionary maintenance.
+bool BBRimeSessionExists(uint64_t session);
+
 #ifdef __cplusplus
 }
 #endif

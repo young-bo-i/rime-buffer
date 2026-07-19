@@ -15,8 +15,17 @@ enum HostMarkedTextPresentationRules {
     static func presentation(bufferControlsActive: Bool,
                              capturesRimeCommits: Bool,
                              rimeComposing: Bool,
-                             secureInput: Bool) -> HostMarkedTextPresentation {
+                             secureInput: Bool,
+                             stagedChordGuardActive: Bool = false) -> HostMarkedTextPresentation {
         guard !secureInput else { return .none }
+        // Strict FlyYao 并击 keeps a one-sided press outside Rime while it
+        // waits for the complementary keyboard half.  Establish an invisible
+        // marked-text session during that interval even when the workbench is
+        // off, otherwise hostile fields can observe the physical key before
+        // IMK's handled result arrives.
+        if stagedChordGuardActive {
+            return .bufferGuard(rimeComposing: rimeComposing)
+        }
         guard bufferControlsActive else { return .normalPreedit }
 
         // Persistent capture renders all preedit in our panel. A transient
