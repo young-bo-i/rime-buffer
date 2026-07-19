@@ -72,27 +72,46 @@ jobs:
       - name: Smoke tests
         run: |
           BIN="$(swift build --show-bin-path)/RimeBuffer"
-          "$BIN" schema-smoke
-          "$BIN" buffer-smoke
-          "$BIN" buffer-window-smoke # focus/target/lifecycle rules + multi-screen geometry (pure)
-          "$BIN" stats-smoke
-          "$BIN" matrix-smoke   # candidate-matrix viewport math (pure, no window server)
-          "$BIN" candidate-metrics-smoke # candidate size dependency/layout constraints (pure)
-          "$BIN" theme-smoke    # fixed day-palette contrast + explicit AppKit appearance (pure)
-          "$BIN" origin-smoke   # block-origin plumbing + echo guard (pure)
-          "$BIN" inbound-smoke  # inbound gating / cap / streaming / accept (pure)
-          "$BIN" plugin-smoke   # action-plugin runtime binding + target-safe delivery (pure/local URLProtocol)
-          "$BIN" plugin-stream-smoke # NDJSON v1 identity/sequence/bounds + stable block streaming (pure)
-          "$BIN" plugin-platform-smoke # namespaced built-in/external discovery + enablement delegation
-          "$BIN" translation-smoke # local translation latest-wins + derived target-only delivery
-          "$BIN" ai-text-smoke # fake CLI/API streams + private config + derived target-only delivery
-          "$BIN" settings-routing-smoke # stable vertical routes + dynamic extension/subpage fallback
-          "$BIN" history-heatmap-smoke # all-history calendar layout/intensity math (pure)
-          "$BIN" typing-speed-smoke # aggregate sessions/persistence/privacy (pure)
-          "$BIN" fly-chord-learning-smoke # schema-derived lessons/progress/privacy (pure)
-          "$BIN" input-telemetry-smoke # sanitized observation + typing admission policy (pure)
-          "$BIN" user-lexicon-smoke # portable learned-dictionary validation/import/export (fake engine)
-          "$BIN" remote-smoke   # ECDH + framing + loopback socket (no Squirrel/network perms)
+          ROOT="$RUNNER_TEMP/rimebuffer-smoke"
+          mkdir -p "$ROOT/profile" "$ROOT/local" "$ROOT/plugins"
+          export RIMEBUFFER_USER_DIR="$ROOT/profile"
+          export RIMEBUFFER_LOCAL_DATA_ROOT="$ROOT/local"
+          export RIMEBUFFER_PLUGIN_ROOT="$ROOT/plugins"
+
+          SMOKES=(
+            schema-smoke
+            buffer-smoke
+            buffer-window-smoke
+            stats-smoke
+            matrix-smoke
+            candidate-metrics-smoke
+            theme-smoke
+            origin-smoke
+            inbound-smoke
+            plugin-smoke
+            plugin-stream-smoke
+            plugin-platform-smoke
+            translation-smoke
+            ai-text-smoke
+            settings-routing-smoke
+            history-heatmap-smoke
+            typing-speed-smoke
+            fly-chord-learning-smoke
+            input-telemetry-smoke
+            user-lexicon-smoke
+            remote-smoke
+          )
+          for smoke in "${SMOKES[@]}"; do
+            echo "::group::$smoke"
+            if "$BIN" "$smoke"; then
+              echo "::endgroup::"
+            else
+              status=$?
+              echo "::endgroup::"
+              echo "::error title=Smoke test failed::$smoke exited with status $status"
+              exit "$status"
+            fi
+          done
 
       # Instantiate every core/dynamic AppKit route, render it off-screen, and
       # verify the complete manifest. All writable roots are runner-temporary,
