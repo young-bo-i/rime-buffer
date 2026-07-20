@@ -6,6 +6,26 @@ private final class AITextSmokeCancellation: AITextCancellable {
     func cancel() { wasCancelled = true }
 }
 
+private final class AITextSmokeCounter {
+    private let lock = NSLock()
+    private var storage = 0
+
+    @discardableResult
+    func increment() -> Int {
+        lock.lock()
+        storage += 1
+        let value = storage
+        lock.unlock()
+        return value
+    }
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+}
+
 private final class AITextSmokeProvider: AITextProvider {
     let kind: AITextProviderKind
     var availability: AITextProviderAvailability = .ready
@@ -315,11 +335,48 @@ private enum AITextCodexLoginTransportSmoke {
     }
 
     static func run() -> Bool {
+        guard statusDecoder() else {
+            print("Claude auth status decoder smoke failed")
+            return false
+        }
         for mode in [Mode.success, .cancel, .timeout] {
             guard exercise(mode) else {
                 print("Codex login transport smoke failed: \(mode.rawValue)")
                 return false
             }
+        }
+        return true
+    }
+
+    private static func statusDecoder() -> Bool {
+        func result(_ json: String,
+                    status: Int32 = 0,
+                    timedOut: Bool = false,
+                    cancelled: Bool = false,
+                    outputTooLarge: Bool = false) -> AITextCLIProcessResult {
+            AITextCLIProcessResult(
+                terminationStatus: status,
+                standardOutput: Data(json.utf8),
+                timedOut: timedOut,
+                cancelled: cancelled,
+                outputTooLarge: outputTooLarge
+            )
+        }
+        let loggedIn = result("{\"loggedIn\":true,\"authMethod\":\"claude.ai\"}")
+        guard AITextClaudeAuthentication.acceptsStatusResult(loggedIn),
+              !AITextClaudeAuthentication.acceptsStatusResult(
+                result("{\"loggedIn\":false}")
+              ),
+              !AITextClaudeAuthentication.acceptsStatusResult(result("not-json")),
+              !AITextClaudeAuthentication.acceptsStatusResult(result("{\"loggedIn\":true}",
+                                                                      status: 1)),
+              !AITextClaudeAuthentication.acceptsStatusResult(result("{\"loggedIn\":true}",
+                                                                      timedOut: true)),
+              !AITextClaudeAuthentication.acceptsStatusResult(result("{\"loggedIn\":true}",
+                                                                      cancelled: true)),
+              !AITextClaudeAuthentication.acceptsStatusResult(result("{\"loggedIn\":true}",
+                                                                      outputTooLarge: true)) else {
+            return false
         }
         return true
     }
@@ -463,6 +520,159 @@ private enum AITextCodexLoginTransportSmoke {
         \(accountResponse)
           esac
         done
+        """
+    }
+
+    private static func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+}
+
+private enum AITextClaudeLoginTransportSmoke {
+    private enum Mode: String {
+        case success
+        case cancel
+        case timeout
+    }
+
+    static func run() -> Bool {
+        for mode in [Mode.success, .cancel, .timeout] {
+            guard exercise(mode) else {
+                print("Claude login transport smoke failed: \(mode.rawValue)")
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func exercise(_ mode: Mode) -> Bool {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RimeBuffer-Claude-Login-Transport-Smoke-\(UUID().uuidString)",
+                                   isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: root,
+                                                    withIntermediateDirectories: false,
+                                                    attributes: [.posixPermissions: 0o700])
+        } catch {
+            return false
+        }
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let executable = root.appendingPathComponent("fake-claude")
+        let exitMarker = root.appendingPathComponent("process-exited")
+        let invocationMarker = root.appendingPathComponent("safe-invocation")
+        let script = fakeCLIScript(mode: mode,
+                                   exitMarker: exitMarker,
+                                   invocationMarker: invocationMarker)
+        do {
+            try Data(script.utf8).write(to: executable, options: .atomic)
+            guard chmod(executable.path, S_IRWXU) == 0 else { return false }
+        } catch {
+            return false
+        }
+
+        var operation: AITextClaudeLoginOperation?
+        var result: Result<Void, AITextProviderError>?
+        var completionCount = 0
+        let authenticationChecks = AITextSmokeCounter()
+        var callbackAfterCompletion = false
+        var statuses: [AITextClaudeLoginStatus] = []
+        operation = AITextClaudeLoginOperation(
+            environment: [
+                "HOME": "/tmp",
+                "USER": "smoke",
+                "LOGNAME": "smoke",
+                "ANTHROPIC_API_KEY": "must-not-leak",
+                "CLAUDE_CODE_OAUTH_TOKEN": "must-not-leak",
+                "CLAUDE_CONFIG_DIR": "/tmp/must-not-leak",
+            ],
+            executableResolver: { executable },
+            compatibilityResolver: { _ in true },
+            authenticationResolver: { _, _ in
+                authenticationChecks.increment()
+                return mode == .success
+            },
+            loginTimeout: mode == .timeout ? 0.1 : 3,
+            onStatus: { status in
+                if result != nil { callbackAfterCompletion = true }
+                statuses.append(status)
+                if mode == .cancel, status == .waitingForBrowser {
+                    operation?.cancel()
+                }
+            },
+            completion: {
+                completionCount += 1
+                result = $0
+            }
+        )
+        operation?.start()
+        guard waitUntil(timeout: 5, { result != nil }) else {
+            operation?.cancel()
+            return false
+        }
+        _ = waitUntil(timeout: 0.15, { false })
+        let requiresScriptStartup = mode != .cancel
+        guard completionCount == 1,
+              !callbackAfterCompletion,
+              (!requiresScriptStartup
+                || FileManager.default.fileExists(atPath: exitMarker.path)),
+              (!requiresScriptStartup
+                || FileManager.default.fileExists(atPath: invocationMarker.path)),
+              statuses.first == .launching,
+              statuses.contains(.waitingForBrowser) else {
+            print("Claude login lifecycle mismatch: mode=\(mode.rawValue) result=\(String(describing: result)) completions=\(completionCount) late=\(callbackAfterCompletion) exited=\(FileManager.default.fileExists(atPath: exitMarker.path)) invoked=\(FileManager.default.fileExists(atPath: invocationMarker.path)) statuses=\(statuses) authChecks=\(authenticationChecks.value)")
+            return false
+        }
+        switch (mode, result) {
+        case (.success, .success?):
+            return statuses.contains(.verifying) && authenticationChecks.value == 1
+        case (.cancel, .failure(.cancelled)?):
+            return !statuses.contains(.verifying) && authenticationChecks.value == 0
+        case (.timeout, .failure(.timedOut)?):
+            return !statuses.contains(.verifying) && authenticationChecks.value == 0
+        default:
+            print("Claude login result mismatch: mode=\(mode.rawValue) result=\(String(describing: result)) statuses=\(statuses) authChecks=\(authenticationChecks.value)")
+            return false
+        }
+    }
+
+    private static func waitUntil(timeout: TimeInterval,
+                                  _ condition: () -> Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            _ = RunLoop.current.run(mode: .default,
+                                    before: Date().addingTimeInterval(0.01))
+        }
+        return condition()
+    }
+
+    private static func fakeCLIScript(mode: Mode,
+                                      exitMarker: URL,
+                                      invocationMarker: URL) -> String {
+        let exitPath = shellQuote(exitMarker.path)
+        let invocationPath = shellQuote(invocationMarker.path)
+        let body: String
+        switch mode {
+        case .success:
+            body = "printf 'browser opened\\n'; printf 'waiting\\n' >&2; finish\n"
+        case .cancel, .timeout:
+            body = "while :; do /bin/sleep 0.05; done\n"
+        }
+        return """
+        #!/bin/sh
+        EXIT_MARKER=\(exitPath)
+        INVOCATION_MARKER=\(invocationPath)
+        finish() { : > "$EXIT_MARKER"; exit 0; }
+        trap finish TERM INT
+        if [ "$#" -ne 3 ] || [ "$1" != "auth" ] || [ "$2" != "login" ] || [ "$3" != "--claudeai" ]; then
+          exit 64
+        fi
+        if [ -n "${ANTHROPIC_API_KEY+x}" ] || [ -n "${CLAUDE_CODE_OAUTH_TOKEN+x}" ] || [ -n "${CLAUDE_CONFIG_DIR+x}" ]; then
+          exit 65
+        fi
+        : > "$INVOCATION_MARKER"
+        \(body)
         """
     }
 
@@ -812,6 +1022,44 @@ private enum AITextPluginSmoke {
                 "ANTHROPIC_API_KEY": "must-not-leak",
             ]
         )
+        let codexCandidates = AITextCLIExecutableLocator.candidatePaths(
+            for: .codexCLI,
+            environment: ["PATH": "/opt/homebrew/bin:/usr/bin"],
+            homeDirectory: "/Users/smoke"
+        )
+        let rejectedCandidate = URL(fileURLWithPath: "/usr/bin/false")
+        let acceptedCandidate = URL(fileURLWithPath: "/usr/bin/true")
+        let compatibleFallback = AITextCLIExecutableLocator.firstCompatibleExecutable(
+            in: [rejectedCandidate, acceptedCandidate],
+            compatibility: { $0 == acceptedCandidate }
+        )
+        let invalidPinnedExecutable = AITextCLIExecutableLocator.compatibleExecutable(
+            for: .codexCLI,
+            environment: ["RIMEBUFFER_CODEX_PATH": "/tmp/rimebuffer-missing-codex"],
+            compatibility: { _ in true }
+        )
+        let locatorRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RimeBuffer-CLI-Locator-Smoke-\(UUID().uuidString)",
+                                   isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: locatorRoot) }
+        let pinnedSymlink = locatorRoot.appendingPathComponent("codex")
+        do {
+            try FileManager.default.createDirectory(at: locatorRoot,
+                                                    withIntermediateDirectories: false)
+            try FileManager.default.createSymbolicLink(at: pinnedSymlink,
+                                                       withDestinationURL: acceptedCandidate)
+        } catch {
+            return false
+        }
+        var compatibilitySawCanonicalURL = false
+        let canonicalPinnedExecutable = AITextCLIExecutableLocator.compatibleExecutable(
+            for: .codexCLI,
+            environment: ["RIMEBUFFER_CODEX_PATH": pinnedSymlink.path],
+            compatibility: { candidate in
+                compatibilitySawCanonicalURL = candidate == acceptedCandidate.resolvingSymlinksInPath()
+                return true
+            }
+        )
         guard codexArguments.first == "app-server",
               codexArguments.suffix(2) == ["--listen", "stdio://"],
               codexArguments.contains("--strict-config"),
@@ -827,7 +1075,16 @@ private enum AITextPluginSmoke {
               codexEnvironment["OPENAI_API_KEY"] == nil,
               codexEnvironment["CODEX_API_KEY"] == nil,
               codexEnvironment["CODEX_HOME"] == nil,
-              codexEnvironment["ANTHROPIC_API_KEY"] == nil else {
+              codexEnvironment["ANTHROPIC_API_KEY"] == nil,
+              codexCandidates.first == AITextCLIExecutableLocator.bundledChatGPTCodexPath,
+              compatibleFallback == acceptedCandidate,
+              invalidPinnedExecutable == nil,
+              compatibilitySawCanonicalURL,
+              canonicalPinnedExecutable == acceptedCandidate.resolvingSymlinksInPath(),
+              (codexCandidates.firstIndex(
+                of: AITextCLIExecutableLocator.bundledChatGPTCodexPath
+              ) ?? Int.max)
+                < (codexCandidates.firstIndex(of: "/opt/homebrew/bin/codex") ?? Int.max) else {
             return false
         }
         guard AITextFoundationCLIStreamingSmoke.run() else {
@@ -846,6 +1103,10 @@ private enum AITextPluginSmoke {
             print("AI text CLI smoke failed: Codex login transport")
             return false
         }
+        guard AITextClaudeLoginTransportSmoke.run() else {
+            print("AI text CLI smoke failed: Claude login transport")
+            return false
+        }
         let codexHomeRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("RimeBuffer-Codex-Home-Smoke-\(UUID().uuidString)",
                                     isDirectory: true)
@@ -858,13 +1119,48 @@ private enum AITextPluginSmoke {
                   config.contains("forced_login_method = \"chatgpt\""),
                   config.contains("[mcp_servers]"),
                   !config.contains("[mcp_servers.") else { return false }
+            let codexProbeGate = DispatchSemaphore(value: 0)
+            let nonblockingCodex = CodexCLITextProvider(
+                environment: ["HOME": "/tmp"],
+                homeStore: codexHome,
+                executableResolver: { fakeExecutable },
+                compatibilityResolver: { _ in
+                    codexProbeGate.wait()
+                    return true
+                }
+            )
+            let codexProbeStartedAt = ProcessInfo.processInfo.systemUptime
+            let initialCodexAvailability = nonblockingCodex.availability
+            let codexProbeCallDuration = ProcessInfo.processInfo.systemUptime
+                - codexProbeStartedAt
+            guard case let .unavailable(codexProbeMessage) = initialCodexAvailability,
+                  codexProbeMessage.contains("正在检查"),
+                  codexProbeCallDuration < 0.1 else {
+                codexProbeGate.signal()
+                return false
+            }
+            codexProbeGate.signal()
+            guard waitUntil(timeout: 2, {
+                if case let .unavailable(message) = nonblockingCodex.availability {
+                    return message.contains("尚未完成")
+                }
+                return false
+            }) else { return false }
+
+            let codexCompatibilityChecks = AITextSmokeCounter()
             let refreshableCodex = CodexCLITextProvider(
                 environment: ["HOME": "/tmp"],
                 homeStore: codexHome,
                 executableResolver: { fakeExecutable },
-                compatibilityResolver: { _ in true }
+                compatibilityResolver: { _ in
+                    codexCompatibilityChecks.increment()
+                    return true
+                }
             )
-            guard case .unavailable = refreshableCodex.availability else { return false }
+            guard case .unavailable = refreshableCodex.availability,
+                  waitUntil(timeout: 2, { codexCompatibilityChecks.value == 1 }) else {
+                return false
+            }
             let auth: [String: Any] = [
                 "auth_mode": "chatgpt",
                 "tokens": ["access_token": "access", "refresh_token": "refresh"],
@@ -873,7 +1169,9 @@ private enum AITextPluginSmoke {
             try authData.write(to: codexHome.authenticationURL, options: .atomic)
             guard chmod(codexHome.authenticationURL.path, S_IRUSR | S_IWUSR) == 0,
                   codexHome.hasChatGPTCredential,
-                  refreshableCodex.availability == .ready else { return false }
+                  waitUntil(timeout: 2, { refreshableCodex.availability == .ready }) else {
+                return false
+            }
         } catch {
             return false
         }
@@ -891,6 +1189,30 @@ private enum AITextPluginSmoke {
         )
         guard case .failure(.unavailable)? = unsupportedResult else { return false }
 
+        let authenticationGate = DispatchSemaphore(value: 0)
+        let nonblockingClaude = ClaudeCodeCLITextProvider(
+            environment: ["HOME": "/tmp"],
+            executableResolver: { fakeExecutable },
+            compatibilityResolver: { _ in true },
+            authenticationResolver: { _ in
+                authenticationGate.wait()
+                return true
+            }
+        )
+        let probeStartedAt = ProcessInfo.processInfo.systemUptime
+        let initialClaudeAvailability = nonblockingClaude.availability
+        let probeCallDuration = ProcessInfo.processInfo.systemUptime - probeStartedAt
+        guard case let .unavailable(probeMessage) = initialClaudeAvailability,
+              probeMessage.contains("正在检查"),
+              probeCallDuration < 0.1 else {
+            authenticationGate.signal()
+            return false
+        }
+        authenticationGate.signal()
+        guard waitUntil(timeout: 2, { nonblockingClaude.availability == .ready }) else {
+            return false
+        }
+
         let claudeRunner = AITextSmokeRunner()
         let claude = ClaudeCodeCLITextProvider(runner: claudeRunner,
                                                environment: [
@@ -902,7 +1224,11 @@ private enum AITextPluginSmoke {
                                                    "CODEX_HOME": "/tmp/codex-must-not-leak",
                                                ],
                                                executableResolver: { fakeExecutable },
-                                               compatibilityResolver: { _ in true })
+                                               compatibilityResolver: { _ in true },
+                                               authenticationResolver: { _ in true })
+        guard waitUntil(timeout: 2, { claude.availability == .ready }) else {
+            return false
+        }
         var claudeResultValue: Result<[AITextProviderBlock], AITextProviderError>?
         _ = claude.generate(AITextProviderRequest(requestID: UUID(), sourceText: "claude-source"),
                             onEvent: { _ in },
@@ -912,9 +1238,10 @@ private enum AITextPluginSmoke {
               String(data: claudeRunner.specs[0].standardInput, encoding: .utf8)?.contains("claude-source") == true,
               claudeRunner.specs[0].arguments.contains("--strict-mcp-config"),
               !claudeRunner.specs[0].arguments.contains("--json-schema"),
+              claudeRunner.specs[0].arguments.contains("--no-chrome"),
               claudeRunner.specs[0].environment["ANTHROPIC_API_KEY"] == nil,
-              claudeRunner.specs[0].environment["CLAUDE_CODE_OAUTH_TOKEN"] == "claude-only",
-              claudeRunner.specs[0].environment["CLAUDE_CONFIG_DIR"] == "/tmp/claude",
+              claudeRunner.specs[0].environment["CLAUDE_CODE_OAUTH_TOKEN"] == nil,
+              claudeRunner.specs[0].environment["CLAUDE_CONFIG_DIR"] == nil,
               claudeRunner.specs[0].environment["TMPDIR"] == claudeRunner.specs[0].currentDirectoryURL.path,
               claudeRunner.specs[0].environment["OPENAI_API_KEY"] == nil,
               claudeRunner.specs[0].environment["CODEX_HOME"] == nil else {
@@ -949,7 +1276,13 @@ private enum AITextPluginSmoke {
               AITextCLIExecutableLocator.bundledChatGPTCodexPath
                 == "/Applications/ChatGPT.app/Contents/Resources/codex",
               AITextCodexCompatibility.supportedVersionOutput.contains(
+                "codex-cli 0.144.1"
+              ),
+              AITextCodexCompatibility.supportedVersionOutput.contains(
                 "codex-cli 0.145.0-alpha.18"
+              ),
+              AITextClaudeCompatibility.supportedVersionOutput.contains(
+                "2.1.211 (Claude Code)"
               ),
               AITextClaudeCompatibility.supportedVersionOutput.contains(
                 "2.1.215 (Claude Code)"
@@ -971,6 +1304,40 @@ private enum AITextPluginSmoke {
         )
         guard unsupportedClaudeRunner.specs.isEmpty,
               case .failure(.unavailable)? = unsupportedClaudeResult else { return false }
+
+        let signedOutClaudeRunner = AITextSmokeRunner()
+        let signedOutAuthenticationChecks = AITextSmokeCounter()
+        let signedOutClaude = ClaudeCodeCLITextProvider(
+            runner: signedOutClaudeRunner,
+            environment: ["HOME": "/tmp"],
+            executableResolver: { fakeExecutable },
+            compatibilityResolver: { _ in true },
+            authenticationResolver: { _ in
+                signedOutAuthenticationChecks.increment()
+                return false
+            }
+        )
+        guard waitUntil(timeout: 2, {
+                  if case .unavailable = signedOutClaude.availability {
+                      return signedOutAuthenticationChecks.value == 1
+                  }
+                  return false
+              }),
+              case .unavailable = signedOutClaude.availability,
+              case .unavailable = signedOutClaude.availability,
+              signedOutAuthenticationChecks.value == 1 else { return false }
+        var signedOutClaudeResult: Result<[AITextProviderBlock], AITextProviderError>?
+        _ = signedOutClaude.generate(
+            AITextProviderRequest(requestID: UUID(), sourceText: "must-not-send"),
+            onEvent: { _ in },
+            completion: { signedOutClaudeResult = $0 }
+        )
+        guard signedOutClaudeRunner.specs.isEmpty,
+              case .failure(.unavailable)? = signedOutClaudeResult,
+              signedOutAuthenticationChecks.value == 1 else { return false }
+        signedOutClaude.authenticationDidChange(true)
+        guard signedOutClaude.availability == .ready,
+              signedOutAuthenticationChecks.value == 1 else { return false }
         return true
     }
 
@@ -1384,6 +1751,17 @@ private enum AITextPluginSmoke {
         reviewedWorkspace.start()
         defer { reviewedWorkspace.stop() }
         return reviewedWorkspace.canGenerate
+    }
+
+    private static func waitUntil(timeout: TimeInterval,
+                                  _ condition: () -> Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            _ = RunLoop.current.run(mode: .default,
+                                    before: Date().addingTimeInterval(0.01))
+        }
+        return condition()
     }
 }
 

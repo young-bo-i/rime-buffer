@@ -49,6 +49,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
     private var activeBufferPluginObserver: NSObjectProtocol?
     private var inputConfigurationObserver: NSObjectProtocol?
     private var aiConnectorObserver: NSObjectProtocol?
+    private var aiConnectorAvailabilityObserver: NSObjectProtocol?
 
     private var encodingRadios: [InputEncoding: NSButton] = [:]
     private var keyingModeRadios: [KeyingMode: NSButton] = [:]
@@ -79,6 +80,14 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
     private var codexAuthorizationURL: URL?
     private var codexLoginFeedback: String?
     private var codexLoginFeedbackIsError = false
+    private let claudeLoginButton = NSButton(title: "登录 Claude", target: nil, action: nil)
+    private let claudeLoginSpinner = NSProgressIndicator()
+    private let claudeLoginStatusLabel = NSTextField(wrappingLabelWithString: "")
+    private var claudeLoginOperation: AITextClaudeLoginOperation?
+    private var claudeLoginSessionID: UUID?
+    private var claudeLoginCancelling = false
+    private var claudeLoginFeedback: String?
+    private var claudeLoginFeedbackIsError = false
     private var candidateMetricFields: [CandidateWindowMetric: NSTextField] = [:]
     private var candidateMetricSliders: [CandidateWindowMetric: NSSlider] = [:]
     private var candidateMetricHints: [CandidateWindowMetric: NSTextField] = [:]
@@ -327,6 +336,29 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         ) { [weak self] _ in
             self?.refreshAIConnectorSelection()
         }
+        aiConnectorAvailabilityObserver = NotificationCenter.default.addObserver(
+            forName: .aiTextConnectorAvailabilityDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self,
+                  let rawKind = notification.userInfo?["kind"] as? String,
+                  let kind = AITextProviderKind(rawValue: rawKind) else { return }
+            if kind == .claudeCodeCLI, self.claudeLoginOperation == nil {
+                self.claudeLoginFeedback = nil
+                self.claudeLoginFeedbackIsError = false
+            }
+            if kind == .codexCLI, self.codexLoginOperation == nil {
+                self.codexLoginFeedback = nil
+                self.codexLoginFeedbackIsError = false
+            }
+            guard self.window?.isVisible == true,
+                  self.selectedCoreRoute == .connectors,
+                  self.navigation.selectedSubpage()?.rawValue == "ai-model" else { return }
+            DispatchQueue.main.async { [weak self] in
+                self?.showCurrentRoute()
+            }
+        }
 
         window = win
     }
@@ -338,6 +370,12 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
             codexAuthorizationURL = nil
             codexLoginFeedback = "正在取消 Codex 登录…"
             codexLoginFeedbackIsError = false
+            operation.cancel()
+        }
+        if let operation = claudeLoginOperation {
+            claudeLoginCancelling = true
+            claudeLoginFeedback = "正在取消 Claude 登录…"
+            claudeLoginFeedbackIsError = false
             operation.cancel()
         }
         // The controller is a process-lifetime singleton, but dynamic plugin
@@ -393,6 +431,16 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         codexLoginSpinner.heightAnchor.constraint(equalToConstant: 16).isActive = true
         codexLoginStatusLabel.font = .systemFont(ofSize: 11)
         codexLoginStatusLabel.textColor = .tertiaryLabelColor
+        claudeLoginButton.target = self
+        claudeLoginButton.action = #selector(claudeLoginButtonPressed)
+        claudeLoginSpinner.style = .spinning
+        claudeLoginSpinner.controlSize = .small
+        claudeLoginSpinner.isDisplayedWhenStopped = false
+        claudeLoginSpinner.translatesAutoresizingMaskIntoConstraints = false
+        claudeLoginSpinner.widthAnchor.constraint(equalToConstant: 16).isActive = true
+        claudeLoginSpinner.heightAnchor.constraint(equalToConstant: 16).isActive = true
+        claudeLoginStatusLabel.font = .systemFont(ofSize: 11)
+        claudeLoginStatusLabel.textColor = .tertiaryLabelColor
         bufferCheck.target = self
         bufferCheck.action = #selector(bufferToggled)
         bufferWindowVisibleCheck.target = self
@@ -1113,6 +1161,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
             claudeDetail = message
         }
         refreshCodexLoginControls(codexReady: codexReady)
+        refreshClaudeLoginControls(claudeReady: claudeReady)
         codexLoginButton.removeFromSuperview()
         codexCopyLoginLinkButton.removeFromSuperview()
         codexLoginSpinner.removeFromSuperview()
@@ -1126,6 +1175,17 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         codexLoginActions.orientation = .horizontal
         codexLoginActions.alignment = .centerY
         codexLoginActions.spacing = 8
+        claudeLoginButton.removeFromSuperview()
+        claudeLoginSpinner.removeFromSuperview()
+        claudeLoginStatusLabel.removeFromSuperview()
+        let claudeLoginActions = NSStackView(views: [
+            claudeLoginButton,
+            claudeLoginSpinner,
+            flexSpacer(),
+        ])
+        claudeLoginActions.orientation = .horizontal
+        claudeLoginActions.alignment = .centerY
+        claudeLoginActions.spacing = 8
         let save = NSButton(title: "保存配置",
                             target: self,
                             action: #selector(saveAIModelConfiguration))
@@ -1138,7 +1198,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         actions.spacing = 8
 
         let privacy = NSTextField(wrappingLabelWithString:
-            "Codex CLI 与 Claude Code CLI 在本机启动，但并不代表本地推理：点击生成后，缓冲区全文会通过所选 CLI 的订阅登录态发送。RimeBuffer 不会把环境中的 API Key 透传给这两个 CLI。通用 Open API（OpenAI 兼容）连接器只会在你点击生成时把全文发送到这里配置的端点。")
+            "Codex CLI 与 Claude Code CLI 在本机启动，但并不代表本地推理：点击生成后，缓冲区全文会通过所选 CLI 的授权状态发送。RimeBuffer 不会把环境中的 API Key 透传给这两个 CLI。通用 Open API（OpenAI 兼容）连接器只会在你点击生成时把全文发送到这里配置的端点。")
         privacy.font = .systemFont(ofSize: 11)
         privacy.textColor = .tertiaryLabelColor
 
@@ -1165,6 +1225,8 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
                           detail: claudeDetail,
                           active: claudeReady,
                           inactiveLabel: "不可用"),
+            claudeLoginActions,
+            claudeLoginStatusLabel,
             privacy,
             spacer(16),
             sectionLabel("通用 Open API（OpenAI 兼容 Chat Completions）"),
@@ -1720,6 +1782,50 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         }
     }
 
+    private func refreshClaudeLoginControls(claudeReady: Bool? = nil) {
+        let ready = claudeReady
+            ?? (AITextConnectorRegistry.shared.availability(for: .claudeCodeCLI) == .ready)
+        let isRunning = claudeLoginOperation != nil
+        claudeLoginButton.title = isRunning
+            ? "取消登录"
+            : (ready ? "重新授权 Claude" : "登录 Claude")
+        claudeLoginButton.isEnabled = !claudeLoginCancelling
+        if isRunning {
+            claudeLoginSpinner.startAnimation(nil)
+        } else {
+            claudeLoginSpinner.stopAnimation(nil)
+        }
+        if let claudeLoginFeedback {
+            claudeLoginStatusLabel.stringValue = claudeLoginFeedback
+            claudeLoginStatusLabel.textColor = claudeLoginFeedbackIsError
+                ? .systemRed
+                : .secondaryLabelColor
+        } else if ready {
+            claudeLoginStatusLabel.stringValue = "Claude Code CLI 授权已就绪。"
+            claudeLoginStatusLabel.textColor = .systemGreen
+        } else {
+            claudeLoginStatusLabel.stringValue = "登录由本机 Claude Code CLI 管理；RimeBuffer 不读取或展示凭据。"
+            claudeLoginStatusLabel.textColor = .tertiaryLabelColor
+        }
+    }
+
+    private func claudeLoginErrorMessage(_ error: AITextProviderError) -> String {
+        switch error {
+        case let .unavailable(message), let .invalidConfiguration(message):
+            return message
+        case .invalidResult:
+            return "Claude 登录响应无效，请重试。"
+        case .resultTooLarge:
+            return "Claude 登录响应异常过大，已安全中止。"
+        case .timedOut:
+            return "等待 Claude 登录超时，请重新发起授权。"
+        case .cancelled:
+            return "已取消 Claude 登录。"
+        case .failed:
+            return "Claude 登录暂时不可用，请重试。"
+        }
+    }
+
     private func refreshPluginList(statusMessage: String? = nil) {
         let plugins = PluginRegistry.shared.plugins(capability: .bufferAction)
         pluginRowsStack.arrangedSubviews.forEach {
@@ -2264,6 +2370,68 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         codexLoginFeedback = "登录链接已复制；请在浏览器中打开并完成授权。"
         codexLoginFeedbackIsError = false
         refreshCodexLoginControls()
+    }
+
+    @objc private func claudeLoginButtonPressed() {
+        if let operation = claudeLoginOperation {
+            claudeLoginCancelling = true
+            claudeLoginFeedback = "正在取消 Claude 登录…"
+            claudeLoginFeedbackIsError = false
+            refreshClaudeLoginControls()
+            operation.cancel()
+            return
+        }
+
+        let sessionID = UUID()
+        claudeLoginSessionID = sessionID
+        claudeLoginCancelling = false
+        claudeLoginFeedback = AITextClaudeLoginStatus.launching.displayText
+        claudeLoginFeedbackIsError = false
+
+        let operation = AITextClaudeLoginOperation(
+            onStatus: { [weak self] status in
+                guard let self,
+                      self.claudeLoginSessionID == sessionID,
+                      !self.claudeLoginCancelling else { return }
+                self.claudeLoginFeedback = status.displayText
+                self.claudeLoginFeedbackIsError = false
+                self.refreshClaudeLoginControls()
+            },
+            completion: { [weak self] result in
+                guard let self, self.claudeLoginSessionID == sessionID else { return }
+                self.claudeLoginOperation = nil
+                self.claudeLoginSessionID = nil
+                self.claudeLoginCancelling = false
+                switch result {
+                case .success:
+                    self.claudeLoginFeedback = "Claude Code CLI 授权成功，连接器已就绪。"
+                    self.claudeLoginFeedbackIsError = false
+                    AITextConnectorRegistry.shared.claudeAuthenticationDidChange(true)
+                case .failure(.cancelled):
+                    self.claudeLoginFeedback = "已取消 Claude 登录。"
+                    self.claudeLoginFeedbackIsError = false
+                    AITextConnectorRegistry.shared.claudeAuthenticationDidChange(nil)
+                case let .failure(error):
+                    self.claudeLoginFeedback = self.claudeLoginErrorMessage(error)
+                    self.claudeLoginFeedbackIsError = true
+                    AITextConnectorRegistry.shared.claudeAuthenticationDidChange(nil)
+                }
+                self.refreshClaudeLoginControls()
+                BufferWindowController.shared.refresh()
+                RimeBufferController.refreshActiveUI()
+                DispatchQueue.main.async { [weak self] in
+                    guard let self,
+                          self.window?.isVisible == true,
+                          self.selectedCoreRoute == .connectors,
+                          self.navigation.selectedSubpage()?.rawValue == "ai-model" else { return }
+                    self.reload()
+                    self.showCurrentRoute()
+                }
+            }
+        )
+        claudeLoginOperation = operation
+        refreshClaudeLoginControls()
+        operation.start()
     }
 
     private func persistSchemaSelection(_ ids: [String]? = nil) throws {

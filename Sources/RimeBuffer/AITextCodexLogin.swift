@@ -195,16 +195,20 @@ final class AITextCodexLoginOperation: AITextCancellable {
          onAuthorizationURL: @escaping AuthorizationHandler,
          onStatus: @escaping StatusHandler,
          completion: @escaping Completion) {
-        self.environment = environment
-        self.homeStore = homeStore
-        self.executableResolver = executableResolver ?? {
-            AITextCLIExecutableLocator.executable(for: .codexCLI,
-                                                  environment: environment)
-        }
-        self.compatibilityResolver = compatibilityResolver ?? { executableURL in
+        let resolvedCompatibility = compatibilityResolver ?? { executableURL in
             AITextCodexCompatibility.isSupported(executableURL: executableURL,
                                                  environment: environment)
         }
+        self.environment = environment
+        self.homeStore = homeStore
+        self.executableResolver = executableResolver ?? {
+            AITextCLIExecutableLocator.compatibleExecutable(
+                for: .codexCLI,
+                environment: environment,
+                compatibility: resolvedCompatibility
+            )
+        }
+        self.compatibilityResolver = resolvedCompatibility
         self.handshakeTimeout = max(0.05, handshakeTimeout)
         self.loginTimeout = max(0.05, loginTimeout)
         authorizationHandler = onAuthorizationURL
@@ -236,14 +240,18 @@ final class AITextCodexLoginOperation: AITextCancellable {
         lifecycle = .running
         emitStatus(.launching)
 
-        guard let executableURL = executableResolver() else {
+        guard let locatedExecutableURL = executableResolver() else {
             finish(.failure(.unavailable("未找到 Codex CLI")))
             return
         }
-        guard compatibilityResolver(executableURL) else {
+        guard let before = AITextVerifiedCLIExecutable.capture(locatedExecutableURL),
+              compatibilityResolver(before.url),
+              let verified = AITextVerifiedCLIExecutable.capture(before.url),
+              verified == before else {
             finish(.failure(.unavailable("Codex CLI 版本尚未通过安全兼容性验证")))
             return
         }
+        let executableURL = verified.url
         do {
             try homeStore.prepare()
         } catch {

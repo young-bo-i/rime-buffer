@@ -1275,6 +1275,14 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
             self?.refresh()
         })
         observers.append(center.addObserver(
+            forName: .aiTextConnectorAvailabilityDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.refresh()
+            RimeBufferController.refreshActiveUI()
+        })
+        observers.append(center.addObserver(
             forName: .activeBufferPluginDidChange,
             object: nil,
             queue: .main

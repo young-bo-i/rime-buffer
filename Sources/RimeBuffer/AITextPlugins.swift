@@ -9,6 +9,9 @@ extension Notification.Name {
     static let aiTextConnectorDidChange = Notification.Name(
         "RimeBuffer.AITextConnector.didChange"
     )
+    static let aiTextConnectorAvailabilityDidChange = Notification.Name(
+        "RimeBuffer.AITextConnector.availabilityDidChange"
+    )
 }
 
 /// The workbench exposes one AI action. The provider-specific IDs remain stable
@@ -1080,6 +1083,97 @@ enum AITextCLIExecutableLocator {
     static func executable(for kind: AITextProviderKind,
                            environment: [String: String] = ProcessInfo.processInfo.environment,
                            fileManager: FileManager = .default) -> URL? {
+        executableCandidates(for: kind,
+                             environment: environment,
+                             fileManager: fileManager).first
+    }
+
+    static func compatibleExecutable(
+        for kind: AITextProviderKind,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        fileManager: FileManager = .default,
+        compatibility: (URL) -> Bool
+    ) -> URL? {
+        // An explicit path is an administrative pin: fail closed instead of
+        // silently falling through to a different installation.
+        let override: String?
+        switch kind {
+        case .codexCLI:
+            override = environment["RIMEBUFFER_CODEX_PATH"]
+        case .claudeCodeCLI:
+            override = environment["RIMEBUFFER_CLAUDE_PATH"]
+        case .openAICompatible:
+            override = nil
+        }
+        if let override, !override.isEmpty {
+            let path = override.hasPrefix("~/")
+                ? fileManager.homeDirectoryForCurrentUser.path + String(override.dropFirst())
+                : override
+            guard let executable = executableURL(atPath: path, fileManager: fileManager) else {
+                return nil
+            }
+            return verifiedCompatibleExecutable(executable, compatibility: compatibility)
+        }
+        let candidates = executableCandidates(for: kind,
+                                              environment: environment,
+                                              fileManager: fileManager)
+        for candidate in candidates {
+            if let verified = verifiedCompatibleExecutable(candidate,
+                                                           compatibility: compatibility) {
+                return verified
+            }
+        }
+        return nil
+    }
+
+    static func firstCompatibleExecutable(
+        in candidates: [URL],
+        compatibility: (URL) -> Bool
+    ) -> URL? {
+        candidates.first(where: compatibility)
+    }
+
+    private static func verifiedCompatibleExecutable(
+        _ candidate: URL,
+        compatibility: (URL) -> Bool
+    ) -> URL? {
+        guard let before = AITextVerifiedCLIExecutable.capture(candidate),
+              compatibility(before.url),
+              let after = AITextVerifiedCLIExecutable.capture(before.url),
+              before == after else { return nil }
+        return after.url
+    }
+
+    private static func executableCandidates(
+        for kind: AITextProviderKind,
+        environment: [String: String],
+        fileManager: FileManager
+    ) -> [URL] {
+        let candidatePaths = candidatePaths(
+            for: kind,
+            environment: environment,
+            homeDirectory: fileManager.homeDirectoryForCurrentUser.path
+        )
+        return candidatePaths.compactMap { path in
+            executableURL(atPath: path, fileManager: fileManager)
+        }
+    }
+
+    private static func executableURL(atPath path: String,
+                                      fileManager: FileManager) -> URL? {
+        guard path.hasPrefix("/"), fileManager.isExecutableFile(atPath: path) else { return nil }
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: path, isDirectory: &isDirectory),
+              !isDirectory.boolValue else { return nil }
+        return URL(fileURLWithPath: path)
+    }
+
+    /// Pure ordered candidate list used by both runtime resolution and smoke
+    /// coverage. Duplicate PATH/shim entries are removed without changing the
+    /// first-match order.
+    static func candidatePaths(for kind: AITextProviderKind,
+                               environment: [String: String],
+                               homeDirectory: String) -> [String] {
         let executableName: String
         let overrideKey: String
         let extraCandidates: [String]
@@ -1093,12 +1187,19 @@ enum AITextCLIExecutableLocator {
             overrideKey = "RIMEBUFFER_CLAUDE_PATH"
             extraCandidates = ["~/.claude/local/claude"]
         case .openAICompatible:
-            return nil
+            return []
         }
 
         var candidates: [String] = []
         if let override = environment[overrideKey], !override.isEmpty {
             candidates.append(override)
+        }
+        if kind == .codexCLI {
+            // ChatGPT ships the app-server build whose exact tool surface is
+            // validated below. Prefer it to older Homebrew/npm shims; the old
+            // order stopped at the first executable and never reached this
+            // compatible binary.
+            candidates += extraCandidates
         }
         if kind == .claudeCodeCLI {
             // The npm/user install is commonly newer than a stale Homebrew
@@ -1111,31 +1212,25 @@ enum AITextCLIExecutableLocator {
             "/usr/local/bin/\(executableName)",
             "~/.local/bin/\(executableName)",
         ]
-        candidates += extraCandidates
+        if kind != .codexCLI { candidates += extraCandidates }
         candidates += (environment["PATH"] ?? "")
             .split(separator: ":")
             .map { String($0) + "/" + executableName }
 
-        let home = fileManager.homeDirectoryForCurrentUser.path
-        for rawCandidate in candidates {
+        var seen = Set<String>()
+        return candidates.compactMap { rawCandidate in
             let path = rawCandidate.hasPrefix("~/")
-                ? home + String(rawCandidate.dropFirst())
+                ? homeDirectory + String(rawCandidate.dropFirst())
                 : rawCandidate
-            guard path.hasPrefix("/"), fileManager.isExecutableFile(atPath: path) else { continue }
-            var isDirectory: ObjCBool = false
-            guard fileManager.fileExists(atPath: path, isDirectory: &isDirectory), !isDirectory.boolValue else {
-                continue
-            }
-            return URL(fileURLWithPath: path)
+            return seen.insert(path).inserted ? path : nil
         }
-        return nil
     }
 
     static func sanitizedEnvironment(
         for kind: AITextProviderKind,
         from source: [String: String] = ProcessInfo.processInfo.environment
     ) -> [String: String] {
-        var allowed = [
+        let allowed = [
             "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR",
             "SSL_CERT_FILE", "SSL_CERT_DIR",
         ]
@@ -1146,11 +1241,10 @@ enum AITextCLIExecutableLocator {
             // hooks and tools that are inappropriate for untrusted buffer text.
             break
         case .claudeCodeCLI:
-            // Keep the CLI's configuration/OAuth login state, but deliberately
-            // omit ANTHROPIC_API_KEY for the same subscription-first contract.
-            allowed += [
-                "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN",
-            ]
+            // HOME is enough for the official CLI to resolve its own login.
+            // Do not silently inherit an ambient OAuth
+            // token or alternate config root into the input method.
+            break
         case .openAICompatible:
             break
         }
@@ -1247,6 +1341,7 @@ enum AITextCodexIsolation {
 /// repeats that compatibility check and extends the list.
 enum AITextCodexCompatibility {
     static let supportedVersionOutput: Set<String> = [
+        "codex-cli 0.144.1",
         "codex-cli 0.145.0-alpha.18",
     ]
 
@@ -1290,10 +1385,11 @@ enum AITextCodexCompatibility {
 }
 
 /// Claude flags also change across releases (`--safe-mode` is absent from the
-/// stale Homebrew build on this machine). Pin the exact subscription-capable
+/// stale Homebrew build on this machine). Pin the exact compatible
 /// CLI whose tool-free surface was exercised before accepting any prompt.
 enum AITextClaudeCompatibility {
     static let supportedVersionOutput: Set<String> = [
+        "2.1.211 (Claude Code)",
         "2.1.215 (Claude Code)",
     ]
 
@@ -1876,48 +1972,183 @@ private final class AITextClaudeParserBox {
     }
 }
 
+/// A version-compatible CLI is cached off the IMK main thread. The stat
+/// fingerprint makes generation fail closed if that executable is replaced
+/// after validation, without rerunning `--version` on every UI refresh.
+struct AITextVerifiedCLIExecutable: Equatable {
+    let url: URL
+    let device: UInt64
+    let inode: UInt64
+    let size: Int64
+    let modifiedSeconds: Int64
+    let modifiedNanoseconds: Int64
+
+    static func capture(_ url: URL) -> AITextVerifiedCLIExecutable? {
+        let canonicalURL = url.resolvingSymlinksInPath()
+        var info = stat()
+        guard lstat(canonicalURL.path, &info) == 0 else { return nil }
+        return AITextVerifiedCLIExecutable(
+            url: canonicalURL,
+            device: UInt64(info.st_dev),
+            inode: UInt64(info.st_ino),
+            size: Int64(info.st_size),
+            modifiedSeconds: Int64(info.st_mtimespec.tv_sec),
+            modifiedNanoseconds: Int64(info.st_mtimespec.tv_nsec)
+        )
+    }
+
+    var stillMatches: Bool { Self.capture(url) == self }
+}
+
 final class CodexCLITextProvider: AITextProvider {
+    private enum ProbeResult: Equatable {
+        case ready(AITextVerifiedCLIExecutable)
+        case unavailable(String)
+    }
+
     let kind: AITextProviderKind = .codexCLI
     private let environment: [String: String]
     private let homeStore: AITextCodexHomeStore
     private let executableResolver: () -> URL?
     private let compatibilityResolver: (URL) -> Bool
-    private lazy var cachedExecutableAvailability: AITextProviderAvailability = {
-        guard let executableURL = executableResolver() else {
-            return .unavailable("未找到 Codex CLI")
-        }
-        guard compatibilityResolver(executableURL) else {
-            return .unavailable("Codex CLI 版本尚未通过安全兼容性验证")
-        }
-        return .ready
-    }()
+    private let probeTTL: TimeInterval
+    private let probeQueue = DispatchQueue(label: "RimeBuffer.AIText.CodexProbe",
+                                           qos: .utility)
+    private let probeLock = NSLock()
+    private var cachedProbe: ProbeResult?
+    private var probeInFlight = false
+    private var probeGeneration: UInt64 = 0
+    private var lastProbeUptime: TimeInterval?
 
     init(environment: [String: String] = ProcessInfo.processInfo.environment,
          homeStore: AITextCodexHomeStore? = nil,
          executableResolver: (() -> URL?)? = nil,
-         compatibilityResolver: ((URL) -> Bool)? = nil) {
-        self.environment = environment
-        self.homeStore = homeStore ?? AITextCodexHomeStore(environment: environment)
-        self.executableResolver = executableResolver ?? {
-            AITextCLIExecutableLocator.executable(for: .codexCLI,
-                                                  environment: environment)
-        }
-        self.compatibilityResolver = compatibilityResolver ?? { executableURL in
+         compatibilityResolver: ((URL) -> Bool)? = nil,
+         probeTTL: TimeInterval = 60) {
+        let resolvedCompatibility = compatibilityResolver ?? { executableURL in
             AITextCodexCompatibility.isSupported(executableURL: executableURL,
                                                  environment: environment)
         }
+        self.environment = environment
+        self.homeStore = homeStore ?? AITextCodexHomeStore(environment: environment)
+        self.executableResolver = executableResolver ?? {
+            AITextCLIExecutableLocator.compatibleExecutable(
+                for: .codexCLI,
+                environment: environment,
+                compatibility: resolvedCompatibility
+            )
+        }
+        self.compatibilityResolver = resolvedCompatibility
+        self.probeTTL = max(1, probeTTL)
     }
 
     var availability: AITextProviderAvailability {
-        guard cachedExecutableAvailability == .ready else {
-            return cachedExecutableAvailability
+        scheduleProbeIfNeeded()
+        probeLock.lock()
+        let snapshot = cachedProbe
+        probeLock.unlock()
+        switch snapshot {
+        case .ready?:
+            break
+        case let .unavailable(message)?:
+            return .unavailable(message)
+        case nil:
+            return .unavailable("正在检查 Codex CLI 兼容性…")
         }
-        do { try homeStore.prepare() }
-        catch { return .unavailable("无法准备 Codex 的独立安全配置") }
         guard homeStore.hasChatGPTCredential else {
             return .unavailable("Codex 尚未完成 RimeBuffer 专用的 ChatGPT 登录")
         }
         return .ready
+    }
+
+    private func scheduleProbeIfNeeded(force: Bool = false) {
+        let now = ProcessInfo.processInfo.systemUptime
+        probeLock.lock()
+        let stale = lastProbeUptime.map { now - $0 >= probeTTL } ?? true
+        guard !probeInFlight, force || cachedProbe == nil || stale else {
+            probeLock.unlock()
+            return
+        }
+        probeInFlight = true
+        probeGeneration &+= 1
+        let generation = probeGeneration
+        probeLock.unlock()
+
+        probeQueue.async { [weak self] in
+            guard let self else { return }
+            let result: ProbeResult
+            guard let executableURL = self.executableResolver() else {
+                result = .unavailable("未找到已通过安全兼容性验证的 Codex CLI")
+                self.publishProbe(result, generation: generation)
+                return
+            }
+            guard let before = AITextVerifiedCLIExecutable.capture(executableURL),
+                  self.compatibilityResolver(before.url) else {
+                result = .unavailable("Codex CLI 版本尚未通过安全兼容性验证")
+                self.publishProbe(result, generation: generation)
+                return
+            }
+            guard let verified = AITextVerifiedCLIExecutable.capture(before.url),
+                  verified == before else {
+                result = .unavailable("无法验证 Codex CLI 可执行文件")
+                self.publishProbe(result, generation: generation)
+                return
+            }
+            do {
+                try self.homeStore.prepare()
+            } catch {
+                result = .unavailable("无法准备 Codex 的独立安全配置")
+                self.publishProbe(result, generation: generation)
+                return
+            }
+            result = .ready(verified)
+            self.publishProbe(result, generation: generation)
+        }
+    }
+
+    private func publishProbe(_ result: ProbeResult, generation: UInt64) {
+        probeLock.lock()
+        guard probeGeneration == generation else {
+            probeLock.unlock()
+            return
+        }
+        let changed = cachedProbe != result
+        cachedProbe = result
+        probeInFlight = false
+        lastProbeUptime = ProcessInfo.processInfo.systemUptime
+        probeLock.unlock()
+        guard changed else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            NotificationCenter.default.post(
+                name: .aiTextConnectorAvailabilityDidChange,
+                object: self,
+                userInfo: ["kind": AITextProviderKind.codexCLI.rawValue]
+            )
+        }
+    }
+
+    private func executableForGeneration() -> Result<URL, AITextProviderError> {
+        scheduleProbeIfNeeded()
+        probeLock.lock()
+        let snapshot = cachedProbe
+        probeLock.unlock()
+        switch snapshot {
+        case let .ready(verified)?:
+            guard verified.stillMatches else {
+                probeLock.lock()
+                cachedProbe = nil
+                lastProbeUptime = nil
+                probeLock.unlock()
+                scheduleProbeIfNeeded(force: true)
+                return .failure(.unavailable("Codex CLI 已发生变化，正在重新验证"))
+            }
+            return .success(verified.url)
+        case let .unavailable(message)?:
+            return .failure(.unavailable(message))
+        case nil:
+            return .failure(.unavailable("正在检查 Codex CLI 兼容性…"))
+        }
     }
 
     static func appServerArguments(workspaceURL: URL) -> [String] {
@@ -1936,12 +2167,12 @@ final class CodexCLITextProvider: AITextProvider {
             completion(.failure(.resultTooLarge))
             return relay
         }
-        guard let executableURL = executableResolver() else {
-            completion(.failure(.unavailable("未找到 Codex CLI")))
-            return relay
-        }
-        guard compatibilityResolver(executableURL) else {
-            completion(.failure(.unavailable("Codex CLI 版本尚未通过安全兼容性验证")))
+        let executableURL: URL
+        switch executableForGeneration() {
+        case let .success(value):
+            executableURL = value
+        case let .failure(error):
+            completion(.failure(error))
             return relay
         }
         do { try homeStore.prepare() }
@@ -2002,37 +2233,191 @@ final class CodexCLITextProvider: AITextProvider {
 }
 
 final class ClaudeCodeCLITextProvider: AITextProvider {
+    private enum ProbeResult: Equatable {
+        case ready(AITextVerifiedCLIExecutable)
+        case signedOut(AITextVerifiedCLIExecutable)
+        case unavailable(String)
+
+        var verifiedExecutable: AITextVerifiedCLIExecutable? {
+            switch self {
+            case let .ready(value), let .signedOut(value): return value
+            case .unavailable: return nil
+            }
+        }
+    }
+
     let kind: AITextProviderKind = .claudeCodeCLI
     private let runner: any AITextCLIProcessRunning
     private let environment: [String: String]
     private let executableResolver: () -> URL?
     private let compatibilityResolver: (URL) -> Bool
-    private lazy var cachedAvailability: AITextProviderAvailability = {
-        guard let executableURL = executableResolver() else {
-            return .unavailable("未找到 Claude Code CLI")
-        }
-        return compatibilityResolver(executableURL)
-            ? .ready
-            : .unavailable("Claude Code CLI 版本尚未通过安全兼容性验证")
-    }()
+    private let authenticationResolver: (URL) -> Bool
+    private let probeTTL: TimeInterval
+    private let probeQueue = DispatchQueue(label: "RimeBuffer.AIText.ClaudeProbe",
+                                           qos: .utility)
+    private let probeLock = NSLock()
+    private var cachedProbe: ProbeResult?
+    private var probeInFlight = false
+    private var probeGeneration: UInt64 = 0
+    private var lastProbeUptime: TimeInterval?
 
     init(runner: any AITextCLIProcessRunning = AITextFoundationCLIProcessRunner(),
          environment: [String: String] = ProcessInfo.processInfo.environment,
          executableResolver: (() -> URL?)? = nil,
-         compatibilityResolver: ((URL) -> Bool)? = nil) {
-        self.runner = runner
-        self.environment = environment
-        self.executableResolver = executableResolver ?? {
-            AITextCLIExecutableLocator.executable(for: .claudeCodeCLI,
-                                                  environment: environment)
-        }
-        self.compatibilityResolver = compatibilityResolver ?? { executableURL in
+         compatibilityResolver: ((URL) -> Bool)? = nil,
+         authenticationResolver: ((URL) -> Bool)? = nil,
+         probeTTL: TimeInterval = 60) {
+        let resolvedCompatibility = compatibilityResolver ?? { executableURL in
             AITextClaudeCompatibility.isSupported(executableURL: executableURL,
                                                   environment: environment)
         }
+        self.runner = runner
+        self.environment = environment
+        self.executableResolver = executableResolver ?? {
+            AITextCLIExecutableLocator.compatibleExecutable(
+                for: .claudeCodeCLI,
+                environment: environment,
+                compatibility: resolvedCompatibility
+            )
+        }
+        self.compatibilityResolver = resolvedCompatibility
+        self.authenticationResolver = authenticationResolver ?? { executableURL in
+            AITextClaudeAuthentication.isLoggedIn(executableURL: executableURL,
+                                                   environment: environment)
+        }
+        self.probeTTL = max(1, probeTTL)
     }
 
-    var availability: AITextProviderAvailability { cachedAvailability }
+    var availability: AITextProviderAvailability {
+        scheduleProbeIfNeeded()
+        probeLock.lock()
+        let snapshot = cachedProbe
+        probeLock.unlock()
+        switch snapshot {
+        case .ready?:
+            return .ready
+        case .signedOut?:
+            return .unavailable("Claude 尚未登录，请点击“登录 Claude”完成 CLI 授权")
+        case let .unavailable(message)?:
+            return .unavailable(message)
+        case nil:
+            return .unavailable("正在检查 Claude Code CLI 与登录状态…")
+        }
+    }
+
+    private func scheduleProbeIfNeeded(force: Bool = false) {
+        let now = ProcessInfo.processInfo.systemUptime
+        probeLock.lock()
+        let stale = lastProbeUptime.map { now - $0 >= probeTTL } ?? true
+        guard !probeInFlight, force || cachedProbe == nil || stale else {
+            probeLock.unlock()
+            return
+        }
+        probeInFlight = true
+        probeGeneration &+= 1
+        let generation = probeGeneration
+        probeLock.unlock()
+
+        probeQueue.async { [weak self] in
+            guard let self else { return }
+            let result: ProbeResult
+            guard let executableURL = self.executableResolver() else {
+                result = .unavailable("未找到已通过安全兼容性验证的 Claude Code CLI")
+                self.publishProbe(result, generation: generation)
+                return
+            }
+            guard let before = AITextVerifiedCLIExecutable.capture(executableURL),
+                  self.compatibilityResolver(before.url) else {
+                result = .unavailable("Claude Code CLI 版本尚未通过安全兼容性验证")
+                self.publishProbe(result, generation: generation)
+                return
+            }
+            guard let verified = AITextVerifiedCLIExecutable.capture(before.url),
+                  verified == before else {
+                result = .unavailable("无法验证 Claude Code CLI 可执行文件")
+                self.publishProbe(result, generation: generation)
+                return
+            }
+            result = self.authenticationResolver(verified.url)
+                ? .ready(verified)
+                : .signedOut(verified)
+            self.publishProbe(result, generation: generation)
+        }
+    }
+
+    private func publishProbe(_ result: ProbeResult, generation: UInt64) {
+        probeLock.lock()
+        guard probeGeneration == generation else {
+            probeLock.unlock()
+            return
+        }
+        let changed = cachedProbe != result
+        cachedProbe = result
+        probeInFlight = false
+        lastProbeUptime = ProcessInfo.processInfo.systemUptime
+        probeLock.unlock()
+        if changed { postAvailabilityChange() }
+    }
+
+    private func postAvailabilityChange() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            NotificationCenter.default.post(
+                name: .aiTextConnectorAvailabilityDidChange,
+                object: self,
+                userInfo: ["kind": AITextProviderKind.claudeCodeCLI.rawValue]
+            )
+        }
+    }
+
+    /// The login operation already performs a background `auth status` check.
+    /// Publish that verified outcome directly; cancellation/failure keeps the
+    /// last usable state while a background refresh reconciles any CLI change.
+    func authenticationDidChange(_ loggedIn: Bool?) {
+        var changed = false
+        var needsProbe = false
+        probeLock.lock()
+        probeGeneration &+= 1
+        probeInFlight = false
+        if loggedIn == true,
+           let verified = cachedProbe?.verifiedExecutable,
+           verified.stillMatches {
+            let next = ProbeResult.ready(verified)
+            changed = cachedProbe != next
+            cachedProbe = next
+            lastProbeUptime = ProcessInfo.processInfo.systemUptime
+        } else {
+            needsProbe = true
+        }
+        probeLock.unlock()
+        if changed { postAvailabilityChange() }
+        if needsProbe { scheduleProbeIfNeeded(force: true) }
+    }
+
+    private func executableForGeneration() -> Result<URL, AITextProviderError> {
+        scheduleProbeIfNeeded()
+        probeLock.lock()
+        let snapshot = cachedProbe
+        probeLock.unlock()
+        switch snapshot {
+        case let .ready(verified)?:
+            guard verified.stillMatches else {
+                probeLock.lock()
+                cachedProbe = nil
+                lastProbeUptime = nil
+                probeLock.unlock()
+                scheduleProbeIfNeeded(force: true)
+                return .failure(.unavailable("Claude Code CLI 已发生变化，正在重新验证"))
+            }
+            return .success(verified.url)
+        case .signedOut?:
+            return .failure(.unavailable("Claude 尚未登录，请点击“登录 Claude”完成 CLI 授权"))
+        case let .unavailable(message)?:
+            return .failure(.unavailable(message))
+        case nil:
+            return .failure(.unavailable("正在检查 Claude Code CLI 与登录状态…"))
+        }
+    }
 
     @discardableResult
     func generate(_ request: AITextProviderRequest,
@@ -2044,12 +2429,12 @@ final class ClaudeCodeCLITextProvider: AITextProvider {
             completion(.failure(.resultTooLarge))
             return relay
         }
-        guard let executableURL = executableResolver() else {
-            completion(.failure(.unavailable("未找到 Claude Code CLI")))
-            return relay
-        }
-        guard compatibilityResolver(executableURL) else {
-            completion(.failure(.unavailable("Claude Code CLI 版本尚未通过安全兼容性验证")))
+        let executableURL: URL
+        switch executableForGeneration() {
+        case let .success(value):
+            executableURL = value
+        case let .failure(error):
+            completion(.failure(error))
             return relay
         }
         let temporary: AITextTemporaryWorkspace
@@ -2082,7 +2467,7 @@ final class ClaudeCodeCLITextProvider: AITextProvider {
                 "--include-partial-messages",
                 "--tools", "", "--disable-slash-commands", "--safe-mode",
                 "--strict-mcp-config", "--no-session-persistence",
-                "--permission-mode", "dontAsk",
+                "--permission-mode", "dontAsk", "--no-chrome",
             ],
             standardInput: stdin,
             currentDirectoryURL: temporary.directoryURL,
@@ -2105,6 +2490,7 @@ final class ClaudeCodeCLITextProvider: AITextProvider {
             if result.timedOut { completion(.failure(.timedOut)); return }
             if result.outputTooLarge { completion(.failure(.resultTooLarge)); return }
             guard result.terminationStatus == 0 else {
+                self.authenticationDidChange(nil)
                 completion(.failure(.failed))
                 return
             }
@@ -2672,6 +3058,11 @@ final class AITextConnectorRegistry: AITextProvider {
             ?? .unavailable("连接器不可用：\(kind.displayName)")
     }
 
+    func claudeAuthenticationDidChange(_ loggedIn: Bool?) {
+        (provider(for: .claudeCodeCLI) as? ClaudeCodeCLITextProvider)?
+            .authenticationDidChange(loggedIn)
+    }
+
     @discardableResult
     func select(_ kind: AITextProviderKind) -> Bool {
         selectionStore.select(kind)
@@ -2850,6 +3241,13 @@ final class AITextPluginWorkspace: BufferDeliveryContentSource {
             ) { [weak self] _ in
                 self?.configurationDidChange()
             })
+            observers.append(NotificationCenter.default.addObserver(
+                forName: .aiTextConnectorAvailabilityDidChange,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                self?.availabilityDidChange()
+            })
         }
         selectionDidChange()
     }
@@ -2875,6 +3273,19 @@ final class AITextPluginWorkspace: BufferDeliveryContentSource {
     /// already reload on every access; this only invalidates any old result.
     func configurationDidChange() {
         invalidate(clearOutput: true, nextPhase: .idle)
+        refreshAvailability()
+        notifyChange()
+    }
+
+    /// Runtime availability changes (for example a completed CLI auth probe)
+    /// must update controls without deleting a generated, unsent target rail.
+    private func availabilityDidChange() {
+        guard isSelected, !protectedSession else { return }
+        // Availability gates the next generation. It must not lock an already
+        // reviewed target rail or interrupt the CLI that is currently running.
+        if phase == .running || (phase == .ready && !outputBlocks.isEmpty) {
+            return
+        }
         refreshAvailability()
         notifyChange()
     }
@@ -3088,7 +3499,9 @@ final class AITextPluginWorkspace: BufferDeliveryContentSource {
         }
         switch provider.availability {
         case .ready:
-            if case .unavailable = phase { phase = .idle }
+            if case .unavailable = phase {
+                phase = outputBlocks.isEmpty ? .idle : .ready
+            }
         case let .unavailable(message):
             phase = .unavailable(message)
         }
@@ -3200,6 +3613,7 @@ final class AITextPluginWorkspace: BufferDeliveryContentSource {
             capturedSourceBlockIDs.removeAll()
             stableIDs.removeAll()
             phase = .idle
+            refreshAvailability()
             sourceModel.consumeDelivered(blockIDs: sourceIDs)
         }
         notifyChange()
