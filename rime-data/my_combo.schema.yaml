@@ -14,15 +14,9 @@ switches:
   - name: ascii_mode
     reset: 0
     states: [ 中, 英 ]
-  - name: ai_mode
-    reset: 0
-    states: [ 常, AI ]
 
 engine:
   processors:
-    - lua_processor@*mode_switch_processor
-    - lua_processor@*ai_box_processor
-    - lua_processor@*ai_clipboard_processor
     - ascii_composer
     - recognizer
     - chord_composer  # 核心：并击处理器
@@ -39,12 +33,10 @@ engine:
     - punct_segmentor
     - fallback_segmentor
   translators:
-    - lua_translator@*ai_box_status_translator
     - punct_translator
     - script_translator
-    - lua_translator@*ai_translator
+    - echo_translator  # 无映射和弦仍给出可提交的原码候选
   filters:
-    - lua_filter@*ai_box_filter
     - uniquifier
 
 ascii_composer:
@@ -755,7 +747,9 @@ chord_composer:
 
 
 speller:
-  alphabet: 'qwertyuiopasdfghjklzxcvbnm,.'
+  # ,/. 只属于 chord_composer 的双角色物理键；和弦结算为单键时必须
+  # 继续交给 punctuator，而不能在这里被当作无候选拼音编码吞掉。
+  alphabet: 'qwertyuiopasdfghjklzxcvbnm'
   delimiter: "'"
 translator:
   dictionary: rime_ice  # 使用雾凇拼音词典
@@ -770,50 +764,6 @@ punctuator:
 
 key_binder:
   import_preset: default
-  ai_translate_clipboard: Control+Shift+e
 
 recognizer:
   import_preset: default
-
-ai_translator:
-  trigger: zzai
-  comment: "〔AI续写〕"
-  empty_context_hint: "先正常输入一句话，再输入 zzai"
-  error_text: "AI 未就绪"
-  max_candidates: 3
-  recent_commit_count: 12
-  max_context_chars: 240
-  cache_ttl_seconds: 15
-  timeout_seconds: 8
-  python_bin: /usr/bin/python3
-
-ai_clipboard_processor:
-  hotkeys:
-    - F8
-    - Shift+F8
-    - Control+Shift+e
-  timeout_seconds: 12
-  python_bin: /usr/bin/python3
-
-ai_box_processor:
-  timeout_seconds: 12
-  python_bin: /usr/bin/python3
-  error_prefix: "AI 请求失败："
-  enable_stream: true
-  poll_interval_seconds: 0.12
-  wait_timeout_seconds: 20
-  native_refresh_key: F20
-
-ai_box_status_translator:
-  idle_code: zzzzaibox
-  label: "〔AI〕"
-  preedit_prefix: "AI >"
-  ready_hint: "1-4/↑↓ 空格回车Tab"
-  waiting_text: "AI 正在生成..."
-  comment_preview_chars: 96
-
-ai_box_filter:
-  label: "〔AI〕"
-
-mode_switch_processor:
-  idle_code: zzzzaibox

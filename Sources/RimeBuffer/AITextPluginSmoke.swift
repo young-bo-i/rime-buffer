@@ -35,6 +35,13 @@ private final class AITextSmokeProvider: AITextProvider {
         eventCallbacks[index](.blockSnapshot(block))
     }
 
+    func emitActivity(_ message: String,
+                      kind: AITextProviderActivityKind = .reasoning,
+                      request index: Int) {
+        eventCallbacks[index](.activity(AITextProviderActivity(kind: kind,
+                                                               message: message)))
+    }
+
     func finish(_ result: Result<[AITextProviderBlock], AITextProviderError>,
                 request index: Int) {
         completions[index](result)
@@ -73,22 +80,533 @@ private final class AITextSmokeRunner: AITextCLIProcessRunning {
     }
 }
 
+private final class AITextSmokeURLProtocol: URLProtocol {
+    private static let handlerLock = NSLock()
+    private static var storedHandler: ((AITextSmokeURLProtocol) -> Void)?
+
+    static func install(_ handler: @escaping (AITextSmokeURLProtocol) -> Void) {
+        handlerLock.lock()
+        storedHandler = handler
+        handlerLock.unlock()
+    }
+
+    static func reset() {
+        handlerLock.lock()
+        storedHandler = nil
+        handlerLock.unlock()
+    }
+
+    private static func currentHandler() -> ((AITextSmokeURLProtocol) -> Void)? {
+        handlerLock.lock()
+        defer { handlerLock.unlock() }
+        return storedHandler
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let handler = Self.currentHandler() else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        handler(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private final class AITextOpenAISmokeRecorder {
+    struct Snapshot {
+        var events: [AITextProviderEvent]
+        var results: [Result<[AITextProviderBlock], AITextProviderError>]
+        var eventAfterCompletion: Bool
+    }
+
+    private let lock = NSLock()
+    private var events: [AITextProviderEvent] = []
+    private var results: [Result<[AITextProviderBlock], AITextProviderError>] = []
+    private var completed = false
+    private var eventAfterCompletion = false
+
+    func record(_ event: AITextProviderEvent) {
+        lock.lock()
+        if completed { eventAfterCompletion = true }
+        events.append(event)
+        lock.unlock()
+    }
+
+    func record(_ result: Result<[AITextProviderBlock], AITextProviderError>) {
+        lock.lock()
+        completed = true
+        results.append(result)
+        lock.unlock()
+    }
+
+    func snapshot() -> Snapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return Snapshot(events: events,
+                        results: results,
+                        eventAfterCompletion: eventAfterCompletion)
+    }
+}
+
+private enum AITextCodexLoginProtocolSmoke {
+    static func run() -> Bool {
+        for rawURL in [
+            "https://auth.openai.com/oauth/authorize?state=smoke",
+            "https://chatgpt.com/auth/callback?state=smoke",
+        ] {
+            var state = AITextCodexLoginProtocolState()
+            guard beginLogin(&state),
+                  containsAuthorization(state.consume([
+                    "id": AITextCodexLoginProtocolState.loginStartRequestID,
+                    "result": [
+                        "type": "chatgpt",
+                        "loginId": "login-smoke",
+                        "authUrl": rawURL,
+                    ],
+                  ]), rawURL: rawURL) else { return false }
+        }
+
+        for rejectedURL in [
+            "http://auth.openai.com/oauth/authorize",
+            "https://auth.openai.com.evil.example/oauth/authorize",
+            "https://user@auth.openai.com/oauth/authorize",
+            "https://auth.openai.com:444/oauth/authorize",
+        ] {
+            var state = AITextCodexLoginProtocolState()
+            guard beginLogin(&state),
+                  containsFailure(state.consume([
+                    "id": AITextCodexLoginProtocolState.loginStartRequestID,
+                    "result": [
+                        "type": "chatgpt",
+                        "loginId": "login-smoke",
+                        "authUrl": rejectedURL,
+                    ],
+                  ])) else { return false }
+        }
+
+        var success = AITextCodexLoginProtocolState()
+        guard beginLogin(&success),
+              containsAuthorization(success.consume([
+                "id": AITextCodexLoginProtocolState.loginStartRequestID,
+                "result": [
+                    "type": "chatgpt",
+                    "loginId": "expected-login",
+                    "authUrl": "https://chatgpt.com/auth/callback",
+                ],
+              ]), rawURL: "https://chatgpt.com/auth/callback"),
+              success.consume([
+                "method": "account/login/completed",
+                "params": ["loginId": "other-login", "success": true],
+              ]).isEmpty,
+              containsAccountRead(success.consume([
+                "method": "account/login/completed",
+                "params": ["loginId": "expected-login", "success": true],
+              ])),
+              containsCompletion(success.consume([
+                "id": AITextCodexLoginProtocolState.accountReadRequestID,
+                "result": [
+                    "account": [
+                        "type": "chatgpt",
+                        "email": NSNull(),
+                        "planType": "plus",
+                    ],
+                    "requiresOpenaiAuth": true,
+                ],
+              ])) else { return false }
+
+        var failedCompletion = AITextCodexLoginProtocolState()
+        guard beginLogin(&failedCompletion) else { return false }
+        _ = failedCompletion.consume([
+            "id": AITextCodexLoginProtocolState.loginStartRequestID,
+            "result": [
+                "type": "chatgpt",
+                "loginId": "failed-login",
+                "authUrl": "https://auth.openai.com/oauth/authorize",
+            ],
+        ])
+        guard containsFailure(failedCompletion.consume([
+            "method": "account/login/completed",
+            "params": ["loginId": "failed-login", "success": false],
+        ])) else { return false }
+
+        var missingAccount = AITextCodexLoginProtocolState()
+        guard beginLogin(&missingAccount) else { return false }
+        _ = missingAccount.consume([
+            "id": AITextCodexLoginProtocolState.loginStartRequestID,
+            "result": [
+                "type": "chatgpt",
+                "loginId": "missing-account",
+                "authUrl": "https://auth.openai.com/oauth/authorize",
+            ],
+        ])
+        _ = missingAccount.consume([
+            "method": "account/login/completed",
+            "params": ["loginId": "missing-account", "success": true],
+        ])
+        guard containsFailure(missingAccount.consume([
+            "id": AITextCodexLoginProtocolState.accountReadRequestID,
+            "result": ["account": NSNull(), "requiresOpenaiAuth": true],
+        ])) else { return false }
+
+        var rpcError = AITextCodexLoginProtocolState()
+        guard containsFailure(rpcError.consume([
+            "id": AITextCodexLoginProtocolState.initializeRequestID,
+            "error": ["code": -32_000, "message": "smoke"],
+        ])) else { return false }
+        return true
+    }
+
+    private static func beginLogin(_ state: inout AITextCodexLoginProtocolState) -> Bool {
+        state.consume([
+            "id": AITextCodexLoginProtocolState.initializeRequestID,
+            "result": ["userAgent": "smoke"],
+        ]).contains {
+            if case .sendInitializedAndStartLogin = $0 { return true }
+            return false
+        }
+    }
+
+    private static func containsAuthorization(
+        _ actions: [AITextCodexLoginProtocolAction],
+        rawURL: String
+    ) -> Bool {
+        actions.contains {
+            if case let .openAuthorizationURL(url, loginID) = $0 {
+                return url.absoluteString == rawURL && loginID == "login-smoke"
+                    || url.absoluteString == rawURL && loginID == "expected-login"
+            }
+            return false
+        }
+    }
+
+    private static func containsAccountRead(
+        _ actions: [AITextCodexLoginProtocolAction]
+    ) -> Bool {
+        actions.contains {
+            if case let .sendAccountRead(loginID) = $0 {
+                return loginID == "expected-login"
+            }
+            return false
+        }
+    }
+
+    private static func containsCompletion(
+        _ actions: [AITextCodexLoginProtocolAction]
+    ) -> Bool {
+        actions.contains { if case .completed = $0 { return true }; return false }
+    }
+
+    private static func containsFailure(
+        _ actions: [AITextCodexLoginProtocolAction]
+    ) -> Bool {
+        actions.contains { if case .failed = $0 { return true }; return false }
+    }
+}
+
+private enum AITextCodexLoginTransportSmoke {
+    private enum Mode: String {
+        case success
+        case cancel
+        case timeout
+    }
+
+    static func run() -> Bool {
+        for mode in [Mode.success, .cancel, .timeout] {
+            guard exercise(mode) else {
+                print("Codex login transport smoke failed: \(mode.rawValue)")
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func exercise(_ mode: Mode) -> Bool {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RimeBuffer-Codex-Login-Transport-Smoke-\(UUID().uuidString)",
+                                   isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: root,
+                                                    withIntermediateDirectories: false,
+                                                    attributes: [.posixPermissions: 0o700])
+        } catch {
+            return false
+        }
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let executable = root.appendingPathComponent("fake-codex")
+        let exitMarker = root.appendingPathComponent("process-exited")
+        let traceURL = root.appendingPathComponent("trace")
+        let script = fakeServerScript(mode: mode,
+                                      exitMarker: exitMarker,
+                                      traceURL: traceURL)
+        do {
+            try Data(script.utf8).write(to: executable, options: .atomic)
+            guard chmod(executable.path, S_IRWXU) == 0 else { return false }
+        } catch {
+            return false
+        }
+
+        let homeStore = AITextCodexHomeStore(
+            rootDirectory: root.appendingPathComponent("app-data", isDirectory: true)
+        )
+        var operation: AITextCodexLoginOperation?
+        var result: Result<Void, AITextProviderError>?
+        var completionCount = 0
+        var receivedAuthorizationURL = false
+        var callbackAfterCompletion = false
+        operation = AITextCodexLoginOperation(
+            environment: ["HOME": "/tmp", "USER": "smoke", "LOGNAME": "smoke"],
+            homeStore: homeStore,
+            executableResolver: { executable },
+            compatibilityResolver: { _ in true },
+            handshakeTimeout: mode == .timeout ? 0.1 : 3,
+            loginTimeout: 1,
+            onAuthorizationURL: { _ in
+                if result != nil { callbackAfterCompletion = true }
+                receivedAuthorizationURL = true
+                if mode == .cancel { operation?.cancel() }
+            },
+            onStatus: { _ in
+                if result != nil { callbackAfterCompletion = true }
+            },
+            completion: {
+                completionCount += 1
+                result = $0
+            }
+        )
+        operation?.start()
+        guard waitUntil(timeout: 4, { result != nil }) else {
+            operation?.cancel()
+            print("Codex login transport timed out waiting for completion: \(mode.rawValue)")
+            return false
+        }
+        _ = waitUntil(timeout: 0.15, { false })
+        guard completionCount == 1,
+              !callbackAfterCompletion,
+              FileManager.default.fileExists(atPath: exitMarker.path) else {
+            print("Codex login transport lifecycle mismatch: mode=\(mode.rawValue) completions=\(completionCount) late=\(callbackAfterCompletion) exited=\(FileManager.default.fileExists(atPath: exitMarker.path)) result=\(String(describing: result))")
+            return false
+        }
+        switch (mode, result) {
+        case (.success, .success?):
+            return receivedAuthorizationURL && homeStore.hasChatGPTCredential
+        case (.cancel, .failure(.cancelled)?):
+            return receivedAuthorizationURL
+        case (.timeout, .failure(.timedOut)?):
+            return !receivedAuthorizationURL
+        default:
+            let trace = (try? String(contentsOf: traceURL, encoding: .utf8)) ?? "<none>"
+            print("Codex login transport result mismatch: mode=\(mode.rawValue) authURL=\(receivedAuthorizationURL) credential=\(homeStore.hasChatGPTCredential) result=\(String(describing: result)) trace=\(trace)")
+            return false
+        }
+    }
+
+    private static func waitUntil(timeout: TimeInterval,
+                                  _ condition: () -> Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            _ = RunLoop.current.run(mode: .default,
+                                    before: Date().addingTimeInterval(0.01))
+        }
+        return condition()
+    }
+
+    private static func fakeServerScript(mode: Mode,
+                                         exitMarker: URL,
+                                         traceURL: URL) -> String {
+        let marker = shellQuote(exitMarker.path)
+        let trace = shellQuote(traceURL.path)
+        let header = """
+        #!/bin/sh
+        MARKER=\(marker)
+        TRACE=\(trace)
+        trap 'sleep 0.2; : > "$MARKER"; exit 0' TERM
+        hang() { while :; do /bin/sleep 0.1; done; }
+
+        """
+        if mode == .timeout {
+            return header + "while IFS= read -r line; do hang; done\n"
+        }
+        let loginResponse = """
+              *login*start*)
+        """ + (mode == .success ? """
+                printf '%s\n%s\n' '{"id":2,"result":{"type":"chatgpt","loginId":"transport-login","authUrl":"https://auth.openai.com/oauth/authorize?state=smoke"}}' '{"method":"account/login/completed","params":{"loginId":"transport-login","success":true,"error":null}}'
+        """ : """
+                printf '%s\n' '{"id":2,"result":{"type":"chatgpt","loginId":"transport-login","authUrl":"https://chatgpt.com/auth/callback?state=smoke"}}'
+                hang
+        """) + """
+                ;;
+        """
+        let accountResponse = mode == .success ? """
+              *account*read*)
+                printf '%s' '{"auth_mode":"chatgpt","tokens":{"access_token":"access","refresh_token":"refresh"}}' > "$CODEX_HOME/auth.json"
+                chmod 600 "$CODEX_HOME/auth.json"
+                printf '%s\n' '{"id":3,"result":{"account":{"type":"chatgpt","email":null,"planType":"plus"},"requiresOpenaiAuth":true}}'
+                hang
+                ;;
+        """ : ""
+        return header + """
+        while IFS= read -r line; do
+          printf '%s\n' "$line" >> "$TRACE"
+          case "$line" in
+            *'"method":"initialize"'*)
+              printf '%s' '{"id":1,"result":'
+              /bin/sleep 0.02
+              printf '%s\n' '{"userAgent":"transport-smoke"}}'
+              ;;
+        \(loginResponse)
+        \(accountResponse)
+          esac
+        done
+        """
+    }
+
+    private static func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+}
+
+private enum AITextFoundationCLIStreamingSmoke {
+    static func run() -> Bool {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RimeBuffer-CLI-Streaming-Smoke-\(UUID().uuidString)",
+                                   isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: root,
+                                                    withIntermediateDirectories: false,
+                                                    attributes: [.posixPermissions: 0o700])
+        } catch {
+            return false
+        }
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appendingPathComponent("stream-fixture")
+        let releaseMarker = root.appendingPathComponent("release-final-output")
+        let script = """
+        #!/bin/sh
+        printf '%s' 'partial'
+        while [ ! -e "$1" ]; do /bin/sleep 0.02; done
+        printf '%s' 'final'
+        """
+        do {
+            try Data(script.utf8).write(to: executable, options: .atomic)
+            guard chmod(executable.path, S_IRWXU) == 0 else { return false }
+        } catch {
+            return false
+        }
+
+        let firstChunk = DispatchSemaphore(value: 0)
+        let completed = DispatchSemaphore(value: 0)
+        let lock = NSLock()
+        var observedFirst = false
+        var releasedProcess = false
+        var firstData = Data()
+        var finalResult: AITextCLIProcessResult?
+        let runner = AITextFoundationCLIProcessRunner()
+        let task = runner.run(
+            AITextCLIProcessSpec(
+                executableURL: executable,
+                arguments: [releaseMarker.path],
+                standardInput: Data(),
+                currentDirectoryURL: root,
+                environment: ["HOME": "/tmp", "PATH": "/usr/bin:/bin"],
+                timeout: 10,
+                maximumOutputBytes: 1_024
+            ),
+            onStandardOutput: { data in
+                lock.lock()
+                if !observedFirst {
+                    observedFirst = true
+                    firstData = data
+                    releasedProcess = FileManager.default.createFile(
+                        atPath: releaseMarker.path,
+                        contents: Data()
+                    )
+                    firstChunk.signal()
+                }
+                lock.unlock()
+            },
+            completion: { result in
+                lock.lock()
+                finalResult = result
+                lock.unlock()
+                completed.signal()
+            }
+        )
+        // The marker makes this a causal streaming assertion instead of a
+        // scheduler-speed assertion: the child cannot emit its final bytes or
+        // exit until the first stdout callback has actually arrived.
+        guard firstChunk.wait(timeout: .now() + 5) == .success else {
+            task.cancel()
+            _ = completed.wait(timeout: .now() + 2)
+            return false
+        }
+        guard completed.wait(timeout: .now() + 5) == .success else {
+            task.cancel()
+            return false
+        }
+        lock.lock()
+        let first = firstData
+        let didReleaseProcess = releasedProcess
+        let result = finalResult
+        lock.unlock()
+        return didReleaseProcess
+            && String(data: first, encoding: .utf8) == "partial"
+            && String(data: result?.standardOutput ?? Data(), encoding: .utf8) == "partialfinal"
+            && result?.terminationStatus == 0
+            && result?.timedOut == false
+            && result?.cancelled == false
+    }
+}
+
 private enum AITextPluginSmoke {
     static func run() -> Bool {
         guard Thread.isMainThread else { return false }
-        return resultDecoder()
-            && streamParsers()
-            && fakeCLIRunners()
-            && configurationStorageAndRequest()
-            && workspaceGatesAndDelivery()
-            && remoteMirrorAndActionReview()
+        guard resultDecoder() else {
+            print("AI text smoke failed: result decoder")
+            return false
+        }
+        guard streamParsers() else {
+            print("AI text smoke failed: stream parsers")
+            return false
+        }
+        guard fakeCLIRunners() else {
+            print("AI text smoke failed: CLI providers")
+            return false
+        }
+        guard configurationStorageAndRequest() else {
+            print("AI text smoke failed: OpenAI configuration")
+            return false
+        }
+        guard openAIStreamingOperation() else {
+            print("AI text smoke failed: OpenAI streaming")
+            return false
+        }
+        guard connectorSelectionAndUnifiedWorkspace() else {
+            print("AI text smoke failed: connector workspace")
+            return false
+        }
+        guard workspaceGatesAndDelivery() else {
+            print("AI text smoke failed: workspace gates")
+            return false
+        }
+        guard remoteMirrorAndActionReview() else {
+            print("AI text smoke failed: remote action review")
+            return false
+        }
+        return true
     }
 
     private static func resultDecoder() -> Bool {
         let structured = """
         {"blocks":[{"text":"第一块","title":"A"},{"text":"第二块","title":null}]}
         """
-        guard let blocks = try? AITextResultDecoder.decodeFinalText(structured),
+        guard AITextResultDecoder.JSONSchema.contains("\"required\":[\"text\",\"title\"]"),
+              let blocks = try? AITextResultDecoder.decodeFinalText(structured),
               blocks.count == 2,
               blocks[0].index == 0,
               blocks[0].text == "第一块",
@@ -96,7 +614,45 @@ private enum AITextPluginSmoke {
         guard let fenced = try? AITextResultDecoder.decodeFinalText("```json\n\(structured)\n```"),
               fenced == blocks else { return false }
         guard let fallback = try? AITextResultDecoder.decodeFinalText("甲\n\n乙"),
-              fallback.map(\.text) == ["甲", "乙"] else { return false }
+              fallback.map(\.text) == ["甲\n\n", "乙"] else { return false }
+        let fineSource = "第一句，第二句。第三句\n第四句；第五句！"
+        let fine = AITextFineBlockSegmenter.refine([
+            AITextProviderBlock(index: 0, text: fineSource, title: "细分"),
+        ])
+        guard fine.count >= 5,
+              fine.map(\.text).joined() == fineSource,
+              fine.map(\.index) == Array(fine.indices),
+              fine.first?.title == "细分",
+              fine.dropFirst().allSatisfy({ $0.title == nil }) else { return false }
+        let protectedSource = "访问 https://example.com/a?x=1,000&at=12:30，然后看“你好，世界”，代码 `let value = \"a,b:c\"`。"
+        let protected = AITextFineBlockSegmenter.refine([
+            AITextProviderBlock(index: 0, text: protectedSource, title: nil),
+        ])
+        guard protected.map(\.text).joined() == protectedSource,
+              protected.contains(where: { $0.text.contains("https://example.com/a?x=1,000&at=12:30") }),
+              protected.contains(where: { $0.text.contains("“你好，世界”") }),
+              protected.contains(where: { $0.text.contains("`let value = \"a,b:c\"`") }) else {
+            return false
+        }
+        var previousPrefixBlocks: [AITextProviderBlock] = []
+        var growing = ""
+        for character in protectedSource {
+            growing.append(character)
+            let currentBlocks = AITextFineBlockSegmenter.refine([
+                AITextProviderBlock(index: 0, text: growing, title: "流式"),
+            ])
+            let stableCount = max(0, previousPrefixBlocks.count - 1)
+            guard Array(currentBlocks.prefix(stableCount))
+                == Array(previousPrefixBlocks.prefix(stableCount)) else { return false }
+            previousPrefixBlocks = currentBlocks
+        }
+        let manyClauses = (1 ... 21).map { "第\($0)段，" }.joined()
+        let capped = AITextFineBlockSegmenter.refine([
+            AITextProviderBlock(index: 0, text: manyClauses, title: nil),
+        ])
+        guard capped.count == AITextRuntimeLimits.maximumBlockCount,
+              capped.map(\.text).joined() == manyClauses,
+              capped.last?.text.contains("第21段") == true else { return false }
         let partial = AITextPartialJSONBlocks.decode(
             "{\"blocks\":[{\"text\":\"首块\\n正在生"
         )
@@ -140,11 +696,20 @@ private enum AITextPluginSmoke {
                 "delta": ["type": "text_delta", "text": "partial"],
             ],
         ]
+        let claudeResultText = "{\"blocks\":[{\"text\":\"claude result\",\"title\":null}]}"
         let claudeResult: [String: Any] = [
             "type": "result",
-            "structured_output": ["blocks": [["text": "claude result"]]],
+            "result": claudeResultText,
+        ]
+        let claudeThinking: [String: Any] = [
+            "type": "stream_event",
+            "event": [
+                "type": "content_block_delta",
+                "delta": ["type": "thinking_delta", "thinking": "must stay private"],
+            ],
         ]
         guard let deltaData = try? JSONSerialization.data(withJSONObject: claudeDelta),
+              let thinkingData = try? JSONSerialization.data(withJSONObject: claudeThinking),
               let resultData = try? JSONSerialization.data(withJSONObject: claudeResult) else {
             return false
         }
@@ -152,13 +717,59 @@ private enum AITextPluginSmoke {
         var fixture = Data()
         fixture.append(deltaData)
         fixture.append(0x0A)
+        fixture.append(thinkingData)
+        fixture.append(0x0A)
         fixture.append(resultData)
         fixture.append(0x0A)
-        guard let claudeSnapshots = try? claude.append(fixture),
-              claudeSnapshots == ["partial"],
+        guard let claudeBatch = try? claude.append(fixture),
+              claudeBatch.snapshots == ["partial"],
+              claudeBatch.activities.contains(where: { $0.kind == .composing }),
+              claudeBatch.activities.contains(where: { $0.kind == .reasoning }),
+              !claudeBatch.snapshots.contains(where: { $0.contains("must stay private") }),
               let final = claude.finalText,
               let finalBlocks = try? AITextResultDecoder.decodeFinalText(final),
               finalBlocks.first?.text == "claude result" else { return false }
+
+        let allowedRate: [String: Any] = [
+            "type": "rate_limit_event",
+            "rate_limit_info": ["status": "allowed"],
+        ]
+        let warningRate: [String: Any] = [
+            "type": "rate_limit_event",
+            "rate_limit_info": ["status": "allowed_warning"],
+        ]
+        guard let allowedRateData = try? JSONSerialization.data(withJSONObject: allowedRate),
+              let warningRateData = try? JSONSerialization.data(withJSONObject: warningRate) else {
+            return false
+        }
+        var rateFixture = Data()
+        rateFixture.append(allowedRateData)
+        rateFixture.append(0x0A)
+        rateFixture.append(warningRateData)
+        rateFixture.append(0x0A)
+        var rateParser = AITextClaudeJSONStreamParser()
+        guard let rateBatch = try? rateParser.append(rateFixture),
+              rateBatch.activities.count == 1,
+              rateBatch.activities.first?.message == "Claude Code 接近用量限制" else {
+            return false
+        }
+
+        let forbiddenTool: [String: Any] = [
+            "type": "stream_event",
+            "event": [
+                "type": "content_block_start",
+                "content_block": ["type": "server_tool_use"],
+            ],
+        ]
+        guard var forbiddenData = try? JSONSerialization.data(withJSONObject: forbiddenTool) else {
+            return false
+        }
+        forbiddenData.append(0x0A)
+        var forbiddenParser = AITextClaudeJSONStreamParser()
+        do {
+            _ = try forbiddenParser.append(forbiddenData)
+            return false
+        } catch {}
 
         let eventOne = "data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\n"
         let eventTwo = "data: {\"choices\":[{\"delta\":{\"content\":\" two\"}}]}\r\n\r\n"
@@ -172,70 +783,101 @@ private enum AITextPluginSmoke {
               (try? AITextOpenAIResponseDecoder.streamDelta(from: payloads[1])) == " two" else {
             return false
         }
+        let unfinishedPayload = "{\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":null}]}"
+        let finishedPayload = "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}"
+        guard let unfinished = try? AITextOpenAIResponseDecoder.streamUpdate(
+            from: unfinishedPayload
+        ),
+        unfinished.contentDelta == "x",
+        !unfinished.finished,
+        (try? AITextOpenAIResponseDecoder.streamUpdate(from: finishedPayload))?.finished == true else {
+            return false
+        }
         return true
     }
 
     private static func fakeCLIRunners() -> Bool {
-        let codexRunner = AITextSmokeRunner()
         let fakeExecutable = URL(fileURLWithPath: "/usr/bin/true")
-        let codex = CodexCLITextProvider(runner: codexRunner,
-                                        environment: [
-                                            "HOME": "/tmp",
-                                            "CODEX_HOME": "/tmp/codex",
-                                            "OPENAI_API_KEY": "openai-only",
-                                            "CODEX_API_KEY": "codex-only",
-                                            "ANTHROPIC_API_KEY": "must-not-leak",
-                                            "CLAUDE_CODE_OAUTH_TOKEN": "must-not-leak",
-                                        ],
-                                        executableResolver: { fakeExecutable },
-                                        compatibilityResolver: { _ in true })
-        var codexResult: Result<[AITextProviderBlock], AITextProviderError>?
-        _ = codex.generate(AITextProviderRequest(requestID: UUID(), sourceText: "private-source"),
-                           onEvent: { _ in },
-                           completion: { codexResult = $0 })
-        guard codexRunner.specs.count == 1 else { return false }
-        let codexSpec = codexRunner.specs[0]
-        guard codexSpec.executableURL == fakeExecutable,
-              codexSpec.arguments.first == "exec",
-              !codexSpec.arguments.contains(where: { $0.contains("private-source") }),
-              String(data: codexSpec.standardInput, encoding: .utf8)?.contains("private-source") == true,
-              codexSpec.arguments.contains("--strict-config"),
-              codexSpec.arguments.contains("default_permissions=\"rimebuffer\""),
-              !codexSpec.arguments.contains("--sandbox"),
-              codexSpec.arguments.contains("permissions.rimebuffer.network.enabled=false"),
-              codexSpec.arguments.contains("tools.experimental_request_user_input={enabled=false}"),
-              codexSpec.arguments.contains("web_search=\"disabled\""),
-              codexSpec.arguments.contains(where: {
+        let codexWorkspace = URL(fileURLWithPath: "/tmp/rime-codex-app-server-smoke")
+        let codexArguments = CodexCLITextProvider.appServerArguments(
+            workspaceURL: codexWorkspace
+        )
+        let codexEnvironment = AITextCLIExecutableLocator.sanitizedEnvironment(
+            for: .codexCLI,
+            from: [
+                "HOME": "/tmp",
+                "CODEX_HOME": "/tmp/codex",
+                "OPENAI_API_KEY": "must-not-leak",
+                "CODEX_API_KEY": "must-not-leak",
+                "ANTHROPIC_API_KEY": "must-not-leak",
+            ]
+        )
+        guard codexArguments.first == "app-server",
+              codexArguments.suffix(2) == ["--listen", "stdio://"],
+              codexArguments.contains("--strict-config"),
+              codexArguments.contains("default_permissions=\"rimebuffer\""),
+              !codexArguments.contains("--sandbox"),
+              codexArguments.contains("permissions.rimebuffer.network.enabled=false"),
+              codexArguments.contains("tools.experimental_request_user_input={enabled=false}"),
+              codexArguments.contains("web_search=\"disabled\""),
+              codexArguments.contains(where: {
                   $0.hasPrefix("permissions.rimebuffer.filesystem=")
-                      && $0.contains(codexSpec.currentDirectoryURL.path)
+                      && $0.contains(codexWorkspace.path)
               }),
-              codexSpec.environment["OPENAI_API_KEY"] == "openai-only",
-              codexSpec.environment["CODEX_API_KEY"] == "codex-only",
-              codexSpec.environment["CODEX_HOME"] == "/tmp/codex",
-              codexSpec.environment["TMPDIR"] == codexSpec.currentDirectoryURL.path,
-              codexSpec.environment["ANTHROPIC_API_KEY"] == nil,
-              codexSpec.environment["CLAUDE_CODE_OAUTH_TOKEN"] == nil,
-              !["sh", "bash", "zsh"].contains(codexSpec.executableURL.lastPathComponent) else {
+              codexEnvironment["OPENAI_API_KEY"] == nil,
+              codexEnvironment["CODEX_API_KEY"] == nil,
+              codexEnvironment["CODEX_HOME"] == nil,
+              codexEnvironment["ANTHROPIC_API_KEY"] == nil else {
             return false
         }
-        let codexObject: [String: Any] = [
-            "type": "item.completed",
-            "item": [
-                "type": "agent_message",
-                "text": "{\"blocks\":[{\"text\":\"ok\"}]}",
-            ],
-        ]
-        guard var codexData = try? JSONSerialization.data(withJSONObject: codexObject) else {
+        guard AITextFoundationCLIStreamingSmoke.run() else {
+            print("AI text CLI smoke failed: process streaming")
             return false
         }
-        codexData.append(0x0A)
-        codexRunner.succeed(request: 0, chunks: [codexData])
-        guard case let .success(blocks)? = codexResult,
-              blocks.first?.text == "ok" else { return false }
-
-        let unsupportedRunner = AITextSmokeRunner()
+        guard AITextCodexAppServerProtocolSmoke.run() else {
+            print("AI text CLI smoke failed: Codex app-server protocol")
+            return false
+        }
+        guard AITextCodexLoginProtocolSmoke.run() else {
+            print("AI text CLI smoke failed: Codex login protocol")
+            return false
+        }
+        guard AITextCodexLoginTransportSmoke.run() else {
+            print("AI text CLI smoke failed: Codex login transport")
+            return false
+        }
+        let codexHomeRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RimeBuffer-Codex-Home-Smoke-\(UUID().uuidString)",
+                                    isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: codexHomeRoot) }
+        let codexHome = AITextCodexHomeStore(rootDirectory: codexHomeRoot)
+        do {
+            try codexHome.prepare()
+            guard let config = try? String(contentsOf: codexHome.configurationURL,
+                                           encoding: .utf8),
+                  config.contains("forced_login_method = \"chatgpt\""),
+                  config.contains("[mcp_servers]"),
+                  !config.contains("[mcp_servers.") else { return false }
+            let refreshableCodex = CodexCLITextProvider(
+                environment: ["HOME": "/tmp"],
+                homeStore: codexHome,
+                executableResolver: { fakeExecutable },
+                compatibilityResolver: { _ in true }
+            )
+            guard case .unavailable = refreshableCodex.availability else { return false }
+            let auth: [String: Any] = [
+                "auth_mode": "chatgpt",
+                "tokens": ["access_token": "access", "refresh_token": "refresh"],
+            ]
+            let authData = try JSONSerialization.data(withJSONObject: auth)
+            try authData.write(to: codexHome.authenticationURL, options: .atomic)
+            guard chmod(codexHome.authenticationURL.path, S_IRUSR | S_IWUSR) == 0,
+                  codexHome.hasChatGPTCredential,
+                  refreshableCodex.availability == .ready else { return false }
+        } catch {
+            return false
+        }
         let unsupportedCodex = CodexCLITextProvider(
-            runner: unsupportedRunner,
             environment: ["HOME": "/tmp"],
             executableResolver: { fakeExecutable },
             compatibilityResolver: { _ in false }
@@ -247,8 +889,7 @@ private enum AITextPluginSmoke {
             onEvent: { _ in },
             completion: { unsupportedResult = $0 }
         )
-        guard unsupportedRunner.specs.isEmpty,
-              case .failure(.unavailable)? = unsupportedResult else { return false }
+        guard case .failure(.unavailable)? = unsupportedResult else { return false }
 
         let claudeRunner = AITextSmokeRunner()
         let claude = ClaudeCodeCLITextProvider(runner: claudeRunner,
@@ -260,7 +901,8 @@ private enum AITextPluginSmoke {
                                                    "OPENAI_API_KEY": "must-not-leak",
                                                    "CODEX_HOME": "/tmp/codex-must-not-leak",
                                                ],
-                                               executableResolver: { fakeExecutable })
+                                               executableResolver: { fakeExecutable },
+                                               compatibilityResolver: { _ in true })
         var claudeResultValue: Result<[AITextProviderBlock], AITextProviderError>?
         _ = claude.generate(AITextProviderRequest(requestID: UUID(), sourceText: "claude-source"),
                             onEvent: { _ in },
@@ -269,7 +911,8 @@ private enum AITextPluginSmoke {
               !claudeRunner.specs[0].arguments.contains(where: { $0.contains("claude-source") }),
               String(data: claudeRunner.specs[0].standardInput, encoding: .utf8)?.contains("claude-source") == true,
               claudeRunner.specs[0].arguments.contains("--strict-mcp-config"),
-              claudeRunner.specs[0].environment["ANTHROPIC_API_KEY"] == "anthropic-only",
+              !claudeRunner.specs[0].arguments.contains("--json-schema"),
+              claudeRunner.specs[0].environment["ANTHROPIC_API_KEY"] == nil,
               claudeRunner.specs[0].environment["CLAUDE_CODE_OAUTH_TOKEN"] == "claude-only",
               claudeRunner.specs[0].environment["CLAUDE_CONFIG_DIR"] == "/tmp/claude",
               claudeRunner.specs[0].environment["TMPDIR"] == claudeRunner.specs[0].currentDirectoryURL.path,
@@ -279,7 +922,7 @@ private enum AITextPluginSmoke {
         }
         let claudeObject: [String: Any] = [
             "type": "result",
-            "structured_output": ["blocks": [["text": "claude ok"]]],
+            "result": "{\"blocks\":[{\"text\":\"claude ok\",\"title\":null}]}",
         ]
         guard var claudeData = try? JSONSerialization.data(withJSONObject: claudeObject) else {
             return false
@@ -288,6 +931,46 @@ private enum AITextPluginSmoke {
         claudeRunner.succeed(request: 0, chunks: [claudeData])
         guard case let .success(blocks)? = claudeResultValue,
               blocks.first?.text == "claude ok" else { return false }
+        var preparedClaudeResult: Result<[AITextProviderBlock], AITextProviderError>?
+        _ = claude.generate(
+            AITextProviderRequest(
+                requestID: UUID(),
+                sourceText: "must-not-be-wrapped",
+                preparedPrompt: "prepared-claude-prompt"
+            ),
+            onEvent: { _ in },
+            completion: { preparedClaudeResult = $0 }
+        )
+        guard claudeRunner.specs.count == 2,
+              String(data: claudeRunner.specs[1].standardInput, encoding: .utf8)
+                == "prepared-claude-prompt" else { return false }
+        claudeRunner.succeed(request: 1, chunks: [claudeData])
+        guard case .success? = preparedClaudeResult,
+              AITextCLIExecutableLocator.bundledChatGPTCodexPath
+                == "/Applications/ChatGPT.app/Contents/Resources/codex",
+              AITextCodexCompatibility.supportedVersionOutput.contains(
+                "codex-cli 0.145.0-alpha.18"
+              ),
+              AITextClaudeCompatibility.supportedVersionOutput.contains(
+                "2.1.215 (Claude Code)"
+              ) else { return false }
+
+        let unsupportedClaudeRunner = AITextSmokeRunner()
+        let unsupportedClaude = ClaudeCodeCLITextProvider(
+            runner: unsupportedClaudeRunner,
+            environment: ["HOME": "/tmp"],
+            executableResolver: { fakeExecutable },
+            compatibilityResolver: { _ in false }
+        )
+        guard case .unavailable = unsupportedClaude.availability else { return false }
+        var unsupportedClaudeResult: Result<[AITextProviderBlock], AITextProviderError>?
+        _ = unsupportedClaude.generate(
+            AITextProviderRequest(requestID: UUID(), sourceText: "must-not-send"),
+            onEvent: { _ in },
+            completion: { unsupportedClaudeResult = $0 }
+        )
+        guard unsupportedClaudeRunner.specs.isEmpty,
+              case .failure(.unavailable)? = unsupportedClaudeResult else { return false }
         return true
     }
 
@@ -335,6 +1018,19 @@ private enum AITextPluginSmoke {
         object["model"] as? String == "example-model",
         object["stream"] as? Bool == true else { return false }
 
+        guard let preparedRequest = try? AITextOpenAIRequestBuilder.makeRequest(
+            configuration: configuration,
+            sourceText: "must-not-be-user-content",
+            preparedPrompt: "prepared-openai-prompt"
+        ),
+        let preparedBody = preparedRequest.httpBody,
+        let preparedObject = try? JSONSerialization.jsonObject(with: preparedBody)
+            as? [String: Any],
+        let messages = preparedObject["messages"] as? [[String: Any]],
+        messages.last?["content"] as? String == "prepared-openai-prompt" else {
+            return false
+        }
+
         do {
             try store.delete()
             let target = root.appendingPathComponent("outside")
@@ -353,6 +1049,222 @@ private enum AITextPluginSmoke {
         return true
     }
 
+    private static func openAIStreamingOperation() -> Bool {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RimeBuffer-OpenAI-Stream-Smoke-\(UUID().uuidString)",
+                                    isDirectory: true)
+        defer {
+            AITextSmokeURLProtocol.reset()
+            try? FileManager.default.removeItem(at: root)
+        }
+        let store = OpenAICompatibleConfigurationStore(rootDirectory: root)
+        do {
+            try store.save(OpenAICompatibleConfiguration(baseURL: "https://example.com/v1",
+                                                         model: "stream-model",
+                                                         apiKey: ""))
+        } catch {
+            return false
+        }
+        let sessionConfiguration: () -> URLSessionConfiguration = {
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [AITextSmokeURLProtocol.self]
+            return configuration
+        }
+        let provider = OpenAICompatibleTextProvider(
+            configurationStore: store,
+            sessionConfigurationFactory: sessionConfiguration
+        )
+
+        func payload(_ content: String) -> String? {
+            guard let data = try? JSONSerialization.data(withJSONObject: [
+                "choices": [["delta": ["content": content]]],
+            ]) else { return nil }
+            return String(data: data, encoding: .utf8)
+        }
+        guard let first = payload("{\"blocks\":[{\"text\":\"流"),
+              let second = payload("式。\",\"title\":null}]}") else { return false }
+        AITextSmokeURLProtocol.install { protocolInstance in
+            guard let response = HTTPURLResponse(
+                url: protocolInstance.request.url!,
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "text/event-stream"]
+            ) else { return }
+            protocolInstance.client?.urlProtocol(protocolInstance,
+                                                 didReceive: response,
+                                                 cacheStoragePolicy: .notAllowed)
+            protocolInstance.client?.urlProtocol(protocolInstance,
+                                                 didLoad: Data("data: \(first)\n\n".utf8))
+            protocolInstance.client?.urlProtocol(protocolInstance,
+                                                 didLoad: Data("data: \(second)\n\n".utf8))
+            // Deliberately omit didFinishLoading: [DONE] must settle the request
+            // even when a compatible server keeps the HTTP body alive.
+            protocolInstance.client?.urlProtocol(protocolInstance,
+                                                 didLoad: Data("data: [DONE]\n\n".utf8))
+            // Any transport callbacks queued after the protocol terminator
+            // must be ignored by the settled operation.
+            protocolInstance.client?.urlProtocol(protocolInstance,
+                                                 didLoad: Data("data: {not-json}\n\n".utf8))
+            protocolInstance.client?.urlProtocolDidFinishLoading(protocolInstance)
+        }
+        let recorder = AITextOpenAISmokeRecorder()
+        _ = provider.generate(
+            AITextProviderRequest(requestID: UUID(), sourceText: "stream source"),
+            onEvent: { recorder.record($0) },
+            completion: { recorder.record($0) }
+        )
+        guard runLoopUntil({ !recorder.snapshot().results.isEmpty }) else { return false }
+        _ = runLoopUntil(timeout: 0.05) { false }
+        let streamed = recorder.snapshot()
+        guard streamed.results.count == 1,
+              !streamed.eventAfterCompletion,
+              case let .success(blocks) = streamed.results[0],
+              blocks.map(\.text).joined() == "流式。",
+              streamed.events.contains(where: {
+                  if case .activity(.init(kind: .composing,
+                                         message: "Open API 正在流式返回")) = $0 {
+                      return true
+                  }
+                  return false
+              }),
+              streamed.events.contains(where: {
+                  if case .blockSnapshot = $0 { return true }
+                  return false
+              }) else { return false }
+
+        AITextSmokeURLProtocol.install { protocolInstance in
+            guard let response = HTTPURLResponse(
+                url: protocolInstance.request.url!,
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/json"]
+            ) else { return }
+            protocolInstance.client?.urlProtocol(protocolInstance,
+                                                 didReceive: response,
+                                                 cacheStoragePolicy: .notAllowed)
+        }
+        let unsupportedRecorder = AITextOpenAISmokeRecorder()
+        _ = provider.generate(
+            AITextProviderRequest(requestID: UUID(), sourceText: "must stream"),
+            onEvent: { _ in },
+            completion: { unsupportedRecorder.record($0) }
+        )
+        guard runLoopUntil({ !unsupportedRecorder.snapshot().results.isEmpty }) else {
+            return false
+        }
+        let unsupported = unsupportedRecorder.snapshot().results
+        guard unsupported.count == 1,
+              case let .failure(.invalidConfiguration(message)) = unsupported[0],
+              message.contains("流式") else { return false }
+
+        let transportReady = DispatchSemaphore(value: 0)
+        let releaseTransport = DispatchSemaphore(value: 0)
+        AITextSmokeURLProtocol.install { protocolInstance in
+            guard let response = HTTPURLResponse(
+                url: protocolInstance.request.url!,
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "text/event-stream"]
+            ) else { return }
+            protocolInstance.client?.urlProtocol(protocolInstance,
+                                                 didReceive: response,
+                                                 cacheStoragePolicy: .notAllowed)
+            transportReady.signal()
+            _ = releaseTransport.wait(timeout: .now() + 1)
+            let frames = "data: \(first)\n\ndata: \(second)\n\ndata: [DONE]\n\n"
+            protocolInstance.client?.urlProtocol(protocolInstance,
+                                                 didLoad: Data(frames.utf8))
+            protocolInstance.client?.urlProtocolDidFinishLoading(protocolInstance)
+        }
+        let raceRecorder = AITextOpenAISmokeRecorder()
+        let raceTask = provider.generate(
+            AITextProviderRequest(requestID: UUID(), sourceText: "cancel race"),
+            onEvent: { raceRecorder.record($0) },
+            completion: { raceRecorder.record($0) }
+        )
+        guard transportReady.wait(timeout: .now() + 1) == .success else { return false }
+        let cancelIssued = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            raceTask.cancel()
+            cancelIssued.signal()
+        }
+        releaseTransport.signal()
+        guard cancelIssued.wait(timeout: .now() + 1) == .success,
+              runLoopUntil({ !raceRecorder.snapshot().results.isEmpty }) else { return false }
+        _ = runLoopUntil(timeout: 0.05) { false }
+        let raced = raceRecorder.snapshot()
+        guard raced.results.count == 1,
+              !raced.eventAfterCompletion else { return false }
+        return true
+    }
+
+    private static func runLoopUntil(timeout: TimeInterval = 1,
+                                     _ predicate: () -> Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        repeat {
+            if predicate() { return true }
+            _ = RunLoop.main.run(mode: .default,
+                                 before: min(deadline, Date().addingTimeInterval(0.01)))
+        } while Date() < deadline
+        return predicate()
+    }
+
+    private static func connectorSelectionAndUnifiedWorkspace() -> Bool {
+        let defaultsName = "RimeBuffer.AIConnectorSmoke.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: defaultsName) else { return false }
+        defer { defaults.removePersistentDomain(forName: defaultsName) }
+
+        let selection = AITextConnectorSelectionStore(defaults: defaults)
+        let codex = AITextSmokeProvider(kind: .codexCLI)
+        let claude = AITextSmokeProvider(kind: .claudeCodeCLI)
+        let openAI = AITextSmokeProvider(kind: .openAICompatible)
+        let registry = AITextConnectorRegistry(
+            selectionStore: selection,
+            providers: [codex, claude, openAI]
+        )
+        guard selection.selectedKind == .codexCLI,
+              registry.selectedKind == .codexCLI,
+              (registry.selectedProvider as? AITextSmokeProvider) === codex,
+              registry.provider(for: .openAICompatible)?.kind == .openAICompatible else {
+            return false
+        }
+
+        let source = BufferModel()
+        source.stageExternal("connector-source", origin: .rime)
+        let workspace = AITextPluginWorkspace(
+            provider: registry,
+            sourceModel: source,
+            pluginKey: AITextBuiltInPluginID.key,
+            isSelected: { true }
+        )
+        workspace.start()
+        defer { workspace.stop() }
+        guard workspace.pluginKey == AITextBuiltInPluginID.key,
+              workspace.deliveryWorkspaceID == "ai-text",
+              workspace.generate(),
+              codex.requests.count == 1 else { return false }
+
+        guard registry.select(.claudeCodeCLI),
+              codex.cancellations[0].wasCancelled,
+              workspace.outputBlocks.isEmpty,
+              workspace.kind == .claudeCodeCLI,
+              AITextConnectorSelectionStore(defaults: defaults).selectedKind
+                == .claudeCodeCLI,
+              (registry.selectedProvider as? AITextSmokeProvider) === claude,
+              workspace.generate(),
+              claude.requests.count == 1 else { return false }
+        claude.finish(.success([
+            AITextProviderBlock(index: 0, text: "selected connector", title: nil),
+        ]), request: 0)
+        guard workspace.phase == .ready,
+              workspace.deliveryPendingBlocks.first?.origin
+                == .processor(id: AITextProviderKind.claudeCodeCLI.processorID,
+                              allowsRemoteMirror: true),
+              AITextProviderError.unavailable("connector detail").localizedDescription
+                == "connector detail" else { return false }
+        return true
+    }
+
     private static func workspaceGatesAndDelivery() -> Bool {
         let source = BufferModel()
         source.stageExternal("source", origin: .rime)
@@ -366,6 +1278,10 @@ private enum AITextPluginSmoke {
         guard workspace.canGenerate, workspace.generate(), provider.requests.count == 1 else {
             return false
         }
+        provider.emitActivity("正在认真组织回复", request: 0)
+        guard workspace.statusText.contains("正在认真组织回复"),
+              workspace.outputBlocks.isEmpty,
+              workspace.phase == .running else { return false }
         provider.emit(AITextProviderBlock(index: 0, text: "draft", title: nil), request: 0)
         guard let partialID = workspace.outputBlocks.first?.id,
               workspace.outputBlocks.first?.incomplete == true,

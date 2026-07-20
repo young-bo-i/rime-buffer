@@ -1,6 +1,6 @@
 # Enter输入法 (ETInput) · 系统架构
 
-版本：2026-07-19 · 权威全局架构文档
+版本：2026-07-20 · 权威全局架构文档
 关系：本文档描述**整个系统**（既有输入核心 + 缓冲工作台）。`WORKBENCH-DESIGN.md` 是工作台的产品方案与决策记录；`ARCHITECTURE.md` 是 P1 时代的交接文档（已滞后，仅存档）。三者冲突时以本文档为准。
 
 代码规模：约 31000 行（Swift + 一层 C++ librime 桥）。单进程、后台 agent（`LSUIElement`）。
@@ -9,7 +9,7 @@
 
 ## 0. 一句话
 
-Enter输入法是一个 **macOS 中文输入法**（IMKit + 自包含 librime），并在其上叠加了一个**独立、常驻、上屏前的文本工作台**：本地打字、已接受的外部文字与用户主动请求的插件结果汇入缓冲区，经人工确认后投递到实时校验的输入框。普通工作台折叠/展开为 44/78pt；苹果本地翻译、Codex CLI、Claude Code CLI 或 OpenAI 兼容 API 打开时改为上 source/下 target 两条缓冲轨，折叠/展开为 78/112pt，拖拽/展开对齐源文行，发送对齐目标行。上层含状态、缓冲插件选择器与当前动作、刷新/重置和关闭；选择器可原地切换全部 `.bufferAction` 插件的唯一 owner。AI 插件只在用户点击生成时读取当前缓冲全文；下方目标块全部成功发送后才消费对应源块。刷新/重置保留源正文，只取消过时任务、重新探测上下文或重启当前生成。`Command+Shift+B` 可从任意应用全局打开工作台并恢复缓冲捕获。工作台本身不提供块编辑器或缓冲开关；候选与 preedit 继续由常规 `CandidateWindow` 呈现，缓冲模式下默认锚定在工作台下方。
+Enter输入法是一个 **macOS 中文输入法**（IMKit + 自包含 librime），并在其上叠加了一个**独立、常驻、上屏前的文本工作台**：本地打字、已接受的外部文字与用户主动请求的插件结果汇入缓冲区，经人工确认后投递到实时校验的输入框。普通工作台折叠/展开为 44/78pt；苹果本地翻译或唯一的「AI 生成」插件打开时改为上 source/下 target 两条缓冲轨，折叠/展开为 78/112pt，拖拽/展开对齐源文行，发送对齐目标行。「AI 生成」与 Action Plugin 使用“连接器 › AI 模型”中独立选择的 Codex CLI、Claude Code CLI 或 OpenAI 兼容 API；模型源不再分别占用缓冲插件位。上层含状态、缓冲插件选择器与当前动作、刷新/重置和关闭；选择器可原地切换全部 `.bufferAction` 插件的唯一 owner。AI 只在用户明确点击生成时运行；下方目标块全部成功发送后才消费对应源块。刷新/重置保留源正文，只取消过时任务、重新探测上下文或重启当前生成。`Command+Shift+B` 可从任意应用全局切换工作台：关闭时打开并恢复捕获，打开时按普通关闭语义收束组字、保留内容并暂停捕获。工作台本身不提供块编辑器或缓冲开关；候选与 preedit 继续由常规 `CandidateWindow` 呈现，缓冲模式下默认锚定在工作台下方。
 
 ---
 
@@ -24,8 +24,9 @@ Enter输入法是一个 **macOS 中文输入法**（IMKit + 自包含 librime）
  [计划]服务器推送 ─SSE─────┤─▶ SSEProvider ──┤                         │ 接受            │
  [计划]远程主机 ───SSH─────┤─▶ SSHProvider ──┘                         ▼                 │
  已安装 Action Plugin manifest ─▶ ActionPluginHost ─Bearer HTTP─▶ 本机插件服务         │
-                          │          │ 有效结果                            │失效结果     │
-                          │          └────────────────▶ BufferModel ◀─ Rime │          │
+                          │          │ legacy invoke 或 prepare prompt       │失效结果     │
+                          │          ├─prepare─▶ 当前 AI 连接器 ─有效结果─▶ BufferModel │
+                          │          └─legacy invoke──────────────▶ BufferModel ◀─ Rime │
                           │                                      (blocks)  └▶InboundBus│
                           │                                      (blocks)     commit  │
                           │                                Return 手势 / 主条纸飞机       │
@@ -39,9 +40,13 @@ Enter输入法是一个 **macOS 中文输入法**（IMKit + 自包含 librime）
  配对 Mac  ─AES-GCM双向───┤─▶ RemoteTypingService ─▶ insertRemoteText ─▶ Delivery.insert│
                           │                                  └─无安全目标→剪贴板累积    │
                           │                                                           │
- Apple 本地翻译──────▶ TranslationWorkspace ──▶ 独立译文缓冲          │
- Codex/Claude CLI ─────▶ AITextPluginWorkspace ──▶ 独立生成缓冲       │
- OpenAI 兼容 API ────────────────────────────────┘
+ Apple 本地翻译────────▶ TranslationWorkspace ───────▶ 独立译文缓冲     │
+ 唯一「AI 生成」插件────▶ AITextPluginWorkspace ──────▶ 独立生成缓冲     │
+ Marine prepare prompt ─▶ ActionPluginHost ─┐                              │
+                                            └─▶ AITextConnectorRegistry    │
+                                                ├─ Codex CLI（订阅登录态）   │
+                                                ├─ Claude Code（订阅登录态） │
+                                                └─ OpenAI 兼容 API           │
  [计划] 多目标/远端 ACK────┤◀▶ DeliveryRouter（M5；当前不存在）                          │
                           └──────────────────────────────────────────────────────────┘
                                     │ 底座
@@ -56,8 +61,8 @@ Enter输入法是一个 **macOS 中文输入法**（IMKit + 自包含 librime）
 |---|---|---|
 | **来源层** Sources | 把外部文字收进来，门控后产出待决条目 | InboundBus, LocalGateway, 各 Provider |
 | **缓冲层** Buffer | 所有文本的暂存枢纽；块携带来源 | BufferModel, Origin |
-| **动作插件层** Action Plugins | 用户明确调用 Marine 等外部动作；冻结上下文并把结果安全地路由回缓冲/收件箱 | ActionPluginHost, manifest, loopback HTTP |
-| **加工层** Transforms | 本地翻译与三个显式 AI 生成插件使用独立 source/target 双缓冲 | AppleTranslationWorkspace, AITextPluginWorkspace, CLI/API providers |
+| **动作插件层** Action Plugins | 用户明确调用 Marine 等外部动作；冻结上下文，必要时接收 prepared prompt，再把 Rime 本地连接器结果安全地路由回缓冲/收件箱 | ActionPluginHost, manifest, loopback HTTP |
+| **加工层** Transforms | 本地翻译与唯一「AI 生成」插件使用独立 source/target 双缓冲；三个模型源由连接器注册表独立切换 | AppleTranslationWorkspace, AITextPluginWorkspace, AITextConnectorRegistry |
 | **投递层** Delivery | 把确认后的块送到目标；防过期焦点、防回环、防误投 | InputFocusCoordinator, BufferDeliveryCoordinator, Delivery（唯一插入咽喉） |
 
 下面是底座：**输入核心**（Rime 引擎 + IMKit 事件 + 候选窗），它既独立工作（普通打字），又是缓冲层的一个来源（Rime commit）。
@@ -68,11 +73,11 @@ Enter输入法是一个 **macOS 中文输入法**（IMKit + 自包含 librime）
 
 ```
 ① 本地打字         ② 外部来源                    ③ Action Plugin
-   键盘事件           MCP/HTTP；[计划] SSE/SSH       用户点动作 → 本机服务生成
+   键盘事件           MCP/HTTP；[计划] SSE/SSH       用户点动作 → 本机服务准备话术
      │                   │                         │
      ▼                   ▼                         ▼
   RimeEngine          LocalGateway              ActionPluginHost
-  processKey          → InboundBus.submit        run(input) async
+  processKey          → InboundBus.submit        prepare → 当前 AI 连接器执行
      │ commit            │ 门控                     │ requestId/contextId/FocusToken 校验
      ▼                   ▼                         ▼
   ┌──────────────────────────────────────────────────────┐
@@ -82,7 +87,8 @@ Enter输入法是一个 **macOS 中文输入法**（IMKit + 自包含 librime）
                                  │ Return 轻按/长按或点击主条右侧纸飞机
                                  ▼
                      BufferDeliveryCoordinator
-                    ┌──── FocusToken/controller/client 身份、bundle 与前台 bundle/PID 精确匹配
+                    ┌──── 普通 App：FocusToken/client 与前台 bundle/PID 精确匹配
+                    │     Spotlight：系统 PID + 可见窗口 + 下层前台 bundle/PID 锚点
                     ├──── 组字未决 / secure input → 拒绝或先显式收束
                     ├──── 每个块投递前再次校验，焦点变化立即停
                     ▼
@@ -93,11 +99,12 @@ Enter输入法是一个 **macOS 中文输入法**（IMKit + 自包含 librime）
 1. **非配对外部文字永不自动上屏**——MCP/HTTP 先进收件箱待决；用户主动调用且仍匹配原 request/context/focus 的插件结果可直接进缓冲，失效或迟到结果退回收件箱。
 2. **插件/处理器结果永不直接上屏**——无论直接进缓冲还是退回收件箱，都只能由用户随后明确投递。
 3. **secure input（密码框）激活时，投递整体禁用**。
-4. **缓冲投递不保存“最近输入框”兜底**：只有当前 `FocusToken` 的外部文本框能接收，且租约记录的 bundle 与进程 PID 必须同时匹配当前前台应用；切 app、切文本框或同 bundle 应用重启都会令旧目标失效。
+4. **缓冲投递不保存“最近输入框”兜底**：只有当前 `FocusToken` 的外部文本框能接收。普通 App 的 bundle/PID 必须同时匹配当前前台应用；系统 Spotlight 因不成为 frontmost，改为同时匹配其绑定 PID、真实可见窗口与下层前台 bundle/PID 锚点。切 app、切文本框、窗口隐藏或进程重启都会令旧目标失效。
 5. **手动投递不等于目标已确认收到**：当前产品在 `Delivery.insert` 成功返回后立即消费 live block，不保留明文发送历史；失败的块和后续尚未发送的块原位保留。
 6. **配对设备是来源侧唯一直通例外**：收到的文字沿既有实时传字路径直接上屏，不进入缓冲工作台。
 7. **缓冲按键与宿主隔离**：缓冲模式下普通/Shift+Return 与 Backspace 总是被输入法消费。有未决 Rime/并击/raw 输入时，本次 Return 只收束成缓冲块并抑制同一物理按键余下事件；没有未决组字时，轻按发送下一块，按住约 1.2 秒发送全部。Backspace 只在精确焦点下编辑 Rime/并击状态或删除缓冲块。焦点不可信时始终吞键且不投递；引擎故障时，无法安全收束的未决组字只吞不发，但无未决组字的已有块仍可发送。宿主绝不会收到换行或删除。
 8. **派生双轨按生成快照交易**：只有已完成且仍匹配 source text/block ids/generation 的 target blocks 可投递；目标块未全部送完时源块原样保留，最后一个目标块成功消费后才一次性消费对应源块。
+9. **插件和连接器是两条独立选择轴**：`.bufferAction` owner 只决定当前工作台动作；Codex CLI、Claude Code CLI 与 OpenAI 兼容 API 只决定谁执行 AI。切 Marine/「AI 生成」不会暗中切换模型源，切模型源也不会改写插件 owner。
 
 ---
 
@@ -145,14 +152,15 @@ AITextWorkspaceOutputBlock ── 独立 target rail 的逻辑块
              ├─▶ RimeEngine ──▶ CRimeBridge (C++) ──dlopen──▶ librime.dylib
              │      每 controller 一个 session；引擎全局单例             (自带，Squirrel 回退)
              ├─▶ CompositionSession   marked text / preedit（只在本地）
-             ├─▶ InputFocusCoordinator  FocusToken + client 身份 + 前台 bundle/PID 租约
+             ├─▶ InputFocusCoordinator  FocusToken + client 身份 + 前台/系统浮层双模式租约
              └─▶ CandidateWindow      唯一候选面板；锚定 caret 或缓冲条下方
 ```
 
 - **RimeEngine / CRimeBridge**：手写声明整个 `RimeApi` 结构体，`dlopen` 优先加载自带 librime，失败回退系统 Squirrel。首启 `start_maintenance` 自部署，自包含无需装 Squirrel。
+- **`my_combo` AI 去耦**：旧 `ai_mode`、`ai_box`/剪贴板 processor、状态 translator、AI translator/filter、快捷键与 `python_bin` 配置已从 schema 下线；Rime schema 不再启动 Lua/Python AI 链路。普通输入依赖的 librime Lua 模块继续保留，AI 只由原生工作台插件和 Rime 侧连接器执行。
 - **RimeBufferController 按键隔离与 Enter 手势**：缓冲模式在最外层吞掉普通/Shift+Return 与 Backspace。精确外部租约持有缓冲控制期间，`CompositionSession` 会常驻一次不可见 U+200B marked-text guard（包括 Rime 空闲和引擎不可用阶段），防止 Chromium/ProseMirror 在 IMK handled 结果之外观察 raw Return 并提交；guard 生命周期与真实组字状态分离，空闲 guard 不会把 `composition.composing` / lease `compositionActive` 置真，且 marked range 标为不可靠。Return keyDown 绑定当时的 `FocusToken`；有未决组字时只收束并抑制到物理抬起，否则 keyUp 或物理轮询检测到抬起时请求 `sendNext`，持续物理按住到 1.2 秒时请求 `sendAll`。发送动作与 callback ownership 独立：每次被接管的物理按键持有 sticky keyUp / `didCommand(insertNewline:)` suppression，发送最后一个 transient block 令 buffer inactive、动作 reset 或失焦都不能把迟到/重复回调放给宿主；旧字段的 stale callback 不改变当前按压状态，下一次确认的 non-repeat keyDown 才退休旧代并立即按新状态路由。`handle(_:client:)` 是 Return 唯一动作入口，`didCommand` 仅防御性吞命令，不形成第二条发送路径。Backspace 仅在精确租约下改 Rime/缓冲。隔离分支先于 raw fallback，故引擎失败和不可信焦点也不会把这两个键交给宿主。
 - **CandidateWindow**：候选交互与显示的唯一状态机。普通模式锚定 caret；缓冲模式默认把同一个 `nonactivatingPanel` 锚定在缓冲条下方，因此主题、尺寸、翻页、单字选择和 token 化点击行为与常规候选完全一致。工作台不再维护 `CandidateProjection` 或第二份候选视图。
-- **InputFocusCoordinator**：把 controller、租约 `IMKTextInput`、`controller.client()` 当前对象身份、bundle id、前台应用 PID 与单调 token 绑定；`liveTarget` 同时重验全部身份与前台 PID，防止同 bundle 应用重启或文本框切换后复用旧租约。事件时间戳必须晚于 activation floor/最近已接受事件；先于 activate 的首键只建立短期 provisional 租约。explicit/implicit lifecycle callback 都必须与当前 client 一致；同一 proxy 跨字段或跨 controller 复用、异步 chord 回放失配、弱 client 过期时，旧 session 只在 Rime 内回收/丢弃，不调用已移动或释放的 proxy。
+- **InputFocusCoordinator**：把 controller、租约 `IMKTextInput`、`controller.client()` 当前对象身份、bundle id、宿主进程/前台锚点与单调 token 绑定；普通 App 的 `liveTarget` 重验全部身份及 frontmost bundle/PID。唯一浮层例外是系统路径下唯一运行的 `com.apple.Spotlight`：activation 只创建 suspended 预热租约，真实可见 Spotlight 窗口中的新鲜 keyDown 才建立可投递 epoch；租约分别冻结 Spotlight PID 与下层前台 bundle/PID，后续 target/event 全部重验，keyUp/flagsChanged 不能建立或解锁它，任一 workspace activation 都撤销它。事件时间戳必须晚于 activation floor/最近已接受事件；先于 activate 的首键只建立短期 provisional 租约。explicit/implicit lifecycle callback 都必须与当前 client 一致；同一 proxy 跨字段或跨 controller 复用、异步 chord 回放失配、弱 client 过期时，旧 session 只在 Rime 内回收/丢弃，不调用已移动或释放的 proxy。
 - **ChordController + ChordSettings**：并击 release-replay；时长现在是 UI 可配置项（`ChordSettings`，默认 0.10s，UserDefaults + 通知）。
 - **StatusMenu**：不建独立 NSStatusItem，命令挂在系统输入法菜单里（设置 / 收件箱 / 显示或关闭工作台 / 常显 / 移到当前屏幕 / 更新 / 部署 / 重装 / 重启）。
 
@@ -215,31 +223,38 @@ BufferDeliveryCoordinator (单例)
 
 ### 4.4 Action Plugin 宿主与本地翻译工作区
 
-每个插件目录包含 schemaVersion=1 的 `manifest.json`，声明插件 id/name、runtime config 候选路径和动作 `id/title/symbol/statusPath/invokePath/modes`；互斥场景动作还可声明成对的 `presentationId/presentationTitle`。同一插件内共享 presentation id 的动作必须共享标题，工作台只渲染一个按钮，但请求、流事件、结果元数据与发送复核始终保留 status 当前选中的真实 action id。runtime config 只接受 `localhost/127.0.0.1/::1`，必须包含与 manifest 精确相同的 `pluginId` 以及 `apiBase/token/updatedAt`（可附 `instanceId/processId`）；宿主拒绝符号链接、非普通文件、相对路径逃逸和超过 1 MiB 的配置，按更新时间从新到旧探测，跳过已失效的残留配置。一次 status 成功后，invoke、生成后的复核与发送前复核都锁定该精确 runtime binding，期间出现更新的配置也不能把请求切到另一实例。工作台可见时每秒轻量刷新状态，因此“先开缓冲、后选浏览器目标”和“先选目标、后开缓冲”都成立，设置/菜单中的底层缓冲启停本身不参与目标发现。展开区的刷新/重置会取消当前及过时调用、清掉本次失败状态并强制重新获取当前上下文，但不修改 `BufferModel` 正文。
+每个插件目录包含 schemaVersion=1 的 `manifest.json`，声明插件 id/name、runtime config 候选路径和动作 `id/title/symbol/statusPath/invokePath/modes`；需要由 Rime 执行模型的动作可增量声明 `preparePath`，互斥场景动作还可声明成对的 `presentationId/presentationTitle`。同一插件内共享 presentation id 的动作必须共享标题和 status/prepare/invoke/stream 契约，工作台只渲染一个按钮，但请求、流事件、结果元数据与发送复核始终保留 status 当前选中的真实 action id。runtime config 只接受 `localhost/127.0.0.1/::1`，必须包含与 manifest 精确相同的 `pluginId` 以及 `apiBase/token/updatedAt`（可附 `instanceId/processId`）；宿主拒绝符号链接、非普通文件、相对路径逃逸和超过 1 MiB 的配置，按更新时间从新到旧探测，跳过已失效的残留配置。一次 status 成功后，prepare/invoke、生成后的复核与发送前复核都锁定该精确 runtime binding，期间出现更新的配置也不能把请求切到另一实例。工作台可见时每秒轻量刷新状态，因此“先开缓冲、后选浏览器目标”和“先选目标、后开缓冲”都成立，设置/菜单中的底层缓冲启停本身不参与目标发现。展开区的刷新/重置会取消当前及过时调用、清掉本次失败状态并强制重新获取当前上下文，但不修改 `BufferModel` 正文。
 
 `ActionPluginManager` 管理 `~/Library/RimeBuffer/plugins`：本地安装可复制完整插件目录或单一清单，网络安装只接受 HTTPS `manifest.json`，不解压归档、也不执行安装脚本；安装过程使用同目录暂存与替换，并拒绝异 ID、大小写碰撞及符号链接重定向。底层启用状态仍单独持久化并在损坏时 fail-closed；设置页把安装、卸载、刷新和打开目录收进三个操作弹窗，插件行不再暴露底层启用与当前 owner 两套状态。管理读写串行化，远端下载绑定 mutation generation，后发的启停/卸载可让迟到下载失效，不能复活插件。管理变更通过通知让 `ActionPluginHost` 立即重载；插件被禁用、卸载或升级时，旧动作、在途调用、发送复核和 bearer 绑定同时失效。
 
-动作点击时，宿主冻结 `actionId + requestId + contextId + FocusToken + runtime binding`，但绝不把 IMK client、FocusToken 或 bearer token 交给插件。invoke 完成后用同一 binding 再读取一次 status：响应 id、当前 context 和原焦点租约全部匹配时，结果作为 `.plugin(id)` Block 进入缓冲；任一项失效时，带 `stale=true` 元数据进入 `InboundBus` 等人工接受。用户随后发送仍绑定目标的插件块时，唯一投递协调器还会异步重取同一实例的 fresh status，并在回调后再次核对原 `FocusToken/context/action`；切到另一评论后，迟到的“允许”回调也只能把旧块标记过期，绝不进入 `Delivery.insert`。若用户在收件箱明确选择“作为普通文本加入”，元数据会转为 `reviewedAsPlainText=true`：保留来源和原目标仅供核对，但永久解除旧浏览器绑定，之后像普通块一样只投递到用户当时明确聚焦的输入框。两条生成路径本身都不调用 `Delivery.insert`，因此不会自动上屏。
+动作点击时，宿主冻结 `actionId + requestId + contextId + FocusToken + runtime binding`，但绝不把 IMK client、FocusToken 或 bearer token 交给插件。带 `preparePath` 的动作先返回 `protocolVersion=1 + resultFormat=blocks-v1 + pluginId/runtimeInstanceId/requestId/actionId/contextId + prompt`；宿主逐项校验插件、实例、请求、动作、上下文和 256 KiB 上限后，才把 prompt 交给当前 Rime AI 连接器。模型选择、订阅/API 凭据、CLI 参数、工具开关与结果 schema 全部留在 RimeBuffer，插件不能覆盖。没有 `preparePath` 的旧插件仍走 legacy invoke/stream，保持 Action Plugin v1 向后兼容。
 
-`BufferPluginSelectionStore` 把 `.bufferAction` 能力收敛为一个当前 owner：Marine、苹果翻译与三个 AI 文本插件在设置中以同一种卡片和唯一 Switch 呈现，展开工作台中的紧凑选择器也直接枚举这些插件。Switch/选择器都直接映射 owner；打开新插件会原子替换旧 owner，选到 disabled 插件会先恢复它的底层启用状态。缓冲插件不会贡献动态“扩展”路由。owner 切换会取消旧 owner 的在途请求、停止其工作台状态并作废旧翻译/AI generation，但**不撤销已完成 Action Plugin block 生成时的投递 authority**：例如切到 Codex 后，已完成的 Marine 块仍可用原 runtime binding/action/context/focus 复核。只有该外部插件被禁用、卸载、升级或原 runtime 失效时，才撤销对应已完成结果的权限。
+模型完成后或 legacy invoke 完成后，宿主都用同一 binding 再读取一次 status：响应 id、当前 context 和原焦点租约全部匹配时，结果作为 `.plugin(id)` Block 进入缓冲；任一项失效时，带 `stale=true` 元数据进入 `InboundBus` 等人工接受。用户随后发送仍绑定目标的插件块时，唯一投递协调器还会异步重取同一实例的 fresh status，并在回调后再次核对原 `FocusToken/context/action`；切到另一评论后，迟到的“允许”回调也只能把旧块标记过期，绝不进入 `Delivery.insert`。若用户在收件箱明确选择“作为普通文本加入”，元数据会转为 `reviewedAsPlainText=true`：保留来源和原目标仅供核对，但永久解除旧浏览器绑定，之后像普通块一样只投递到用户当时明确聚焦的输入框。两条路径本身都不调用 `Delivery.insert`，因此不会自动上屏。
+
+`BufferPluginSelectionStore` 把 `.bufferAction` 能力收敛为一个当前 owner：Marine、苹果翻译与唯一「AI 生成」插件在设置中以同一种卡片和唯一 Switch 呈现，展开工作台中的紧凑选择器也直接枚举这些插件。Switch/选择器都直接映射 owner；打开新插件会原子替换旧 owner，选到 disabled 插件会先恢复它的底层启用状态。缓冲插件不会贡献动态“扩展”路由。旧版本中三个 provider-specific plugin id 会迁移到「AI 生成」owner，并把原选择保留为连接器偏好。owner 切换会取消旧 owner 的在途请求、停止其工作台状态并作废旧翻译/AI generation，但**不撤销已完成 Action Plugin block 生成时的投递 authority**：例如切到「AI 生成」后，已完成的 Marine 块仍可用原 runtime binding/action/context/focus 复核。只有该外部插件被禁用、卸载、升级或原 runtime 失效时，才撤销对应已完成结果的权限。
 
 Apple 翻译不伪装成 HTTP Action Plugin。`AppleTranslationWorkspace` 读取 `BufferModel.stagedText`；界面上方源轨合并显示全文且不分 block，下方目标轨独立显示译文 block，两条轨道分别横向滚动。翻译态中拖拽与展开按钮对齐上方原文行，发送按钮对齐下方目标语言行。AppKit 工作台挂载 1×1 的 `NSHostingView`，通过 SwiftUI `translationTask` 获得只在视图生命周期内有效的 `TranslationSession`。自动刷新采用 single-in-flight + latest-queued：持续输入不会反复取消当前本地会话，完成的旧快照只能作为降透明的“更新中”预览，只有与当前原文和语言完全匹配的 generation 才进入可发送态。用户点击展开区的刷新/重置时，保留原文 `BufferModel`，作废当前译文 generation 并立即重启当前语言组合的翻译。未 review 的 Action Plugin 目标绑定块禁止作为翻译源，避免加工后绕过原焦点/上下文校验。`BufferDeliveryCoordinator` 通过 `BufferDeliveryContentSource` 选择普通缓冲或译文缓冲，并在每个 block 投递前按 workspace/generation/id 重取实时内容。译文 `.processor` 来源继承所有源 block 中最严格的 remote-mirror 策略。
 
 ```
-当前 BufferModel 全文 ─用户点击生成─▶ AITextPluginWorkspace 冻结 source text + block IDs
-                                               │ 单任务；继续输入/切 owner/安全遮蔽即取消或作废
-                         ┌─ CodexCLITextProvider ────── Process + stdin + JSONL
-                         ├─ ClaudeCodeCLITextProvider ─── Process + stdin + stream-json
-                         └─ OpenAICompatibleTextProvider ─ URLSession + chat/completions SSE
-                                               │ 每个逻辑 block 用稳定 UUID 原位更新
-                                               ▼
-                                      下方 target rail（完成后才可发）
+当前 BufferModel 全文 ─用户点「AI 生成」─▶ AITextPluginWorkspace 冻结 source text + block IDs
+Marine 页面上下文 ─用户点插件动作─▶ Marine prepare prompt ─▶ ActionPluginHost 冻结目标 authority
+                                                          │
+                                                          ▼
+                                                AITextConnectorRegistry
+                                     （与 buffer plugin owner 独立的单选）
+                         ┌─ CodexCLITextProvider ───────── app-server + stdio JSON-RPC delta
+                         ├─ ClaudeCodeCLITextProvider ───── Process + stdin + stream-json partial
+                         └─ OpenAICompatibleTextProvider ── URLSession + chat/completions SSE
+                                                          │ 活动/秒数先行；delta 真流式；细粒度 block 原位更新
+                                                          ▼
+                              AI target rail / Action Plugin blocks（完成后才可发）
 ```
 
 - **翻译（已实现）**：当前 macOS 15.1 SDK 下使用 SwiftUI `translationTask(configuration)` 桥接；Translation 与 `_Translation_SwiftUI` 弱链接，最低系统仍是 macOS 13，13/14 只显示不可用状态。`prepareTranslation()` 由系统在首次使用语言组合时准备本地模型。
-- **Codex/Claude CLI**：输入法用 `Process` 直接启动已登录 CLI，参数固定，源正文只走 stdin，工作目录临时且为 0700，不启用 shell、工具或会话持久化。这是“本地启动 CLI”而不是“本地推理”：点击生成后，缓冲全文会经各自 CLI 当前已登录的服务发送。
-- **OpenAI 兼容 API**：在“设置 › 连接器 › AI 模型”配置 Base URL、model 和 API key；端点为 `POST {baseURL}/chat/completions`，支持 SSE 与非流式 JSON fallback。远程地址必须 HTTPS，HTTP 仅允许 loopback，且拒绝 userinfo/query/fragment 与 redirect。配置与密钥存于 0600 文件 `~/Library/RimeBuffer/ai/openai-compatible.json`，不写 UserDefaults 或日志。
-- **共同隐私边界**：三个插件都只在用户点击生成时发送当前 `BufferModel.stagedText`，不附带历史、preedit、剪贴板或屏幕上下文。未 review 的 Action Plugin 目标绑定块不能被作为源文。
+- **Codex/Claude CLI**：Codex 用一次性 app-server 的双向 stdio JSON-RPC 接收 `item/agentMessage/delta`，专用 ChatGPT 登录持久化在 `~/Library/RimeBuffer/ai/codex-home`；它不继承 `~/.codex`。设置页的结构化 account/login 流程只打开受限 HTTPS 授权 URL，以 loginId 匹配完成事件并经 account/read 复核订阅账户；生成前再断言 MCP 列表为空。Claude 用 `stream-json` partial。两者都由 `Process` 直接启动，参数固定，工作目录临时且为 0700，不启用 shell、工具、网络工具或会话持久化；ambient API key 被剔除，CLI 版本与隔离参数未通过回归时 fail-closed。这是“本地启动 CLI”而不是“本地推理”。
+- **OpenAI 兼容 API**：在“设置 › 连接器 › AI 模型”配置 Base URL、model 和 API key；端点为 `POST {baseURL}/chat/completions`，必须返回 SSE，按 `choices[].delta.content`/`[DONE]` 收口，2xx 非 SSE 响应 fail-closed。远程地址必须 HTTPS，HTTP 仅允许 loopback，且拒绝 userinfo/query/fragment 与 redirect。配置与密钥存于 0600 文件 `~/Library/RimeBuffer/ai/openai-compatible.json`，不写 UserDefaults 或日志。
+- **共同隐私/体验边界**：三个连接器只在用户点击生成时运行。「AI 生成」只发送当前 `BufferModel.stagedText`，不附带历史、preedit、剪贴板或屏幕上下文；prepared Action Plugin 只发送插件明确返回且通过身份校验的 prompt。首字前仅展示安全的连接/思考摘要/重试/校验状态与等待秒数，不展示 raw chain-of-thought；正文增量统一细分为短句、分句、列表项或步骤，并保护 URL、数字、引文和代码。未 review 的 Action Plugin 目标绑定块不能被作为普通 AI 源文。
+- **Marine 边界**：Marine 继续负责浏览器上下文、话术规则、记录和界面信息，并通过 `preparePath` 产出 prompt；它不再选择模型、保存模型凭据、启动 Codex/Claude 或调用 OpenAI。连接器执行与 `blocks-v1` 结果校验都在 RimeBuffer 内完成，最终块仍绑定 Marine 原来的 runtime/context/focus authority。
 
 ### 4.5 投递层
 
@@ -280,7 +295,7 @@ Delivery.insert(_ text, into: client)
 ```
 
 - **缓冲工作台是独立 `NSPanel`**：默认 nonactivating，不抢目标输入框焦点；普通折叠态为 44pt 单轨，展开后为 78pt。苹果翻译或 AI 文本插件打开时 source rail 在上、target rail 在下，折叠/展开为 78/112pt；两轨拥有独立的 scroll/document。双轨态的拖拽/展开与上方源文行对齐，发送与下方目标行对齐；普通单轨态三者仍居中。上层固定显示状态、紧凑插件选择器与当前动作、刷新/重置与关闭，不再含块编辑器或面板内缓冲开关。切 owner 和展开都固定底边，所以条下方候选锚点不跳。仅拖拽图标能移动窗口，背景与其他控件不能拖；窗口仍可调整宽度，frame/展开态持久化并在屏幕拓扑变化后夹回可见区域。原来的标题/字数、手动遮蔽、历史、清空和工具层发送入口均已移除。
-- **全局打开快捷键**：`GlobalHotKeyController` 用 Carbon 注册精确 `Command+Shift+B`，不需 Accessibility 权限，按下后调用 `BufferWindowController.openAndResume()`。它会将位于旧 Space 的非 pin 面板带到当前 Space，显示窗口并把 `BufferModel.enabled` 恢复为 true；该注册快捷键被消费，B 不继续传给前台应用。
+- **全局切换快捷键**：`GlobalHotKeyController` 用 Carbon 注册精确 `Command+Shift+B`，不需 Accessibility 权限，按下后调用 `BufferWindowController.toggleVisibility()`。关闭时它把非 pin 面板带到当前 Space、显示窗口并恢复 `BufferModel.enabled`；打开时复用 `closeAndPause()`，安全收束当前组字、保留块、暂停捕获并隐藏。该注册快捷键被消费，B 不继续传给前台应用。
 - **边缘绘制**：圆角层内缩到透明窗口边距，并覆盖固定的日/夜工作台背景 token，避免 HUD 背景采样破坏对比度；边框按 backing scale 以路径内 hairline 绘制，避免把居中 border 压在窗口 bounds 上造成圆角或边缘裁剪毛边。
 - **关闭不会删除已有块**：先显式收束当前组字，暂停捕获，结束 transient 加载/错误状态并保留已有模型块，再隐藏。从设置/输入法菜单显示工作台时会恢复底层捕获。工作台没有手动清空或撤销入口；隐私选项触发的跨 app 清理仍是不可恢复的安全操作。
 - **常显与多屏**：pin 开启时加入所有桌面与全屏辅助空间；关闭时只属于一个 Space。工作台位于当前 Space 时，常规候选面板使用细条下沿作为锚点；需要时仍可跟随 caret。菜单“显示”会把仍留在旧 Space 的面板重新带到当前 Space，菜单和设置都能把窗口移到鼠标所在屏幕。
@@ -302,14 +317,14 @@ Delivery.insert(_ text, into: client)
 ```
 
 - 每个一级页的子页固定显示在右侧顶部；route/subpage 使用稳定字符串身份，不依赖 sidebar 行号。启停内置扩展后目录会重建；若当前扩展被停用，安全回退到「插件 ▸ 内置扩展」。
-- 输入法页明确分开三层：输入编码、键入模式和词库。运行时只暴露经过验证的 Rime 组合方案，不允许三层任意交叉，以免生成不可部署配置。`my_combo` 的产品名是「飞耀互击」；同一 schema 由完整的 `InputConfiguration.keyingMode` 区分并击门禁与互击单侧结算，不能从 schema ID 反推。词库页通过 librime `levers` API 维护真实的 `rime_ice` / `english` 用户学习库，导入是合并，导出是可移植 TSV，不复制 live LevelDB。
-- 缓冲区、连接器和外部插件管理仍接真实运行时；“AI 模型”子页展示 Codex/Claude CLI 的服务隐私说明，并管理 OpenAI 兼容 API 的 Base URL、model 与 API key。尚未实现的 SSE/SSH 不显示成可操作假功能。当前没有按来源编辑信任等级或重新生成 token 的 UI。
+- 输入法页明确分开三层：输入编码、键入模式和词库。运行时只暴露经过验证的 Rime 组合方案，不允许三层任意交叉，以免生成不可部署配置。`my_combo` 的产品名是「飞耀互击」；同一 schema 由完整的 `InputConfiguration.keyingMode` 区分“只结算当前批的并击”与“可跨批配对左右半区的互击”，两者都保留单侧批次，不能从 schema ID 反推。无映射批由 `echo_translator` 给出低优先级原码候选；`,`/`.` 只在 chord alphabet 中充当双角色键，单键结算继续落到 punctuator。词库页通过 librime `levers` API 维护真实的 `rime_ice` / `english` 用户学习库，导入是合并，导出是可移植 TSV，不复制 live LevelDB。
+- 缓冲区、连接器和外部插件管理仍接真实运行时；“AI 模型”子页用单选控件在 Codex CLI、Claude Code CLI 与 OpenAI 兼容 API 三个模型源间切换，展示两个 CLI 的可用性与订阅服务隐私说明，并管理 OpenAI 兼容 API 的 Base URL、model 与 API key。该连接器选择独立于缓冲插件 owner。尚未实现的 SSE/SSH 不显示成可操作假功能。当前没有按来源编辑信任等级或重新生成 token 的 UI。
 
 ### 5.3 统一插件平台
 
 - `PluginRegistry` 是发现、命名空间、内置扩展生命周期和统一启停 facade；`PluginKey(domain, rawID)` 防止内置与外部包同名遮蔽。
 - **外部缓冲插件**仍完全沿用 Action Plugin v1：`ActionPluginHost + ActionPluginManager` 是执行、runtime binding、授权与撤权的唯一 authority。Registry 不重建 wire metadata，也不能让外部包贡献原生 AppKit 设置页，因此 Marine 兼容路径不变。
-- **内置扩展/缓冲插件**是随应用编译的可信模块。统计、打字测速和飞耀互击学习贡献动态设置页；苹果翻译、Codex CLI、Claude Code CLI 与 OpenAI 兼容 API 贡献 `.bufferAction`，在唯一 owner 下互斥运行且不出现为左侧动态扩展页。
+- **内置扩展/缓冲插件**是随应用编译的可信模块。统计、打字测速和飞耀互击学习贡献动态设置页；苹果翻译与唯一「AI 生成」贡献 `.bufferAction`，在唯一 owner 下与 Marine 等插件互斥运行且不出现为左侧动态扩展页。Codex CLI、Claude Code CLI 与 OpenAI 兼容 API 是 `AITextConnectorRegistry` 下的三个连接器，不再是三个插件。
 - `InputTelemetryBus` 是非消费型、脱敏的主线程观测通道：不携带正文、候选、IMK client、FocusToken、应用或焦点身份。secure input、ETInput 自身窗口和不可信/失焦目标不发事件；字符计数只在真正进入缓冲或 `Delivery.insert` 成功后发布。
 
 ### 5.4 其它 UI
@@ -347,15 +362,16 @@ Delivery.insert(_ text, into: client)
 |---|---|---|
 | 密码框保护 | `IsSecureEventInputEnabled()` 在投递动作时刻同步查；命中拒发 | ✅ M0（Delivery 唯一咽喉） |
 | 切换应用重置 | 默认跨应用保留；启用后，仅当整个缓冲不含外部来源块时不可撤销地丢弃 blocks；只要含外部块就全部保留 | ✅ |
-| 焦点租约 | 单调 FocusToken + controller/client 对象身份 + client bundle + 前台 bundle/PID + 事件/生命周期归因；无 recent/last client 回退 | ✅ |
+| 焦点租约 | 单调 FocusToken + controller/client 对象身份 + client bundle + 前台 bundle/PID + 事件/生命周期归因；Spotlight 另需唯一系统 PID、可见窗口、前台锚点及 keyDown 建权；无 recent/last client 回退 | ✅ |
 | 工作台隐私 | secure-input 自动遮蔽正文并禁用发送/插件动作；锁屏/睡眠/会话切出撤销租约且不回写旧 client；自身设置窗口不成为缓冲捕获源 | ✅ |
 | 日志脱敏 | 用户文本走 `IMELog.redact()` 只记长度；日志 0600；CI 断言禁 `'\(…)'` 明文 | ✅ M0 |
 | 本地端口鉴权 | 只绑 127.0.0.1 + Bearer token（0600）+ 常数时间比较 + 严格解析上限 | ✅ M2 |
 | 来源门控 | `SourceTrust` 有询问/信任/拦截三种类型；当前规则固定：Marine 信任，MCP/HTTP/SSE/SSH 询问，无按来源覆盖 UI | ✅ 固定规则；可配置化属后续 |
 | echo 防回环 | remotePeer 来源不回镜；规则在 `Origin.allowsRemoteMirror` 与镜像调用点，不依赖尚未实现的 Router | ✅ 规则就位 |
 | MCP 隐私边界 | 工具只给不看不发；无读缓冲/读上下文/触发投递工具 | ✅ 写死 |
-| 网络出站清单 | 隔空传字、更新检查与用户显式生成的 Codex/Claude/OpenAI 兼容 API 已存在；SSE 订阅/SSH 仍属后续 | ✅ 已实现项按用户动作或现有设置运行 |
-| AI 插件隐私红线 | 只在点击生成时发当前缓冲全文，不带历史/preedit/剪贴板/屏幕上下文；CLI 非本地推理 | ✅ |
+| 网络出站清单 | 隔空传字、更新检查与用户显式调用的 Codex/Claude/OpenAI 连接器已存在；SSE 订阅/SSH 仍属后续 | ✅ 已实现项按用户动作或现有设置运行 |
+| AI 连接器隐私红线 | 只在点击生成时发当前缓冲全文或通过身份校验的 prepared prompt；CLI 非本地推理；工具/会话关闭，未知 CLI 版本 fail-closed | ✅ |
+| CLI 授权边界 | Codex/Claude 使用本机订阅登录态；环境白名单保留其配置/OAuth，排除 ambient API key，Marine 不接触凭据 | ✅ |
 | OpenAI 凭据 | Base URL/model/API key 保存到 0600 私有 JSON；拒绝非 HTTPS 远程端点与 redirect | ✅ |
 
 **明确不做**（v1 边界）：剪贴板捕获、AirDrop 目标、Turn/Artifact 完整版本模型、宿主文本撤回，以及工作台内的块级/无边界自由编辑面。
@@ -393,8 +409,8 @@ Sources/RimeBuffer/
   BufferInlineView.swift        工作台待发送 chips（+来源徽标）
   BufferModel.swift             缓冲枢纽（blocks / 成功消费 / transient；无发送历史）
   BufferDeliveryCoordinator.swift 精确目标上的逐块投递与成功块消费
-  GlobalHotKeyController.swift    Command+Shift+B 进程级全局打开/恢复
-  ActionPlugins.swift            manifest/runtime config/Bearer HTTP/动作生命周期与安全分流
+  GlobalHotKeyController.swift    Command+Shift+B 进程级全局打开/关闭
+  ActionPlugins.swift            manifest/runtime config/Bearer HTTP/prepare→本地连接器/动作生命周期与安全分流
   ActionPluginManager.swift      插件安装/下载/启停/卸载与原子文件事务
   Origin.swift                  来源溯源 + echo 守卫              [工作台新增]
   Delivery.swift                唯一上屏咽喉 + 密码框护栏
@@ -422,15 +438,15 @@ Sources/RimeBuffer/
     GatewayToken.swift          0600 token
     InboundTrayWindow.swift     外部来源收件箱（过渡 UI）
   AppleTranslationPlugin.swift  本地翻译双缓冲 / SwiftUI session 桥 / 语言设置
-  AITextPlugins.swift          Codex/Claude CLI、OpenAI 兼容 API provider、source/target workspace 与 0600 配置
+  AITextPlugins.swift          唯一 AI workspace、三源 ConnectorRegistry、CLI/API provider 与 0600 配置
   [计划] Delivery/DeliveryRouter 多目标投递 + 远端 ACK + 持久账本
 ```
 
-**测试**：无 XCTest target；CI 运行编进二进制的 smoke 子命令。`schema-smoke` 覆盖编码/键入映射与旧偏好迁移，`plugin-platform-smoke` 覆盖缓冲插件单选，`translation-smoke` 覆盖 latest-wins、debounce/max-wait、译文专用投递、部分失败保留与 remote echo 继承。`ai-text-smoke` 用假 CLI runner/provider 与本地 URL fixture 覆盖 Codex/Claude 参数、JSONL/SSE 解析、OpenAI URL/请求、0600 配置、稳定流式 block、源快照作废、完整 target 投递后才消费 source 与 Action Plugin 源洗权拒绝；它不会调用真实 CLI/API。真实 librime 词库桥另有强制隔离 `RIMEBUFFER_USER_DIR` 的 `user-lexicon-bridge-smoke`，不触碰 live 用户库。
+**测试**：无 XCTest target；CI 运行编进二进制的 smoke 子命令。`schema-smoke` 覆盖编码/键入映射与旧偏好迁移，`plugin-platform-smoke` 覆盖缓冲插件单选，`translation-smoke` 覆盖 latest-wins、debounce/max-wait、译文专用投递、部分失败保留与 remote echo 继承。`ai-text-smoke` 用假 runner/provider、真实短生命周期子进程与本地 URL fixture 覆盖单一 workspace、三连接器切换、prepared prompt、CLI 小增量在 EOF 前到达、Codex app-server 协议/MCP-empty 门、Codex 登录域名/loginId/account-read 状态机、拆分/合并 JSONL、登录 success/cancel/timeout/真实退出 exactly-once、Claude stream-json、SSE `[DONE]` 不等 EOF、cancel/DONE exactly-once、活动状态、细粒度且保护 URL/数字/引文/代码的 block、独立 Codex home、0600 配置、源快照作废、完整 target 投递后才消费 source 与 Action Plugin 源洗权拒绝；它不会调用真实模型。真实 librime 词库桥另有强制隔离 `RIMEBUFFER_USER_DIR` 的 `user-lexicon-bridge-smoke`，不触碰 live 用户库。
 
-- `plugin-smoke` 覆盖 manifest 发现与 schema、上下文动作单控件聚合及 `status.actionId` 动态切换、`~`/相对 runtime path、runtime 从新到旧回退与 status→invoke 精确绑定、只允许 loopback、流式 1 MiB 响应上限、Bearer request、request/context/action/focus 路由规则、切 owner 后已完成 Marine block 仍保留原投递 authority、切换评论后迟到校验不得上屏、收件箱满载显式失败，以及 stale 结果经人工接受后保留来源但安全降级为普通文本。
+- `plugin-smoke` 覆盖 manifest 发现与 schema、可选 `preparePath` 契约、上下文动作单控件聚合及 `status.actionId` 动态切换、`~`/相对 runtime path、runtime 从新到旧回退与 status→prepare/invoke 精确绑定、只允许 loopback、prepared 五字段身份与 `blocks-v1` 格式校验、流式 1 MiB 响应上限、Bearer request、request/context/action/focus 路由规则、切 owner 后已完成 Marine block 仍保留原投递 authority、切换评论后迟到校验不得上屏、收件箱满载显式失败，以及 stale 结果经人工接受后保留来源但安全降级为普通文本。
 
-- `buffer-window-smoke` 覆盖 focus epoch/弱 lease 清理、target 的 current/expected token 与双 client 身份、前台 bundle/PID、事件顺序、provisional 与 nil-bundle activation、lifecycle/chord 隔离、own-PID 排除，以及只在真实外部 A→B 触发的隐私清理。
+- `buffer-window-smoke` 覆盖 focus epoch/弱 lease 清理、target 的 current/expected token 与双 client 身份、普通前台 bundle/PID、事件顺序、provisional 与 nil-bundle activation、lifecycle/chord 隔离、own-PID 排除；Spotlight 矩阵另覆盖系统路径/唯一进程、双 PID/锚点匹配、nil anchor bundle 延续、进程重启/窗口隐藏拒绝、activation/keyDown/keyUp 建权差异及 workspace fail-closed；同时覆盖只在真实外部 A→B 触发的隐私清理。
 - 同一 smoke 还覆盖工作台布局契约（主条 drag/disclosure/rail/send、展开层 status/plugin-selector+actions/refresh/close、仅 drag handle 可移动、状态不泄露应用去向）、`Command+Shift+B` 精确全局路由、缓冲 Return 的纯轻按/长按轮询判定、Return/Backspace 路由与 callback ownership；另覆盖长按进度在 secure-input 遮蔽时清除、派生 source/target 上下双轨与拖拽/展开/发送的分行对齐、active-Space 可见性和窗口 geometry：完全离屏时回到 fallback screen、超宽 frame 收进相交 screen、普通 44/78pt 与双轨 78/112pt 的高度归一化和底边固定，以及可见区域窄于常规最小宽度时仍能完整放入。真实 IMK 回调顺序、宿主隔离与实际投递仍需安装后的交互回归。
 - `buffer-smoke` 覆盖成功块即时消费且不留历史、未发送块顺序、插入点、暂停保留、transient 状态清理与不可恢复的隐私丢弃。真实窗口关闭/锁屏和 IMK 交互仍需安装后的真机验证。
 
@@ -446,9 +462,9 @@ Sources/RimeBuffer/
 | **spike** | NWListener HTTP/SSE ✓ · MCP 真 Claude Code ✓ · Apple Translation 弱链接/SwiftUI 桥 ✓ | ✅ 全过 |
 | **M2** 网关+MCP | LocalGateway / MCP tools / InboundBus / token / 收件箱 | ✅ 主干+收件箱（0.4.7），传入轨嵌入独立工作台待做 |
 | **缓冲窗口** | FocusToken / Return+Backspace 隔离 / 44pt 简化主条+78pt 上展 / 常规候选窗下挂 / 成功块无历史消费 / 多屏与隐私 | ✅ 2026-07-18 已实现并通过源码 smoke；待安装后真实宿主输入交互验收 |
-| **Action Plugin v1** | manifest/runtime config/loopback Bearer HTTP/动态动作 UI/插件管理/FocusToken+context 安全分流 | ✅ 2026-07-18 已实现；具体插件另行安装 |
+| **Action Plugin v1** | manifest/runtime config/loopback Bearer HTTP/可选 preparePath/动态动作 UI/插件管理/FocusToken+context 安全分流 | ✅ 基础宿主 2026-07-18；prepare 2026-07-20 |
 | **M3** 本地翻译 | 独立双缓冲 / SwiftUI Translation 桥 / 语言选择 / 互斥撤权 | ✅ 已实现；待安装后真语言包验收 |
-| **M4** AI 缓冲插件 | Codex CLI / Claude Code CLI / OpenAI 兼容 API / 双轨 workspace / 0600 凭据 | ✅ 2026-07-19 已实现；通用提示词模板后续 |
+| **M4** AI 插件与连接器 | 唯一「AI 生成」插件 / Codex、Claude Code、OpenAI 三源切换 / 订阅授权 / Marine prepare / 双轨 workspace / 0600 凭据 | ✅ 2026-07-20 已实现；待真实宿主端到端验收 |
 | **M5** 投递路由 | 本地精确焦点已完成；多目标 / 远端 ACK / 持久账本仍属后续，当前明确不保存发送历史 | 部分完成 |
 | **M6** SSE/SSH + 收尾 | SSE/SSH provider / 传入轨嵌入独立工作台 / 视觉对齐 | 计划 |
 
@@ -460,10 +476,11 @@ Sources/RimeBuffer/
 
 1. **身份三元组永不再改**——10 天换 5 代身份造成过 10+ 重复注册鬼影，CI 断言已钉死。
 2. **Delivery.insert 是唯一上屏咽喉**——任何新上屏路径都必须走它，安全护栏才生效。
-3. **FocusToken 是候选与缓冲投递的共同所有权**——迟到回调只能处理自己的 token；前台 bundle 与 PID 也必须匹配；禁止恢复 `active ?? recent`、`lastClient` 或 bundle-only 投递兜底。
+3. **FocusToken 是候选与缓冲投递的共同所有权**——迟到回调只能处理自己的 token；普通 App 的前台 bundle/PID 必须匹配；Spotlight 只能走精确系统 allowlist + 绑定 PID + 可见窗口 + 前台锚点的专用路径，禁止把 accessory app 泛化放行；禁止恢复 `active ?? recent`、`lastClient` 或 bundle-only 投递兜底。
 4. **NWListener 连接对象必须持有**——不持有会立刻释放，`weak self` 变 nil，连接静默失效（spike 抓到过）。
 5. **异步事件不许拉起候选面板或工作台**——外部待决项可更新专用 nonactivating toast/收件箱提示；工作台显隐只由用户与持久化偏好决定。
 6. **处理器必须在入缓冲侧跑**——结果先落块，投递路径保持同步、可逐块重验目标。
 7. **翻译 session 不得离开 SwiftUI 视图生命周期**——工作台内 1×1 `NSHostingView` 承载 `translationTask`；切插件、安全输入、锁屏和关闭时作废 generation。首次语言组合仍可由 macOS 请求下载本地模型。
 8. **钥匙串 vs ad-hoc 签名**——ad-hoc 下钥匙串每次重装弹密码，所有密钥用 0600 文件；拿 Dev ID 后再迁。
 9. **owner 不等于已完成块的 authority**——工作台切插件只取消在途工作；已完成 Marine 块必须继续用生成时 runtime/context/focus 校验，不得因 owner 变更而永久失去或绕过权限。
+10. **插件不等于连接器**——`.bufferAction` owner 决定工作台能力，`AITextConnectorSelectionStore` 决定模型源；两者不得再次耦合。Marine 只能 prepare 话术与上下文，模型凭据、CLI 隔离、执行及 `blocks-v1` 校验必须留在 RimeBuffer。

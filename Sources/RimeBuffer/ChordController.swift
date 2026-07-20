@@ -80,19 +80,20 @@ enum FlyChordLayout {
 
 /// Product-level settlement policy layered over the same FlyYao key map.
 ///
-/// - `bothHalvesRequired` is 并击: a batch is not sent to Rime until at least
-///   one key from each half has participated.
-/// - `independentHalves` is 互击: a left-only initial, right-only final, or a
-///   cross-half batch is sent to Rime and resolved normally.
+/// - `sameBatchOnly` is 并击: every key inside the current timer batch resolves
+///   together, including useful left-only/right-only mappings. Separate batches
+///   are never recombined.
+/// - `independentHalves` is 互击: it has the same per-batch settlement, plus a
+///   settled left-only initial may pair with the next right-only final.
 enum FlyChordSettlementPolicy: Equatable {
-    case bothHalvesRequired
+    case sameBatchOnly
     case independentHalves
 }
 
 /// A my_combo session only owns plain alphabet presses while it is composing
 /// Chinese.  In ASCII mode Rime intentionally returns those keys to the host;
 /// staging them here would swallow ordinary Latin typing until the chord timer
-/// fires (and strict 并击 would discard a one-sided letter altogether).
+/// fires.
 enum FlyChordRoutingRules {
     static func shouldStage(schemaID: String, asciiMode: Bool) -> Bool {
         schemaID == "my_combo" && !asciiMode
@@ -130,11 +131,10 @@ struct FlyChordKeyEvent: Equatable {
 }
 
 enum FlyChordPressDecision: Equatable {
-    /// The key belongs to a batch, but strict 并击 is still waiting for the
-    /// complementary half (or this is an auto-repeat already in the batch).
+    /// The event is an auto-repeat/overflow/unknown key that must not be added
+    /// to the replay set a second time.
     case consume
-    /// Feed these press events to Rime now.  Strict 并击 returns the complete
-    /// staged batch when its second half arrives; 互击 returns the new key.
+    /// Add these newly staged press events to the eventual Rime replay set.
     case process([FlyChordKeyEvent])
 }
 
@@ -223,13 +223,12 @@ struct FlyChordMutualPairingState {
     }
 }
 
-/// Pure batching state.  Keeping this independent of Timer/IMK makes the
-/// important "strict chord vs independent halves" contract executable in the
-/// CLI smoke test.
+/// Pure batching state. Keeping this independent of Timer/IMK makes the
+/// important "same-batch chord vs cross-batch mutual pairing" contract
+/// executable in the CLI smoke test.
 struct FlyChordBatchState {
     private(set) var pending: [FlyChordKeyEvent] = []
     private(set) var handled: [FlyChordKeyEvent] = []
-    private var strictBatchActivated = false
 
     var hasPending: Bool { !pending.isEmpty }
 
@@ -243,14 +242,10 @@ struct FlyChordBatchState {
         pending.append(key)
 
         switch policy {
-        case .independentHalves:
+        case .sameBatchOnly, .independentHalves:
+            // Both modes settle every current batch. Their only semantic
+            // difference is whether the owner later recombines two batches.
             return .process([key])
-        case .bothHalvesRequired:
-            if strictBatchActivated { return .process([key]) }
-            let halves = Set(pending.compactMap { FlyChordLayout.half(for: $0.keycode) })
-            guard halves.count == 2 else { return .consume }
-            strictBatchActivated = true
-            return .process(pending)
         }
     }
 
@@ -263,14 +258,12 @@ struct FlyChordBatchState {
         let replay = handled
         pending.removeAll(keepingCapacity: true)
         handled.removeAll(keepingCapacity: true)
-        strictBatchActivated = false
         return replay
     }
 
     mutating func reset() {
         pending.removeAll(keepingCapacity: true)
         handled.removeAll(keepingCapacity: true)
-        strictBatchActivated = false
     }
 }
 
@@ -313,16 +306,15 @@ final class ChordController {
     /// Replays keys (with releaseMask) against the session and drains commits.
     var onFlush: ((_ keys: [(keycode: Int32, mask: Int32)], _ client: (any IMKTextInput)?) -> Void)?
 
-    /// A strict one-sided batch never entered Rime.  Its timer still needs to
-    /// retire the owner's temporary marked-text guard.
+    /// A defensive empty batch still needs to retire the owner's temporary
+    /// marked-text guard.
     var onDiscard: ((_ client: (any IMKTextInput)?) -> Void)?
 
     var hasPending: Bool { batch.hasPending }
 
-    /// Stage a physical chord press before it reaches Rime.  This is load
-    /// bearing for strict 并击: rejecting a one-sided batch after its press was
-    /// already processed would leave chord_composer with a stuck key or force
-    /// us to clear unrelated preedit.
+    /// Stage a physical chord press before it reaches Rime. All accepted keys
+    /// enter Rime together at settlement, so neither mode may discard a useful
+    /// one-sided mapping merely to distinguish 并击 from 互击.
     func stageChordKey(_ keycode: Int32,
                        mask: Int32,
                        client: any IMKTextInput,
@@ -362,11 +354,10 @@ final class ChordController {
         }
     }
 
-    /// Cancel a batch after Rime rejects one of its press events.  The caller
-    /// receives the already-accepted subset so it can synthesize matching
-    /// releases before clearing the failed composition.  No normal flush or
-    /// client callback is fired: a partially accepted FlyYao batch must never
-    /// be allowed to settle as a valid one-sided mapping.
+    /// Cancel a batch after Rime rejects one of its press events. The caller
+    /// receives the already-staged subset so it can synthesize matching
+    /// releases before clearing the failed composition. No normal flush or
+    /// client callback is fired.
     func abort() -> [(keycode: Int32, mask: Int32)] {
         let keys = batch.settle().map { (keycode: $0.keycode, mask: $0.mask) }
         timer?.invalidate()

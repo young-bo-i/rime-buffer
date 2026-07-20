@@ -6,6 +6,8 @@ enum BuiltInPluginID {
     static let typingSpeed = "builtin.typing-speed"
     static let flyChordLearning = "builtin.fly-chord-learning"
     static let appleTranslation = "builtin.apple-translation"
+    static let aiText = AITextBuiltInPluginID.aiText
+    // Provider-specific IDs are retained for preference/source compatibility.
     static let codexCLI = AITextBuiltInPluginID.codexCLI
     static let claudeCodeCLI = AITextBuiltInPluginID.claudeCodeCLI
     static let openAICompatible = AITextBuiltInPluginID.openAICompatible
@@ -18,9 +20,7 @@ enum BuiltInPlugins {
             TypingSpeedInternalPlugin(),
             FlyChordLearningInternalPlugin(),
             AppleTranslationInternalPlugin(),
-            AITextInternalPlugin(kind: .codexCLI),
-            AITextInternalPlugin(kind: .claudeCodeCLI),
-            AITextInternalPlugin(kind: .openAICompatible),
+            AITextInternalPlugin(),
         ]
     }
 }
@@ -178,43 +178,41 @@ private final class AppleTranslationInternalPlugin: InternalPlugin {
 }
 
 private final class AITextInternalPlugin: InternalPlugin {
-    let kind: AITextProviderKind
-    let descriptor: PluginDescriptor
-
-    init(kind: AITextProviderKind) {
-        self.kind = kind
-        let summary: String
-        switch kind {
-        case .codexCLI:
-            summary = "把缓冲区全文交给本机已登录的 Codex CLI，结果进入独立目标缓冲区。"
-        case .claudeCodeCLI:
-            summary = "把缓冲区全文交给本机已登录的 Claude Code CLI，结果进入独立目标缓冲区。"
-        case .openAICompatible:
-            summary = "通过自定义 Base URL、模型和 API Key 调用 OpenAI 兼容接口。"
-        }
-        descriptor = PluginDescriptor(
-            key: kind.pluginKey,
-            wireID: nil,
-            name: kind.displayName,
-            version: "1.0",
-            summary: summary,
-            source: .builtIn,
-            capabilities: [.bufferAction, .connector],
-            settings: nil,
-            canUninstall: false
-        )
-    }
+    let descriptor = PluginDescriptor(
+        key: AITextBuiltInPluginID.key,
+        wireID: nil,
+        name: "AI 生成",
+        version: "2.0",
+        summary: "使用设置中选定的 Codex、Claude Code 或通用 Open API（OpenAI 兼容）连接器生成独立目标缓冲区。",
+        source: .builtIn,
+        capabilities: [.bufferAction],
+        settings: nil,
+        canUninstall: false
+    )
 
     func start() {
-        AITextPluginRuntimeRegistry.shared.workspace(for: kind)?.start()
+        migrateLegacyProviderSelectionIfNeeded()
+        AITextPluginRuntimeRegistry.shared.workspace.start()
     }
 
     func stop() {
-        AITextPluginRuntimeRegistry.shared.workspace(for: kind)?.stop()
+        AITextPluginRuntimeRegistry.shared.workspace.stop()
     }
 
     func makeSettingsViewController(subpageID: String) -> NSViewController? {
         nil
+    }
+
+    private func migrateLegacyProviderSelectionIfNeeded() {
+        let bufferSelection = BufferPluginSelectionStore.shared
+        guard let legacyKind = AITextProviderKind.legacyKind(
+            for: bufferSelection.activeKey
+        ) else { return }
+        AITextConnectorSelectionStore.shared.select(legacyKind)
+        _ = bufferSelection.select(
+            descriptor.key,
+            among: [RegisteredPlugin(descriptor: descriptor, isEnabled: true)]
+        )
     }
 }
 

@@ -10,6 +10,181 @@ struct FocusToken: Hashable, CustomStringConvertible {
     var description: String { "focus-\(generation)" }
 }
 
+/// Most IMK clients are ordinary activating applications, so their client
+/// bundle/PID must exactly match `NSWorkspace.frontmostApplication`. Spotlight
+/// is different: its search UI is an Apple LSUIElement overlay and deliberately
+/// leaves the application underneath it frontmost. Keep that exception explicit
+/// instead of weakening the foreground gate for every accessory application.
+enum FocusHostKind: Equatable {
+    case frontmostApplication
+    case nonactivatingSystemOverlay
+}
+
+struct FocusHostResolution: Equatable {
+    let kind: FocusHostKind
+    let clientProcessIdentifier: pid_t
+    let foregroundAnchorBundleID: String?
+    let foregroundAnchorProcessIdentifier: pid_t?
+}
+
+enum FocusHostRules {
+    private static let trustedNonactivatingSystemOverlayPaths = [
+        "com.apple.Spotlight": "/System/Library/CoreServices/Spotlight.app",
+    ]
+
+    static func isNonactivatingSystemOverlayBundle(_ bundleID: String) -> Bool {
+        trustedNonactivatingSystemOverlayPaths[bundleID] != nil
+    }
+
+    static func isTrustedNonactivatingSystemOverlay(bundleID: String,
+                                                     bundlePath: String?) -> Bool {
+        guard let expectedPath = trustedNonactivatingSystemOverlayPaths[bundleID],
+              let bundlePath else { return false }
+        let actual = URL(fileURLWithPath: bundlePath)
+            .resolvingSymlinksInPath().standardizedFileURL.path
+        let expected = URL(fileURLWithPath: expectedPath)
+            .resolvingSymlinksInPath().standardizedFileURL.path
+        return actual == expected
+    }
+
+    static func uniqueTrustedOverlayProcessIdentifier(
+        bundleID: String,
+        runningCandidates: [(processIdentifier: pid_t, bundlePath: String?)]
+    ) -> pid_t? {
+        // Count every live process with this bundle identifier before checking
+        // its path. A second spoofed instance must make the identity ambiguous,
+        // rather than being filtered out and silently ignored.
+        guard runningCandidates.count == 1,
+              let candidate = runningCandidates.first,
+              isTrustedNonactivatingSystemOverlay(
+                bundleID: bundleID,
+                bundlePath: candidate.bundlePath
+              ) else { return nil }
+        return candidate.processIdentifier
+    }
+
+    /// Resolve the two identities that a focus lease needs. Ordinary clients
+    /// use the same process as both IMK host and foreground authority. A trusted
+    /// overlay uses its own process as the IMK host, while the unchanged app
+    /// underneath becomes a foreground anchor that must remain stable.
+    static func resolveKnownFrontmost(incomingBundleID: String,
+                                      frontmostBundleID: String,
+                                      frontmostProcessIdentifier: pid_t,
+                                      trustedOverlayProcessIdentifier: pid_t?) -> FocusHostResolution? {
+        if incomingBundleID == frontmostBundleID {
+            return FocusHostResolution(
+                kind: .frontmostApplication,
+                clientProcessIdentifier: frontmostProcessIdentifier,
+                foregroundAnchorBundleID: frontmostBundleID,
+                foregroundAnchorProcessIdentifier: frontmostProcessIdentifier
+            )
+        }
+        guard isNonactivatingSystemOverlayBundle(incomingBundleID),
+              let trustedOverlayProcessIdentifier else { return nil }
+        return FocusHostResolution(
+            kind: .nonactivatingSystemOverlay,
+            clientProcessIdentifier: trustedOverlayProcessIdentifier,
+            foregroundAnchorBundleID: frontmostBundleID,
+            foregroundAnchorProcessIdentifier: frontmostProcessIdentifier
+        )
+    }
+
+    static func callbackMayUseResolution(kind: FocusHostKind,
+                                         explicitActivation: Bool,
+                                         eventCanEstablishOverlay: Bool,
+                                         continuesExactLease: Bool,
+                                         trustedOverlayVisible: Bool) -> Bool {
+        guard kind == .nonactivatingSystemOverlay else { return true }
+        // An explicit lifecycle callback may create only a suspended lease so
+        // it is safe before the search window is ordered. Events require the
+        // real Spotlight window to be on screen.
+        return explicitActivation
+            || (trustedOverlayVisible
+                && (eventCanEstablishOverlay || continuesExactLease))
+    }
+
+    static func resolutionMatchesLease(_ resolution: FocusHostResolution,
+                                       hostKind: FocusHostKind,
+                                       clientProcessIdentifier: pid_t,
+                                       foregroundAnchorBundleID: String?,
+                                       foregroundAnchorProcessIdentifier: pid_t?) -> Bool {
+        let anchorBundleMatches = resolution.foregroundAnchorBundleID
+            == foregroundAnchorBundleID
+            || (hostKind == .frontmostApplication
+                && foregroundAnchorBundleID == nil
+                && resolution.foregroundAnchorProcessIdentifier
+                    == foregroundAnchorProcessIdentifier)
+        return resolution.kind == hostKind
+            && resolution.clientProcessIdentifier == clientProcessIdentifier
+            && anchorBundleMatches
+            && resolution.foregroundAnchorProcessIdentifier
+                == foregroundAnchorProcessIdentifier
+    }
+
+    static func applicationAuthorityMatches(
+        kind: FocusHostKind,
+        leaseBundleID: String,
+        leaseProcessIdentifier: pid_t,
+        foregroundAnchorBundleID: String?,
+        foregroundAnchorProcessIdentifier: pid_t?,
+        currentFrontmostBundleID: String?,
+        currentFrontmostProcessIdentifier: pid_t?,
+        currentTrustedOverlayProcessIdentifier: pid_t?,
+        trustedOverlayVisible: Bool
+    ) -> (bundle: Bool, process: Bool) {
+        switch kind {
+        case .frontmostApplication:
+            return (
+                currentFrontmostBundleID.map { $0 == leaseBundleID } ?? true,
+                currentFrontmostProcessIdentifier == leaseProcessIdentifier
+            )
+        case .nonactivatingSystemOverlay:
+            let overlayProcessMatches = trustedOverlayVisible
+                && currentTrustedOverlayProcessIdentifier == leaseProcessIdentifier
+            let anchorBundleMatches = currentFrontmostBundleID.map {
+                $0 == foregroundAnchorBundleID
+            } ?? (currentFrontmostProcessIdentifier
+                    == foregroundAnchorProcessIdentifier)
+            return (
+                overlayProcessMatches
+                    && foregroundAnchorBundleID != nil
+                    && anchorBundleMatches,
+                overlayProcessMatches
+                    && foregroundAnchorProcessIdentifier != nil
+                    && currentFrontmostProcessIdentifier == foregroundAnchorProcessIdentifier
+            )
+        }
+    }
+
+    static func frontmostChangeInvalidatesLease(
+        hostKind: FocusHostKind,
+        leaseBundleID: String,
+        leaseProcessIdentifier: pid_t,
+        foregroundAnchorBundleID: String?,
+        foregroundAnchorProcessIdentifier: pid_t?,
+        activatedBundleID: String?,
+        activatedProcessIdentifier: pid_t?
+    ) -> Bool {
+        // Spotlight never becomes frontmost. Any later workspace activation —
+        // including the anchor app becoming active again — is a fail-closed
+        // signal that the overlay lease must be retired.
+        if hostKind == .nonactivatingSystemOverlay { return true }
+        let expectedBundleID = foregroundAnchorBundleID ?? leaseBundleID
+        let expectedProcessIdentifier = foregroundAnchorProcessIdentifier
+            ?? leaseProcessIdentifier
+        let bundleChanged = activatedBundleID.map { $0 != expectedBundleID } ?? false
+        return bundleChanged || activatedProcessIdentifier != expectedProcessIdentifier
+    }
+
+    static func displacedLeaseRequiresNoClientCleanup(
+        hostKind: FocusHostKind
+    ) -> Bool {
+        // Replacing a nonactivating overlay means the destination is no longer
+        // authoritative. Its proxy may still be alive but must not be called.
+        hostKind == .nonactivatingSystemOverlay
+    }
+}
+
 /// Pure epoch state used by the runtime coordinator and the CLI smoke test.
 struct FocusEpochState {
     private(set) var generation: UInt64 = 0
@@ -81,6 +256,8 @@ enum FocusTargetRules {
 }
 
 enum FocusEventRules {
+    static let nonactivatingOverlayEventFreshnessWindow: TimeInterval = 1.0
+
     static func isOrdered(_ eventTimestamp: TimeInterval,
                           activationFloor: TimeInterval?,
                           lastAccepted: TimeInterval?) -> Bool {
@@ -90,9 +267,17 @@ enum FocusEventRules {
         return true
     }
 
+    static func isFreshNonactivatingOverlayEvent(_ eventTimestamp: TimeInterval,
+                                                  now: TimeInterval) -> Bool {
+        let age = now - eventTimestamp
+        return age >= -0.000_001 && age <= nonactivatingOverlayEventFreshnessWindow
+    }
+
     static func mayTakeOwnership(incomingBundleID: String,
                                  currentOwnerBundleID: String,
-                                 frontmostBundleID: String?) -> Bool {
+                                 frontmostBundleID: String?,
+                                 incomingHostKind: FocusHostKind) -> Bool {
+        if incomingHostKind == .nonactivatingSystemOverlay { return true }
         guard let frontmostBundleID else {
             return incomingBundleID == currentOwnerBundleID
         }
@@ -110,16 +295,21 @@ enum FocusEventRules {
 
 enum FocusActivationRules {
     static let provisionalConfirmationWindow: TimeInterval = 0.25
+    static let nonactivatingOverlayProvisionalConfirmationWindow: TimeInterval = 2.0
     static let reusedClientLifecycleSuppressionWindow: TimeInterval = 0.25
     static let ambiguousLifecycleMinimumAge: TimeInterval = 0.08
 
     static func shouldConfirmProvisional(isProvisional: Bool,
                                          sameControllerAndClient: Bool,
-                                         age: TimeInterval) -> Bool {
-        isProvisional
+                                         age: TimeInterval,
+                                         hostKind: FocusHostKind = .frontmostApplication) -> Bool {
+        let confirmationWindow = hostKind == .nonactivatingSystemOverlay
+            ? nonactivatingOverlayProvisionalConfirmationWindow
+            : provisionalConfirmationWindow
+        return isProvisional
             && sameControllerAndClient
             && age >= 0
-            && age <= provisionalConfirmationWindow
+            && age <= confirmationWindow
     }
 
     static func lifecycleCallbackMayApply(now: TimeInterval,
@@ -167,6 +357,9 @@ final class FocusLease {
     let clientIdentity: ObjectIdentifier
     let bundleID: String
     let processIdentifier: pid_t
+    let hostKind: FocusHostKind
+    let foregroundAnchorBundleID: String?
+    let foregroundAnchorProcessIdentifier: pid_t?
     let isExternalTarget: Bool
     var activationEventFloor: TimeInterval?
     var lastAcceptedEventTimestamp: TimeInterval?
@@ -175,6 +368,7 @@ final class FocusLease {
     let lifecycleSuppressionUntilUptime: TimeInterval
     let clientIdentityWasReused: Bool
     var deliverySuspended = false
+    var awaitingOverlayKeyDown = false
     var compositionActive = false
     var markedRangeReliable = true
     var markedRangeWasObservable = false
@@ -184,6 +378,9 @@ final class FocusLease {
          client: IMKTextInput,
          bundleID: String,
          processIdentifier: pid_t,
+         hostKind: FocusHostKind,
+         foregroundAnchorBundleID: String?,
+         foregroundAnchorProcessIdentifier: pid_t?,
          isExternalTarget: Bool,
          activationEventFloor: TimeInterval?,
          lastAcceptedEventTimestamp: TimeInterval?,
@@ -197,6 +394,9 @@ final class FocusLease {
         self.clientIdentity = ObjectIdentifier(client as AnyObject)
         self.bundleID = bundleID
         self.processIdentifier = processIdentifier
+        self.hostKind = hostKind
+        self.foregroundAnchorBundleID = foregroundAnchorBundleID
+        self.foregroundAnchorProcessIdentifier = foregroundAnchorProcessIdentifier
         self.isExternalTarget = isExternalTarget
         self.activationEventFloor = activationEventFloor
         self.lastAcceptedEventTimestamp = lastAcceptedEventTimestamp
@@ -219,16 +419,99 @@ final class InputFocusCoordinator {
         let displaced: FocusLease?
     }
 
+    private struct OverlayVisibilitySample {
+        let processIdentifier: pid_t
+        let checkedAtUptime: TimeInterval
+        let visible: Bool
+    }
+
     private var epochs = FocusEpochState()
     private(set) var owner: FocusLease?
     private let knownClientProcesses = NSMapTable<AnyObject, NSNumber>(
         keyOptions: .weakMemory,
         valueOptions: .strongMemory
     )
+    private var overlayVisibilitySample: OverlayVisibilitySample?
     var onChange: (() -> Void)?
     var onInvalidated: ((FocusToken) -> Void)?
 
     private init() {}
+
+    /// Resolve only the one Apple-owned, system-path overlay that has been
+    /// verified on this macOS release. New bindings reject duplicate processes;
+    /// an established lease is revalidated cheaply by its frozen PID.
+    private func trustedNonactivatingSystemOverlayProcessIdentifier(
+        for bundleID: String,
+        boundProcessIdentifier: pid_t? = nil
+    ) -> pid_t? {
+        guard FocusHostRules.isNonactivatingSystemOverlayBundle(bundleID) else {
+            return nil
+        }
+        if let boundProcessIdentifier {
+            guard let application = NSRunningApplication(
+                    processIdentifier: boundProcessIdentifier
+                  ),
+                  !application.isTerminated,
+                  application.bundleIdentifier == bundleID else { return nil }
+            return boundProcessIdentifier
+        }
+        let candidates = NSRunningApplication.runningApplications(
+            withBundleIdentifier: bundleID
+        ).filter { !$0.isTerminated }.map {
+            (processIdentifier: $0.processIdentifier,
+             bundlePath: $0.bundleURL?.path)
+        }
+        return FocusHostRules.uniqueTrustedOverlayProcessIdentifier(
+            bundleID: bundleID,
+            runningCandidates: candidates
+        )
+    }
+
+    /// Spotlight's process is long-lived, so PID/path existence is not enough:
+    /// delivery is trusted only while that process owns an on-screen window.
+    /// A tiny cache coalesces the several target checks made by one key event.
+    private func trustedOverlayHasVisibleWindow(
+        processIdentifier: pid_t,
+        forceRefresh: Bool = false
+    ) -> Bool {
+        let now = ProcessInfo.processInfo.systemUptime
+        if !forceRefresh,
+           let sample = overlayVisibilitySample,
+           sample.processIdentifier == processIdentifier,
+           now - sample.checkedAtUptime >= 0,
+           now - sample.checkedAtUptime <= 0.010 {
+            return sample.visible
+        }
+        let options: CGWindowListOption = [
+            .optionOnScreenOnly,
+            .excludeDesktopElements,
+        ]
+        let windows = CGWindowListCopyWindowInfo(options, kCGNullWindowID)
+            as? [[String: Any]] ?? []
+        let visible = windows.contains { window in
+            guard let ownerPID = window[kCGWindowOwnerPID as String] as? NSNumber,
+                  ownerPID.int32Value == processIdentifier else { return false }
+            let alpha = (window[kCGWindowAlpha as String] as? NSNumber)?.doubleValue
+                ?? 1
+            return alpha > 0
+        }
+        overlayVisibilitySample = OverlayVisibilitySample(
+            processIdentifier: processIdentifier,
+            checkedAtUptime: now,
+            visible: visible
+        )
+        return visible
+    }
+
+    private func suspendReusedOverlayOwnerIfNeeded(
+        reusesExactOwner: Bool,
+        reason: String
+    ) {
+        guard reusesExactOwner,
+              let owner,
+              owner.hostKind == .nonactivatingSystemOverlay else { return }
+        suspendDelivery(token: owner.token, reason: reason)
+    }
 
     @discardableResult
     private func pruneExpiredOwner() -> Bool {
@@ -267,6 +550,7 @@ final class InputFocusCoordinator {
                  client: client,
                  forceNewEpoch: true,
                  eventTimestamp: nil,
+                 eventType: nil,
                  eventFloor: eventFloor)
     }
 
@@ -276,11 +560,13 @@ final class InputFocusCoordinator {
     /// queued before the current activation.
     func noteEvent(controller: RimeBufferController,
                    client: IMKTextInput,
-                   eventTimestamp: TimeInterval) -> Activation? {
+                   eventTimestamp: TimeInterval,
+                   eventType: NSEvent.EventType) -> Activation? {
         activate(controller: controller,
                  client: client,
                  forceNewEpoch: false,
                  eventTimestamp: eventTimestamp,
+                 eventType: eventType,
                  eventFloor: nil)
     }
 
@@ -288,6 +574,7 @@ final class InputFocusCoordinator {
                           client: IMKTextInput,
                           forceNewEpoch: Bool,
                           eventTimestamp: TimeInterval?,
+                          eventType: NSEvent.EventType?,
                           eventFloor: TimeInterval?) -> Activation? {
         dispatchPrecondition(condition: .onQueue(.main))
         let identity = ObjectIdentifier(client as AnyObject)
@@ -317,34 +604,106 @@ final class InputFocusCoordinator {
                 && $0.bundleID == bundleID
         } ?? false
 
+        let activationNow = ProcessInfo.processInfo.systemUptime
+        let explicitActivation = forceNewEpoch && eventTimestamp == nil
+        let eventCanEstablishOverlay = eventType == .keyDown
+            && eventTimestamp.map {
+                FocusEventRules.isFreshNonactivatingOverlayEvent(
+                    $0,
+                    now: activationNow
+                )
+            } == true
+
+        let clientObject = client as AnyObject
+        let knownProcess = knownClientProcesses.object(forKey: clientObject)
+        let overlayBundle = FocusHostRules
+            .isNonactivatingSystemOverlayBundle(bundleID)
+        let boundOverlayProcessIdentifier: pid_t? = {
+            guard overlayBundle,
+                  reusesExactOwner,
+                  owner?.hostKind == .nonactivatingSystemOverlay else { return nil }
+            return owner?.processIdentifier
+        }()
+        var trustedOverlayVisible = false
+        let hostResolution: FocusHostResolution
+
         if let frontmostBundleID, let frontmostProcessIdentifier {
-            guard bundleID == frontmostBundleID else {
+            let overlayProcessIdentifier: pid_t?
+            if overlayBundle {
+                overlayProcessIdentifier =
+                    trustedNonactivatingSystemOverlayProcessIdentifier(
+                        for: bundleID,
+                        boundProcessIdentifier: boundOverlayProcessIdentifier
+                    )
+                if let overlayProcessIdentifier {
+                    trustedOverlayVisible = trustedOverlayHasVisibleWindow(
+                        processIdentifier: overlayProcessIdentifier,
+                        forceRefresh: explicitActivation || eventType != nil
+                    )
+                }
+            } else {
+                overlayProcessIdentifier = nil
+            }
+            guard let resolved = FocusHostRules.resolveKnownFrontmost(
+                incomingBundleID: bundleID,
+                frontmostBundleID: frontmostBundleID,
+                frontmostProcessIdentifier: frontmostProcessIdentifier,
+                trustedOverlayProcessIdentifier: overlayProcessIdentifier
+            ) else {
+                suspendReusedOverlayOwnerIfNeeded(
+                    reusesExactOwner: reusesExactOwner,
+                    reason: "overlay process/anchor unavailable"
+                )
                 IMELog.write("focus background callback rejected bundle=\(bundleID) frontmost=\(frontmostBundleID)")
                 return nil
             }
-            let clientObject = client as AnyObject
-            if let knownProcess = knownClientProcesses.object(forKey: clientObject),
-               knownProcess.int32Value != frontmostProcessIdentifier {
-                IMELog.write("focus client process mismatch rejected bundle=\(bundleID) known=\(knownProcess.int32Value) frontmost=\(frontmostProcessIdentifier)")
+            hostResolution = resolved
+        } else if overlayBundle {
+            // The frontmost bundle can briefly be unavailable. Only an exact,
+            // already-bound overlay lease may continue under the frozen anchor
+            // PID; first establishment still requires both anchor identities.
+            guard let owner,
+                  reusesExactOwner,
+                  owner.hostKind == .nonactivatingSystemOverlay,
+                  let foregroundAnchorBundleID = owner.foregroundAnchorBundleID,
+                  let foregroundAnchorProcessIdentifier =
+                    owner.foregroundAnchorProcessIdentifier,
+                  frontmostProcessIdentifier == foregroundAnchorProcessIdentifier,
+                  trustedNonactivatingSystemOverlayProcessIdentifier(
+                    for: bundleID,
+                    boundProcessIdentifier: owner.processIdentifier
+                  ) == owner.processIdentifier else {
+                suspendReusedOverlayOwnerIfNeeded(
+                    reusesExactOwner: reusesExactOwner,
+                    reason: "overlay foreground anchor unavailable"
+                )
+                IMELog.write("focus overlay callback rejected; foreground anchor unavailable bundle=\(bundleID)")
                 return nil
             }
-            knownClientProcesses.setObject(NSNumber(value: frontmostProcessIdentifier),
-                                           forKey: clientObject)
+            trustedOverlayVisible = trustedOverlayHasVisibleWindow(
+                processIdentifier: owner.processIdentifier,
+                forceRefresh: explicitActivation || eventType != nil
+            )
+            hostResolution = FocusHostResolution(
+                kind: .nonactivatingSystemOverlay,
+                clientProcessIdentifier: owner.processIdentifier,
+                foregroundAnchorBundleID: foregroundAnchorBundleID,
+                foregroundAnchorProcessIdentifier: foregroundAnchorProcessIdentifier
+            )
         } else {
             // NSWorkspace can briefly omit a bundle. Continue an exact lease;
             // when there is no owner yet, the frontmost PID plus the current
             // IMK client is enough to establish a process-bound lease. A known
             // client may also resume only in its recorded process.
-            let clientObject = client as AnyObject
-            let knownProcess = knownClientProcesses.object(forKey: clientObject)
-            let knownProcessMatches = frontmostProcessIdentifier.map { processIdentifier in
-                knownProcess?.int32Value == processIdentifier
+            let knownProcessMatches = frontmostProcessIdentifier.map {
+                knownProcess?.int32Value == $0
             } ?? false
-            let mayEstablishProcessBoundLease = FocusEventRules.mayEstablishProcessBoundLease(
-                ownerExists: owner != nil,
-                frontmostProcessIdentifier: frontmostProcessIdentifier,
-                knownClientProcessIdentifier: knownProcess?.int32Value
-            )
+            let mayEstablishProcessBoundLease = FocusEventRules
+                .mayEstablishProcessBoundLease(
+                    ownerExists: owner != nil,
+                    frontmostProcessIdentifier: frontmostProcessIdentifier,
+                    knownClientProcessIdentifier: knownProcess?.int32Value
+                )
             guard reusesExactOwner
                     || knownProcessMatches
                     || mayEstablishProcessBoundLease else {
@@ -353,15 +712,73 @@ final class InputFocusCoordinator {
             }
             if let owner,
                let frontmostProcessIdentifier,
-               owner.processIdentifier != frontmostProcessIdentifier {
+               (owner.foregroundAnchorProcessIdentifier ?? owner.processIdentifier)
+                    != frontmostProcessIdentifier {
                 IMELog.write("focus callback rejected; frontmost PID changed without bundle")
                 return nil
             }
-            if let frontmostProcessIdentifier {
-                knownClientProcesses.setObject(NSNumber(value: frontmostProcessIdentifier),
-                                               forKey: clientObject)
+            let processIdentifier = frontmostProcessIdentifier
+                ?? knownProcess?.int32Value
+                ?? owner?.processIdentifier
+                ?? 0
+            guard processIdentifier > 0 else {
+                IMELog.write("focus callback rejected; client process unavailable bundle=\(bundleID)")
+                return nil
             }
+            hostResolution = FocusHostResolution(
+                kind: .frontmostApplication,
+                clientProcessIdentifier: processIdentifier,
+                foregroundAnchorBundleID: frontmostBundleID
+                    ?? owner?.foregroundAnchorBundleID,
+                foregroundAnchorProcessIdentifier: frontmostProcessIdentifier
+                    ?? owner?.foregroundAnchorProcessIdentifier
+                    ?? processIdentifier
+            )
         }
+
+        let hostResolutionMatchesOwner = owner.map {
+            FocusHostRules.resolutionMatchesLease(
+                hostResolution,
+                hostKind: $0.hostKind,
+                clientProcessIdentifier: $0.processIdentifier,
+                foregroundAnchorBundleID: $0.foregroundAnchorBundleID,
+                foregroundAnchorProcessIdentifier:
+                    $0.foregroundAnchorProcessIdentifier
+            )
+        } ?? false
+        let continuesExactLease = reusesExactOwner
+            && hostResolutionMatchesOwner
+            && owner?.deliverySuspended == false
+        guard FocusHostRules.callbackMayUseResolution(
+            kind: hostResolution.kind,
+            explicitActivation: explicitActivation,
+            eventCanEstablishOverlay: eventCanEstablishOverlay,
+            continuesExactLease: continuesExactLease,
+            trustedOverlayVisible: trustedOverlayVisible
+        ) else {
+            if !trustedOverlayVisible || !hostResolutionMatchesOwner {
+                suspendReusedOverlayOwnerIfNeeded(
+                    reusesExactOwner: reusesExactOwner,
+                    reason: "overlay window or event authority unavailable"
+                )
+            }
+            IMELog.write("focus overlay event rejected; no visible trusted search lease type=\(eventType?.rawValue ?? 0)")
+            return nil
+        }
+
+        if let knownProcess,
+           knownProcess.int32Value != hostResolution.clientProcessIdentifier {
+            suspendReusedOverlayOwnerIfNeeded(
+                reusesExactOwner: reusesExactOwner,
+                reason: "overlay client process changed"
+            )
+            IMELog.write("focus client process mismatch rejected bundle=\(bundleID) known=\(knownProcess.int32Value) resolved=\(hostResolution.clientProcessIdentifier)")
+            return nil
+        }
+        knownClientProcesses.setObject(
+            NSNumber(value: hostResolution.clientProcessIdentifier),
+            forKey: clientObject
+        )
 
         if let owner, epochs.isCurrent(owner.token) {
             if let eventTimestamp,
@@ -371,16 +788,53 @@ final class InputFocusCoordinator {
                 IMELog.write("focus out-of-order event rejected bundle=\(bundleID) owner=\(owner.token)")
                 return nil
             }
-            guard FocusEventRules.mayTakeOwnership(incomingBundleID: bundleID,
-                                                   currentOwnerBundleID: owner.bundleID,
-                                                   frontmostBundleID: frontmostBundleID) else { return nil }
+            guard FocusEventRules.mayTakeOwnership(
+                incomingBundleID: bundleID,
+                currentOwnerBundleID: owner.bundleID,
+                frontmostBundleID: frontmostBundleID,
+                incomingHostKind: hostResolution.kind
+            ) else { return nil }
         }
 
-        // `markedRange()` touches the host proxy. Do it only after the app/PID
-        // and event ordering gates above have proved this is not a stale or
-        // background callback.
+        if eventType == .keyDown,
+           eventCanEstablishOverlay,
+           trustedOverlayVisible,
+           reusesExactOwner,
+           hostResolutionMatchesOwner,
+           let owner,
+           owner.awaitingOverlayKeyDown,
+           epochs.isCurrent(owner.token) {
+            // The activation already minted a fresh token. Promote that same
+            // lease after the first positive key proof; manufacturing another
+            // same-proxy epoch would make all lifecycle callbacks ambiguous.
+            owner.awaitingOverlayKeyDown = false
+            owner.deliverySuspended = false
+            owner.lastAcceptedEventTimestamp = eventTimestamp
+            IMELog.write("focus overlay promoted token=\(owner.token) bundle=\(bundleID)")
+            onChange?()
+            return Activation(token: owner.token, displaced: nil)
+        }
+
+        let confirmsProvisionalEvent = forceNewEpoch && owner.map {
+            hostResolutionMatchesOwner
+                && ($0.hostKind != .nonactivatingSystemOverlay
+                    || trustedOverlayVisible)
+                && FocusActivationRules.shouldConfirmProvisional(
+                    isProvisional: $0.provisionalFromEvent,
+                    sameControllerAndClient: reusesExactOwner,
+                    age: activationNow - $0.createdAtUptime,
+                    hostKind: $0.hostKind
+                )
+                && !$0.deliverySuspended
+                && epochs.isCurrent($0.token)
+        } ?? false
+
+        // `markedRange()` touches the host proxy. Do it only after the app/PID,
+        // host/anchor, event-order and visibility gates have all succeeded.
         let shouldInspectMarkedRange = eventTimestamp != nil
             && reusesExactOwner
+            && hostResolutionMatchesOwner
+            && owner?.deliverySuspended == false
             && owner?.compositionActive == true
             && owner?.markedRangeReliable == true
             && owner?.markedRangeWasObservable == true
@@ -397,50 +851,18 @@ final class InputFocusCoordinator {
         let eventRequiresFreshEpoch = eventRevealsFieldChange
             || (eventTimestamp != nil
                 && reusesExactOwner
-                && owner?.deliverySuspended == true)
+                && (owner?.deliverySuspended == true
+                    || !hostResolutionMatchesOwner))
 
         // Some hosts deliver the first key before activateServer. That event
-        // creates a provisional epoch; the matching activation confirms it
-        // instead of displacing the just-started composition. Later explicit
-        // activations still create fresh epochs even when IMK reuses a proxy.
-        if forceNewEpoch,
-           let owner,
-           FocusActivationRules.shouldConfirmProvisional(
-                isProvisional: owner.provisionalFromEvent,
-                sameControllerAndClient: owner.controller === controller
-                    && owner.clientIdentity == identity
-                    && owner.client != nil,
-                age: ProcessInfo.processInfo.systemUptime - owner.createdAtUptime
-           ),
-           !owner.deliverySuspended,
-           epochs.isCurrent(owner.token) {
+        // creates a provisional epoch; a matching activation confirms it.
+        if confirmsProvisionalEvent, let owner {
             owner.provisionalFromEvent = false
-            owner.deliverySuspended = false
             if let eventFloor {
-                owner.activationEventFloor = max(owner.activationEventFloor ?? eventFloor,
-                                                 eventFloor)
-            }
-            return Activation(token: owner.token, displaced: nil)
-        }
-
-        // With no verifiable frontmost bundle, an ordered key event may
-        // continue the exact PID-bound lease. An explicit server activation
-        // still denotes a new field (except the provisional confirmation
-        // handled above), so same-proxy reuse is displaced and recovered.
-        if frontmostBundleID == nil,
-           let owner,
-           reusesExactOwner,
-           FocusActivationRules.mayContinueExactLeaseWithoutBundle(
-                forceNewEpoch: forceNewEpoch,
-                eventRequiresFreshEpoch: eventRequiresFreshEpoch
-           ),
-           epochs.isCurrent(owner.token) {
-            if let eventTimestamp {
-                owner.lastAcceptedEventTimestamp = eventTimestamp
-                if owner.deliverySuspended {
-                    owner.deliverySuspended = false
-                    onChange?()
-                }
+                owner.activationEventFloor = max(
+                    owner.activationEventFloor ?? eventFloor,
+                    eventFloor
+                )
             }
             return Activation(token: owner.token, displaced: nil)
         }
@@ -448,53 +870,69 @@ final class InputFocusCoordinator {
         if let owner,
            !forceNewEpoch,
            !eventRequiresFreshEpoch,
-           owner.controller === controller,
-           owner.clientIdentity == identity,
-           owner.client != nil,
+           reusesExactOwner,
+           hostResolutionMatchesOwner,
            epochs.isCurrent(owner.token) {
             if let eventTimestamp {
                 owner.lastAcceptedEventTimestamp = eventTimestamp
-            }
-            if owner.deliverySuspended {
-                owner.deliverySuspended = false
-                onChange?()
             }
             return Activation(token: owner.token, displaced: nil)
         }
 
         let displaced = owner
+        if let displaced,
+           FocusHostRules.displacedLeaseRequiresNoClientCleanup(
+            hostKind: displaced.hostKind
+           ) {
+            displaced.deliverySuspended = true
+            displaced.awaitingOverlayKeyDown = false
+        }
         let token = epochs.activate()
-        let ownBundleID = Bundle.main.bundleIdentifier ?? "com.isaac.inputmethod.RimeBuffer"
+        let ownBundleID = Bundle.main.bundleIdentifier
+            ?? "com.isaac.inputmethod.RimeBuffer"
         let ownProcessIdentifier = ProcessInfo.processInfo.processIdentifier
-        let targetProcessIdentifier = frontmostProcessIdentifier
-            ?? displaced?.processIdentifier
-            ?? 0
+        let targetProcessIdentifier = hostResolution.clientProcessIdentifier
         let isExternalTarget = FocusTargetRules.identifiesExternalTarget(
             bundleID: bundleID,
             processIdentifier: targetProcessIdentifier,
             ownBundleID: ownBundleID,
             ownProcessIdentifier: ownProcessIdentifier
         )
-        let now = ProcessInfo.processInfo.systemUptime
         // An IMK proxy may be reused across controller instances as well as
         // fields within one controller. Identity reuse alone makes the old
         // destination unsafe.
         let reusesDisplacedIdentity = displaced?.clientIdentity == identity
-        owner = FocusLease(token: token,
-                           controller: controller,
-                           client: client,
-                           bundleID: bundleID,
-                           processIdentifier: targetProcessIdentifier,
-                           isExternalTarget: isExternalTarget,
-                           activationEventFloor: eventFloor ?? eventTimestamp,
-                           lastAcceptedEventTimestamp: eventTimestamp,
-                           provisionalFromEvent: !forceNewEpoch,
-                           createdAtUptime: now,
-                           lifecycleSuppressionUntilUptime: reusesDisplacedIdentity
-                               ? now + FocusActivationRules.reusedClientLifecycleSuppressionWindow
-                               : now,
-                           clientIdentityWasReused: reusesDisplacedIdentity)
-        IMELog.write("focus activate token=\(token) bundle=\(bundleID) external=\(isExternalTarget)")
+        let newOwner = FocusLease(
+            token: token,
+            controller: controller,
+            client: client,
+            bundleID: bundleID,
+            processIdentifier: targetProcessIdentifier,
+            hostKind: hostResolution.kind,
+            foregroundAnchorBundleID: hostResolution.foregroundAnchorBundleID,
+            foregroundAnchorProcessIdentifier:
+                hostResolution.foregroundAnchorProcessIdentifier,
+            isExternalTarget: isExternalTarget,
+            activationEventFloor: eventFloor ?? eventTimestamp,
+            lastAcceptedEventTimestamp: eventTimestamp,
+            provisionalFromEvent: !forceNewEpoch,
+            createdAtUptime: activationNow,
+            lifecycleSuppressionUntilUptime: reusesDisplacedIdentity
+                ? activationNow
+                    + FocusActivationRules.reusedClientLifecycleSuppressionWindow
+                : activationNow,
+            clientIdentityWasReused: reusesDisplacedIdentity
+        )
+        // Spotlight activation may precede its window becoming visible. Preheat
+        // the engine under a fresh token, but the first fresh keyDown must
+        // establish the deliverable epoch; keyUp/flagsChanged cannot unlock it.
+        newOwner.deliverySuspended = hostResolution.kind
+            == .nonactivatingSystemOverlay && explicitActivation
+        newOwner.awaitingOverlayKeyDown = newOwner.deliverySuspended
+        owner = newOwner
+        let hostDescription = hostResolution.kind
+            == .nonactivatingSystemOverlay ? "overlay" : "frontmost"
+        IMELog.write("focus activate token=\(token) bundle=\(bundleID) host=\(hostDescription) anchor=\(hostResolution.foregroundAnchorBundleID ?? "unknown") suspended=\(newOwner.deliverySuspended) external=\(isExternalTarget)")
         onChange?()
         return Activation(token: token, displaced: displaced)
     }
@@ -546,9 +984,11 @@ final class InputFocusCoordinator {
     func suspendDelivery(token: FocusToken, reason: String) {
         guard let owner,
               owner.token == token,
-              epochs.isCurrent(token),
-              !owner.deliverySuspended else { return }
+              epochs.isCurrent(token) else { return }
+        let changed = !owner.deliverySuspended || owner.awaitingOverlayKeyDown
+        guard changed else { return }
         owner.deliverySuspended = true
+        owner.awaitingOverlayKeyDown = false
         IMELog.write("focus delivery suspended token=\(token) reason=\(reason)")
         onInvalidated?(token)
         onChange?()
@@ -575,19 +1015,147 @@ final class InputFocusCoordinator {
         return owner
     }
 
+    func maySynchronizePendingOverlayModifierBaseline(
+        controller: RimeBufferController,
+        client: IMKTextInput,
+        eventTimestamp: TimeInterval
+    ) -> Bool {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard let owner,
+              epochs.isCurrent(owner.token),
+              owner.controller === controller,
+              owner.clientIdentity == ObjectIdentifier(client as AnyObject),
+              owner.client != nil,
+              owner.hostKind == .nonactivatingSystemOverlay,
+              owner.deliverySuspended,
+              owner.awaitingOverlayKeyDown else { return false }
+        return FocusEventRules.isOrdered(
+            eventTimestamp,
+            activationFloor: owner.activationEventFloor,
+            lastAccepted: owner.lastAcceptedEventTimestamp
+        )
+    }
+
+    /// Lifecycle callbacks can be the first signal that Spotlight closed.
+    /// Refresh rather than using the per-key cache, then mark the lease unsafe
+    /// while still returning it to the controller for no-client cleanup.
+    func refreshOverlayLifecycleTrust(_ lease: FocusLease) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard owner === lease,
+              epochs.isCurrent(lease.token),
+              lease.hostKind == .nonactivatingSystemOverlay else { return }
+        let frontmostApplication = NSWorkspace.shared.frontmostApplication
+        let processIdentifier =
+            trustedNonactivatingSystemOverlayProcessIdentifier(
+                for: lease.bundleID,
+                boundProcessIdentifier: lease.processIdentifier
+            )
+        let visible = processIdentifier == lease.processIdentifier
+            && trustedOverlayHasVisibleWindow(
+                processIdentifier: lease.processIdentifier,
+                forceRefresh: true
+            )
+        let authority = FocusHostRules.applicationAuthorityMatches(
+            kind: lease.hostKind,
+            leaseBundleID: lease.bundleID,
+            leaseProcessIdentifier: lease.processIdentifier,
+            foregroundAnchorBundleID: lease.foregroundAnchorBundleID,
+            foregroundAnchorProcessIdentifier:
+                lease.foregroundAnchorProcessIdentifier,
+            currentFrontmostBundleID: frontmostApplication?.bundleIdentifier,
+            currentFrontmostProcessIdentifier:
+                frontmostApplication?.processIdentifier,
+            currentTrustedOverlayProcessIdentifier: processIdentifier,
+            trustedOverlayVisible: visible
+        )
+        if !authority.bundle || !authority.process {
+            suspendDelivery(
+                token: lease.token,
+                reason: "overlay lifecycle authority unavailable"
+            )
+        }
+    }
+
     private func validatedTarget(expected token: FocusToken?,
-                                 requireExternal: Bool) -> FocusLease? {
+                                 requireExternal: Bool,
+                                 forceOverlayVisibilityRefresh: Bool) -> FocusLease? {
         if Thread.isMainThread { _ = pruneExpiredOwner() }
         guard let owner else { return nil }
         let client = owner.client
         let controllerClient = owner.controller?.client()
         let frontmostApplication = NSWorkspace.shared.frontmostApplication
-        // A running application can briefly expose a PID before its bundle ID.
-        // The exact PID gate below still applies, so nil bundle is consistent
-        // with the process-bound lease admitted by `activate` above.
-        let frontmostBundleMatches = frontmostApplication?.bundleIdentifier.map {
-            $0 == owner.bundleID
-        } ?? true
+        var currentTrustedOverlayProcessIdentifier: pid_t?
+        var trustedOverlayVisible = false
+        if owner.hostKind == .nonactivatingSystemOverlay {
+            currentTrustedOverlayProcessIdentifier =
+                trustedNonactivatingSystemOverlayProcessIdentifier(
+                    for: owner.bundleID,
+                    boundProcessIdentifier: owner.processIdentifier
+                )
+            if currentTrustedOverlayProcessIdentifier == owner.processIdentifier {
+                trustedOverlayVisible = trustedOverlayHasVisibleWindow(
+                    processIdentifier: owner.processIdentifier,
+                    forceRefresh: forceOverlayVisibilityRefresh
+                )
+            }
+            // Remember a sampled hidden/restarted state. If Spotlight reopens
+            // without a reliable deactivate callback, only a fresh keyDown can
+            // create a new deliverable epoch.
+            if currentTrustedOverlayProcessIdentifier
+                != owner.processIdentifier {
+                suspendDelivery(
+                    token: owner.token,
+                    reason: "overlay process unavailable"
+                )
+            } else if !trustedOverlayVisible,
+                      !owner.deliverySuspended {
+                // A pending activation is expected to precede visibility; an
+                // already-deliverable lease observing a hidden window is not.
+                suspendDelivery(
+                    token: owner.token,
+                    reason: "overlay window unavailable"
+                )
+            }
+        }
+        // A normal running application can briefly expose a PID before its
+        // bundle ID. A trusted overlay instead validates its own system process
+        // plus the unchanged foreground anchor captured by the key event.
+        let authority = FocusHostRules.applicationAuthorityMatches(
+            kind: owner.hostKind,
+            leaseBundleID: owner.bundleID,
+            leaseProcessIdentifier: owner.processIdentifier,
+            foregroundAnchorBundleID: owner.foregroundAnchorBundleID,
+            foregroundAnchorProcessIdentifier: owner.foregroundAnchorProcessIdentifier,
+            currentFrontmostBundleID: frontmostApplication?.bundleIdentifier,
+            currentFrontmostProcessIdentifier: frontmostApplication?.processIdentifier,
+            currentTrustedOverlayProcessIdentifier:
+                currentTrustedOverlayProcessIdentifier,
+            trustedOverlayVisible: trustedOverlayVisible
+        )
+        if owner.hostKind == .nonactivatingSystemOverlay {
+            let anchorAuthority = FocusHostRules.applicationAuthorityMatches(
+                kind: owner.hostKind,
+                leaseBundleID: owner.bundleID,
+                leaseProcessIdentifier: owner.processIdentifier,
+                foregroundAnchorBundleID: owner.foregroundAnchorBundleID,
+                foregroundAnchorProcessIdentifier:
+                    owner.foregroundAnchorProcessIdentifier,
+                currentFrontmostBundleID:
+                    frontmostApplication?.bundleIdentifier,
+                currentFrontmostProcessIdentifier:
+                    frontmostApplication?.processIdentifier,
+                currentTrustedOverlayProcessIdentifier: owner.processIdentifier,
+                trustedOverlayVisible: true
+            )
+            if !anchorAuthority.bundle || !anchorAuthority.process {
+                // Authority is monotonic: an observed anchor mismatch cannot
+                // become trusted again merely because the old app returns.
+                suspendDelivery(
+                    token: owner.token,
+                    reason: "overlay foreground anchor changed"
+                )
+            }
+        }
         guard FocusTargetRules.allows(
             tokenIsCurrent: epochs.isCurrent(owner.token),
             expectedTokenMatches: token == nil || owner.token == token,
@@ -600,8 +1168,8 @@ final class InputFocusCoordinator {
                 ObjectIdentifier($0 as AnyObject) == owner.clientIdentity
             } ?? false,
             clientBundleMatches: client.map { ($0.bundleIdentifier() ?? "unknown") == owner.bundleID } ?? false,
-            frontmostApplicationMatches: frontmostBundleMatches,
-            frontmostProcessMatches: frontmostApplication?.processIdentifier == owner.processIdentifier
+            frontmostApplicationMatches: authority.bundle,
+            frontmostProcessMatches: authority.process
         ) else { return nil }
         return owner
     }
@@ -609,26 +1177,54 @@ final class InputFocusCoordinator {
     /// Exact current client eligible for candidate interaction. Unlike buffered
     /// delivery this may be an ETInput-owned editor, but it still requires a
     /// trusted lifecycle plus the current bundle and process.
-    func interactionTarget(expected token: FocusToken? = nil) -> FocusLease? {
-        validatedTarget(expected: token, requireExternal: false)
+    func interactionTarget(
+        expected token: FocusToken? = nil,
+        forceOverlayVisibilityRefresh: Bool = false
+    ) -> FocusLease? {
+        validatedTarget(
+            expected: token,
+            requireExternal: false,
+            forceOverlayVisibilityRefresh: forceOverlayVisibilityRefresh
+        )
     }
 
     /// Returns a target only while the exact external app/client lease is live.
     /// There is deliberately no recent-controller or last-client fallback.
-    func liveTarget(expected token: FocusToken? = nil) -> FocusLease? {
-        validatedTarget(expected: token, requireExternal: true)
+    func liveTarget(
+        expected token: FocusToken? = nil,
+        forceOverlayVisibilityRefresh: Bool = false
+    ) -> FocusLease? {
+        validatedTarget(
+            expected: token,
+            requireExternal: true,
+            forceOverlayVisibilityRefresh: forceOverlayVisibilityRefresh
+        )
     }
 
-    /// Workspace activation can arrive before or after IMK focus callbacks. If
-    /// the current lease already belongs to the activated app it remains valid;
-    /// otherwise it is revoked and returned so its owner can resolve composition.
+    /// Workspace activation can arrive before or after IMK focus callbacks.
+    /// Ordinary leases survive only an exact same-app notification. Since
+    /// Spotlight itself never activates, any such notification retires its
+    /// overlay lease fail-closed.
     func invalidateIfFrontmostChanged(to application: NSRunningApplication?) -> FocusLease? {
         dispatchPrecondition(condition: .onQueue(.main))
         guard let owner else { return nil }
         let bundleID = application?.bundleIdentifier
         let processIdentifier = application?.processIdentifier
-        let bundleChanged = bundleID.map { $0 != owner.bundleID } ?? false
-        guard bundleChanged || processIdentifier != owner.processIdentifier else { return nil }
+        guard FocusHostRules.frontmostChangeInvalidatesLease(
+            hostKind: owner.hostKind,
+            leaseBundleID: owner.bundleID,
+            leaseProcessIdentifier: owner.processIdentifier,
+            foregroundAnchorBundleID: owner.foregroundAnchorBundleID,
+            foregroundAnchorProcessIdentifier:
+                owner.foregroundAnchorProcessIdentifier,
+            activatedBundleID: bundleID,
+            activatedProcessIdentifier: processIdentifier
+        ) else { return nil }
+        if owner.hostKind == .nonactivatingSystemOverlay {
+            // The returned lease is finalized without touching Spotlight's now
+            // hidden proxy; unresolved text is recovered to the buffer instead.
+            owner.deliverySuspended = true
+        }
         _ = epochs.deactivate(owner.token)
         self.owner = nil
         IMELog.write("focus invalidated token=\(owner.token) activated=\(bundleID ?? "unknown")")
@@ -640,6 +1236,12 @@ final class InputFocusCoordinator {
     func invalidateAll(reason: String) -> FocusLease? {
         dispatchPrecondition(condition: .onQueue(.main))
         guard let owner else { return nil }
+        if owner.hostKind == .nonactivatingSystemOverlay {
+            // Global invalidations (notably input-source changes) can arrive
+            // after Spotlight has hidden without a deactivate callback. Never
+            // settle composition through that stale nonactivating proxy.
+            owner.deliverySuspended = true
+        }
         _ = epochs.deactivate(owner.token)
         self.owner = nil
         IMELog.write("focus invalidated token=\(owner.token) reason=\(reason)")

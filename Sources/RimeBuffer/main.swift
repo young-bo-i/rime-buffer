@@ -722,7 +722,11 @@ func runEngineSmokeTest() -> Bool {
     }
     engine.setOption("ascii_mode", false, session: session)
 
-    func typeFlyChordStrokes(_ strokes: [String], clearComposition: Bool = true)
+    func typeFlyChordStrokes(
+        _ strokes: [String],
+        clearComposition: Bool = true,
+        policy: FlyChordSettlementPolicy = .independentHalves
+    )
         -> (context: RimeContextModel, allPressesHandled: Bool) {
         if clearComposition {
             engine.clearComposition(session: session)
@@ -742,7 +746,7 @@ func runEngineSmokeTest() -> Bool {
             var boundaryPlan = FlyChordBoundaryRules.plan(for: contextBefore)
             if let previousLeft = pairing.takeComplement(
                 before: shape,
-                policy: .independentHalves,
+                policy: policy,
                 currentContext: contextBefore
             ) {
                 for _ in 0..<previousLeft.insertedScalarCount {
@@ -783,12 +787,82 @@ func runEngineSmokeTest() -> Bool {
                 baseInput: contextBefore.input,
                 settledContext: engine.getContext(session: session),
                 boundaryPlan: boundaryPlan,
-                policy: .independentHalves,
+                policy: policy,
                 shape: shape
             )
         }
         return (engine.getContext(session: session), allPressesHandled)
     }
+
+    // 并击 settles every current timer batch, including a useful one-sided
+    // initial/final. It differs from 互击 only by refusing to recombine two
+    // already-settled batches into one syllable.
+    let sameBatchOneSided = typeFlyChordStrokes(["dv"], policy: .sameBatchOnly)
+    let sameBatchCombined = typeFlyChordStrokes(["dvi"], policy: .sameBatchOnly)
+    let sameBatchSplit = typeFlyChordStrokes(["dv", "i"], policy: .sameBatchOnly)
+    let mutualSplit = typeFlyChordStrokes(["dv", "i"], policy: .independentHalves)
+    guard sameBatchOneSided.allPressesHandled,
+          !sameBatchOneSided.context.input.isEmpty,
+          !sameBatchOneSided.context.candidates.isEmpty,
+          sameBatchCombined.context.candidates.map(\.text).contains("你"),
+          sameBatchSplit.allPressesHandled,
+          !sameBatchSplit.context.candidates.isEmpty,
+          sameBatchSplit.context.input != sameBatchCombined.context.input,
+          mutualSplit.context.input == sameBatchCombined.context.input,
+          mutualSplit.context.candidates.map(\.text)
+            == sameBatchCombined.context.candidates.map(\.text) else {
+        print("FAILED: FlyYao same-batch/mutual settlement distinction",
+              sameBatchOneSided.context.input,
+              sameBatchOneSided.context.candidates.map(\.text),
+              sameBatchCombined.context.input,
+              sameBatchSplit.context.input,
+              mutualSplit.context.input)
+        return false
+    }
+
+    // A genuinely unmapped chord must still expose its transformed raw code as
+    // a low-priority echo candidate instead of making the candidate panel empty.
+    let unmappedChord = typeFlyChordStrokes(["qs"], policy: .sameBatchOnly)
+    guard unmappedChord.allPressesHandled,
+          !unmappedChord.context.input.isEmpty,
+          unmappedChord.context.candidates.map(\.text)
+            .contains(unmappedChord.context.input) else {
+        print("FAILED: FlyYao unmapped chord echo fallback",
+              unmappedChord.context.input,
+              unmappedChord.context.candidates.map(\.text))
+        return false
+    }
+
+    // Comma and period remain chord keys in multi-key mappings, but a batch
+    // containing only one of them must fall through to Rime's punctuator.
+    let punctuationCases: [(key: String, chinese: String, ascii: String)] = [
+        (",", "，", ","),
+        (".", "。", "."),
+    ]
+    for policy in [FlyChordSettlementPolicy.sameBatchOnly, .independentHalves] {
+        for punctuation in punctuationCases {
+            for asciiPunct in [false, true] {
+                engine.clearComposition(session: session)
+                _ = engine.takeCommit(session: session)
+                engine.setOption("ascii_punct", asciiPunct, session: session)
+                let outcome = typeFlyChordStrokes(
+                    [punctuation.key],
+                    clearComposition: false,
+                    policy: policy
+                )
+                let commit = engine.takeCommit(session: session)
+                let expected = asciiPunct ? punctuation.ascii : punctuation.chinese
+                guard outcome.allPressesHandled, commit == expected else {
+                    print("FAILED: FlyYao punctuation settlement",
+                          policy, punctuation.key, asciiPunct,
+                          commit ?? "<nil>", outcome.context.input,
+                          outcome.context.candidates.map(\.text))
+                    return false
+                }
+            }
+        }
+    }
+    engine.setOption("ascii_punct", false, session: session)
 
     let flyYaoCases: [(name: String, combined: [String], split: [String], expected: String)] = [
         ("compound initial", ["dvi"], ["dv", "i"], "你"),
@@ -1028,16 +1102,17 @@ func runSchemaListStoreSmokeTest() -> Bool {
     }
     let leftQ = chordKey("q")
     let rightY = chordKey("y")
-    var strictLeftOnly = FlyChordBatchState()
-    let strictLeftDecision = strictLeftOnly.stage(leftQ, policy: .bothHalvesRequired)
-    let strictLeftReplay = strictLeftOnly.settle()
+    var sameBatchLeftOnly = FlyChordBatchState()
+    let sameBatchLeftDecision = sameBatchLeftOnly.stage(leftQ, policy: .sameBatchOnly)
+    sameBatchLeftOnly.noteHandled(leftQ)
+    let sameBatchLeftReplay = sameBatchLeftOnly.settle()
 
-    var strictCross = FlyChordBatchState()
-    let strictFirstDecision = strictCross.stage(leftQ, policy: .bothHalvesRequired)
-    let strictSecondDecision = strictCross.stage(rightY, policy: .bothHalvesRequired)
-    strictCross.noteHandled(leftQ)
-    strictCross.noteHandled(rightY)
-    let strictCrossReplay = strictCross.settle()
+    var sameBatchCross = FlyChordBatchState()
+    let sameBatchFirstDecision = sameBatchCross.stage(leftQ, policy: .sameBatchOnly)
+    let sameBatchSecondDecision = sameBatchCross.stage(rightY, policy: .sameBatchOnly)
+    sameBatchCross.noteHandled(leftQ)
+    sameBatchCross.noteHandled(rightY)
+    let sameBatchCrossReplay = sameBatchCross.settle()
 
     var mutualLeft = FlyChordBatchState()
     let mutualLeftDecision = mutualLeft.stage(leftQ, policy: .independentHalves)
@@ -1110,20 +1185,35 @@ func runSchemaListStoreSmokeTest() -> Bool {
         boundaryPlan: .init(before: false, after: false),
         insertedScalarCount: 1
     )
+    var sameBatchPairing = FlyChordMutualPairingState()
+    sameBatchPairing.recordSettledLeft(
+        keys: [leftQ],
+        baseInput: "",
+        settledContext: settledLeftContext,
+        boundaryPlan: .init(before: false, after: false),
+        policy: .sameBatchOnly,
+        shape: .leftOnly
+    )
+    let sameBatchComplement = sameBatchPairing.takeComplement(
+        before: .rightOnly,
+        policy: .sameBatchOnly,
+        currentContext: settledLeftContext
+    )
 
     guard FlyChordLayout.half(for: leftQ.keycode) == .left,
           FlyChordLayout.half(for: rightY.keycode) == .right,
           FlyChordLayout.half(for: RimeKey.space) == nil,
-          strictLeftDecision == .consume,
-          strictLeftReplay.isEmpty,
-          strictFirstDecision == .consume,
-          strictSecondDecision == .process([leftQ, rightY]),
-          strictCrossReplay == [leftQ, rightY],
+          sameBatchLeftDecision == .process([leftQ]),
+          sameBatchLeftReplay == [leftQ],
+          sameBatchFirstDecision == .process([leftQ]),
+          sameBatchSecondDecision == .process([rightY]),
+          sameBatchCrossReplay == [leftQ, rightY],
           mutualLeftDecision == .process([leftQ]),
           mutualLeftReplay == [leftQ],
           mutualRightDecision == .process([rightY]),
           mutualRightReplay == [rightY],
           immediateComplement == expectedComplement,
+          sameBatchComplement == nil,
           complementAfterBoundary == nil,
           complementAfterCursorMove == nil,
           FlyChordRoutingRules.shouldStage(schemaID: "my_combo", asciiMode: false),
@@ -1137,7 +1227,7 @@ func runSchemaListStoreSmokeTest() -> Bool {
           FlyChordInputRollback.insertedScalarCount(before: "ni", after: "ni") == 0,
           FlyChordInputRollback.insertedScalarCount(before: "ni", after: "n") == nil,
           FlyChordInputRollback.insertedScalarCount(before: "ni", after: "na") == nil else {
-        print("FAILED: FlyYao chord/mutual batching policy")
+        print("FAILED: FlyYao same-batch/mutual batching policy")
         return false
     }
 
@@ -1165,8 +1255,8 @@ func runSchemaListStoreSmokeTest() -> Bool {
         }
     }
 
-    // A v1 FlyYao selection was necessarily labelled chord.  It migrates once
-    // to mutual; an explicit strict-chord choice made under v2 remains strict.
+    // A v1 FlyYao selection was necessarily labelled chord. It migrates once
+    // to mutual; an explicit same-batch chord choice made under v2 is retained.
     defaults.removePersistentDomain(forName: defaultsName)
     defaults.set(InputEncoding.fullPinyin.rawValue,
                  forKey: "input.configuration.encoding.v1")
@@ -1187,22 +1277,22 @@ func runSchemaListStoreSmokeTest() -> Bool {
                  forKey: "input.configuration.keyingMode.v1")
     defaults.set(99, forKey: "input.configuration.keyingMode.semantics.v2")
     defaults.set("my_combo", forKey: "preferredSchema")
-    let strictFlyYaoStore = InputConfigurationStore(defaults: defaults)
-    guard strictFlyYaoStore.configuration
+    let explicitChordStore = InputConfigurationStore(defaults: defaults)
+    guard explicitChordStore.configuration
             == .init(encoding: .fullPinyin, keyingMode: .chord),
-          strictFlyYaoStore.adoptRuntimeSchema("my_combo"),
-          strictFlyYaoStore.configuration
+          explicitChordStore.adoptRuntimeSchema("my_combo"),
+          explicitChordStore.configuration
             == .init(encoding: .fullPinyin, keyingMode: .chord),
           defaults.integer(forKey: "input.configuration.keyingMode.semantics.v2") == 99,
           InputConfigurationStore(defaults: defaults).configuration
             == .init(encoding: .fullPinyin, keyingMode: .chord),
-          strictFlyYaoStore.adoptRuntimeSchema("rime_ice"),
-          strictFlyYaoStore.configuration
+          explicitChordStore.adoptRuntimeSchema("rime_ice"),
+          explicitChordStore.configuration
             == .init(encoding: .fullPinyin, keyingMode: .sequential),
-          strictFlyYaoStore.adoptRuntimeSchema("my_combo"),
-          strictFlyYaoStore.configuration
+          explicitChordStore.adoptRuntimeSchema("my_combo"),
+          explicitChordStore.configuration
             == .init(encoding: .fullPinyin, keyingMode: .mutual) else {
-        print("FAILED: explicit strict FlyYao selection was not preserved")
+        print("FAILED: explicit FlyYao chord selection was not preserved")
         return false
     }
 
@@ -1611,9 +1701,11 @@ private final class ActionPluginURLProtocolStub: URLProtocol {
 private final class ActionPluginTransportStub: ActionPluginTransport {
     var statusResult: Result<ActionPluginStatus, Error>
     var invokeResult: Result<ActionPluginInvokeResponse, Error>
+    var prepareResult: Result<ActionPluginPrepareResponse, Error>?
     var holdInvoke = false
     var holdStatus = false
     private(set) var statusRequestCount = 0
+    private(set) var prepareRequestCount = 0
     private(set) var invokeRequestCount = 0
     private(set) var statusBindings: [ActionPluginRuntimeBinding?] = []
     private(set) var invokeBindings: [ActionPluginRuntimeBinding] = []
@@ -1683,6 +1775,33 @@ private final class ActionPluginTransportStub: ActionPluginTransport {
         return nil
     }
 
+    func prepare(plugin: InstalledActionPlugin,
+                 action: ActionPluginDefinition,
+                 binding: ActionPluginRuntimeBinding,
+                 request payload: ActionPluginInvokeRequest,
+                 completion: @escaping (Result<ActionPluginPrepareResponse, Error>) -> Void)
+        -> ActionPluginInvocationCancellable? {
+        prepareRequestCount += 1
+        guard let prepareResult else {
+            completion(.failure(ActionPluginHTTPError.invalidResponse))
+            return nil
+        }
+        completion(prepareResult.map { template in
+            ActionPluginPrepareResponse(
+                protocolVersion: template.protocolVersion,
+                resultFormat: template.resultFormat,
+                pluginId: payload.pluginId ?? template.pluginId,
+                runtimeInstanceId: payload.runtimeInstanceId ?? template.runtimeInstanceId,
+                requestId: payload.requestId,
+                actionId: payload.actionId,
+                contextId: payload.contextId,
+                prompt: template.prompt,
+                targetSummary: template.targetSummary
+            )
+        })
+        return nil
+    }
+
     func completeHeldInvoke() {
         guard !pendingInvokes.isEmpty else { return }
         let pending = pendingInvokes.removeFirst()
@@ -1707,6 +1826,47 @@ private final class ActionPluginFocusBox {
             isValid: { [weak self] expected in self?.token == expected },
             secureInputEnabled: { [weak self] in self?.secureInput ?? true }
         )
+    }
+}
+
+private final class PreparedActionConnectorStub: AITextProvider {
+    let kind: AITextProviderKind = .codexCLI
+    var availability: AITextProviderAvailability = .ready
+    private(set) var requests: [AITextProviderRequest] = []
+    var blocks = [AITextProviderBlock(index: 0,
+                                      text: "连接器生成结果",
+                                      title: "候选")]
+    var holdsCompletion = false
+    private var pending: (onEvent: (AITextProviderEvent) -> Void,
+                          completion: (Result<[AITextProviderBlock], AITextProviderError>) -> Void)?
+
+    func generate(_ request: AITextProviderRequest,
+                  onEvent: @escaping (AITextProviderEvent) -> Void,
+                  completion: @escaping (Result<[AITextProviderBlock], AITextProviderError>) -> Void)
+        -> any AITextCancellable {
+        requests.append(request)
+        onEvent(.activity(AITextProviderActivity(
+            kind: .reasoning,
+            message: "正在分析页面话术"
+        )))
+        if holdsCompletion {
+            pending = (onEvent, completion)
+        } else {
+            blocks.forEach { onEvent(.blockSnapshot($0)) }
+            completion(.success(blocks))
+        }
+        return AITextNoopCancellation()
+    }
+
+    func complete() {
+        guard let pending else { return }
+        self.pending = nil
+        blocks.forEach { pending.onEvent(.blockSnapshot($0)) }
+        pending.completion(.success(blocks))
+    }
+
+    func emitHeld(_ block: AITextProviderBlock) {
+        pending?.onEvent(.blockSnapshot(block))
     }
 }
 
@@ -1899,11 +2059,516 @@ private func runContextualActionPresentationSmokeTest() -> Bool {
     return true
 }
 
+private func runPreparedActionConnectorSmokeTest() -> Bool {
+    let action = ActionPluginDefinition(
+        id: "prepared.generate",
+        title: "生成",
+        symbol: "sparkles",
+        statusPath: "/status",
+        preparePath: "/prepare",
+        invokePath: "/invoke",
+        modes: ["direct"]
+    )
+    let manifest = ActionPluginManifest(
+        schemaVersion: 1,
+        id: "prepared",
+        name: "Prepared",
+        version: "1",
+        runtimeConfigPaths: ["runtime.json"],
+        actions: [action]
+    )
+    guard ActionPluginManifestLoader.validate(manifest) else {
+        print("FAILED: prepared action manifest validation")
+        return false
+    }
+    let groupedDirect = ActionPluginDefinition(
+        id: "prepared.direct",
+        title: "直评",
+        symbol: "sparkles",
+        statusPath: "/status",
+        preparePath: "/prepare",
+        invokePath: "/invoke",
+        modes: ["direct"],
+        presentationId: "prepared.generate",
+        presentationTitle: "生成"
+    )
+    let groupedReply = ActionPluginDefinition(
+        id: "prepared.reply",
+        title: "回复",
+        symbol: "sparkles",
+        statusPath: "/status",
+        preparePath: "/other-prepare",
+        invokePath: "/invoke",
+        modes: ["reply"],
+        presentationId: "prepared.generate",
+        presentationTitle: "生成"
+    )
+    let mismatchedPreparationManifest = ActionPluginManifest(
+        schemaVersion: 1,
+        id: "prepared-group",
+        name: "Prepared Group",
+        version: "1",
+        runtimeConfigPaths: ["runtime.json"],
+        actions: [groupedDirect, groupedReply]
+    )
+    guard !ActionPluginManifestLoader.validate(mismatchedPreparationManifest) else {
+        print("FAILED: grouped actions accepted different prepare paths")
+        return false
+    }
+    let binding = ActionPluginRuntimeBinding(config: ActionPluginRuntimeConfig(
+        pluginId: "prepared",
+        apiBase: "http://127.0.0.1:47701/v1/plugin",
+        token: "prepared-token",
+        updatedAt: 1,
+        instanceId: "prepared-instance",
+        processId: 1
+    ))
+    let status = ActionPluginStatus(
+        available: true,
+        contextId: "prepared-context",
+        mode: "direct",
+        actionId: action.id,
+        label: "生成话术",
+        targetSummary: "直评目标",
+        updatedAt: Date().timeIntervalSince1970
+    )
+    let template = ActionPluginPrepareResponse(
+        protocolVersion: ActionPluginPrepareContract.protocolVersion,
+        resultFormat: ActionPluginPrepareContract.resultFormat,
+        pluginId: "prepared",
+        runtimeInstanceId: "prepared-instance",
+        requestId: "template",
+        actionId: action.id,
+        contextId: "prepared-context",
+        prompt: "MARINE PREPARED PROMPT\nReturn blocks-v1.",
+        targetSummary: "直评目标"
+    )
+    let expectedIdentity = ActionPluginStreamIdentity(
+        pluginId: "prepared",
+        runtimeInstanceId: "prepared-instance",
+        requestId: "template",
+        actionId: action.id,
+        contextId: "prepared-context"
+    )
+    guard ActionPluginPrepareContract.accepts(template,
+                                              expectedIdentity: expectedIdentity),
+          !ActionPluginPrepareContract.accepts(
+            ActionPluginPrepareResponse(
+                protocolVersion: template.protocolVersion,
+                resultFormat: template.resultFormat,
+                pluginId: template.pluginId,
+                runtimeInstanceId: template.runtimeInstanceId,
+                requestId: "wrong-request",
+                actionId: template.actionId,
+                contextId: template.contextId,
+                prompt: template.prompt,
+                targetSummary: template.targetSummary
+            ),
+            expectedIdentity: expectedIdentity
+          ) else {
+        print("FAILED: prepared action identity contract")
+        return false
+    }
+
+    let dummyResponse = ActionPluginInvokeResponse(
+        requestId: "unused",
+        actionId: action.id,
+        contextId: "prepared-context",
+        blocks: [ActionPluginResultBlock(text: "legacy must not run", title: nil)],
+        targetSummary: nil
+    )
+    let transport = ActionPluginTransportStub(status: status,
+                                              response: dummyResponse,
+                                              binding: binding)
+    transport.prepareResult = .success(template)
+    let connector = PreparedActionConnectorStub()
+    connector.holdsCompletion = true
+    let focusBox = ActionPluginFocusBox()
+    var epochs = FocusEpochState()
+    focusBox.token = epochs.activate()
+    let model = BufferModel()
+    let plugin = InstalledActionPlugin(
+        manifest: manifest,
+        directory: URL(fileURLWithPath: "/tmp/prepared.etplugin", isDirectory: true)
+    )
+    let host = ActionPluginHost(
+        rootURL: URL(fileURLWithPath: "/tmp/prepared-plugin-root", isDirectory: true),
+        client: transport,
+        focus: focusBox.access,
+        bufferModel: model,
+        inboundBus: InboundBus(),
+        pluginLoader: { _ in [plugin] },
+        connectorProvider: { connector },
+        runtimeBindingIsCurrent: { _, candidate in candidate == binding }
+    )
+    host.refreshStatuses(force: true)
+    guard runMainLoopUntil({ host.presentations.first?.canInvoke == true }),
+          let key = host.presentations.first?.key else {
+        print("FAILED: prepared action did not become invokable")
+        return false
+    }
+    host.invoke(key)
+    guard runMainLoopUntil({
+        connector.requests.count == 1
+            && model.loadingMessage?.contains("正在分析页面话术") == true
+    }),
+          model.blocks.isEmpty,
+          model.transientLoadingActive,
+          host.presentations.first?.waitingForFirstContent == true else {
+        print("FAILED: prepared connector activity was not visible before first content")
+        return false
+    }
+    connector.complete()
+    guard runMainLoopUntil({
+        model.blocks.count == 1
+            && model.blocks[0].pluginMetadata?.incomplete == false
+    }),
+          transport.prepareRequestCount == 1,
+          transport.invokeRequestCount == 0,
+          connector.requests.count == 1,
+          connector.requests[0].preparedPrompt == template.prompt,
+          connector.requests[0].sourceText.isEmpty,
+          model.blocks[0].text == "连接器生成结果",
+          model.blocks[0].pluginMetadata?.pluginId == "prepared",
+          model.blocks[0].pluginMetadata?.contextId == "prepared-context" else {
+        print("FAILED: prepared action did not stay on the connector/plugin authority path")
+        return false
+    }
+
+    let invalidProvisionalBlocks = [
+        AITextProviderBlock(index: ActionPluginStreamParser.maximumBlocks,
+                            text: "越界索引",
+                            title: nil),
+        AITextProviderBlock(index: 0,
+                            text: String(repeating: "字",
+                                         count: ActionPluginStreamParser.maximumBlockBytes + 1),
+                            title: nil),
+        AITextProviderBlock(index: 0,
+                            text: "标题越界",
+                            title: String(repeating: "题",
+                                          count: ActionPluginStreamParser.maximumTitleBytes + 1)),
+    ]
+    for (offset, invalidBlock) in invalidProvisionalBlocks.enumerated() {
+        connector.holdsCompletion = true
+        host.invoke(key)
+        guard runMainLoopUntil({
+            connector.requests.count == offset + 2 && model.transientLoadingActive
+        }) else {
+            print("FAILED: invalid prepared connector case did not start")
+            return false
+        }
+        connector.emitHeld(invalidBlock)
+        guard runMainLoopUntil({ !model.transientLoadingActive }),
+              model.blocks.count == 1,
+              host.presentations.first?.waitingForFirstContent == false else {
+            print("FAILED: invalid provisional connector block reached the workbench")
+            return false
+        }
+    }
+    return true
+}
+
+private func runContextOnlyPreparedActionSmokeTest() -> Bool {
+    let legacyJSON = #"""
+    {
+      "id": "legacy.generate",
+      "title": "生成",
+      "symbol": "sparkles",
+      "statusPath": "/status",
+      "invokePath": "/invoke",
+      "modes": ["direct"]
+    }
+    """#
+    let contextOnlyJSON = #"""
+    {
+      "id": "context-only.generate",
+      "title": "生成",
+      "symbol": "sparkles",
+      "statusPath": "/status",
+      "preparePath": "/prepare",
+      "invokePath": "/invoke",
+      "modes": ["direct"],
+      "requiresFocus": false
+    }
+    """#
+    guard let legacyAction = try? JSONDecoder().decode(
+        ActionPluginDefinition.self,
+        from: Data(legacyJSON.utf8)
+    ), legacyAction.requiresFocus,
+       let action = try? JSONDecoder().decode(
+        ActionPluginDefinition.self,
+        from: Data(contextOnlyJSON.utf8)
+       ), !action.requiresFocus else {
+        print("FAILED: requiresFocus manifest compatibility")
+        return false
+    }
+
+    let groupedBound = ActionPluginDefinition(
+        id: "context-only.bound",
+        title: "直评",
+        symbol: "sparkles",
+        statusPath: "/status",
+        preparePath: "/prepare",
+        invokePath: "/invoke",
+        modes: ["direct"],
+        requiresFocus: true,
+        presentationId: "context-only.generate",
+        presentationTitle: "生成"
+    )
+    let groupedUnbound = ActionPluginDefinition(
+        id: "context-only.unbound",
+        title: "回复",
+        symbol: "sparkles",
+        statusPath: "/status",
+        preparePath: "/prepare",
+        invokePath: "/invoke",
+        modes: ["reply"],
+        requiresFocus: false,
+        presentationId: "context-only.generate",
+        presentationTitle: "生成"
+    )
+    let mismatchedFocusManifest = ActionPluginManifest(
+        schemaVersion: 1,
+        id: "context-only-group",
+        name: "Context Only Group",
+        version: "1",
+        runtimeConfigPaths: ["runtime.json"],
+        actions: [groupedBound, groupedUnbound]
+    )
+    guard !ActionPluginManifestLoader.validate(mismatchedFocusManifest) else {
+        print("FAILED: grouped actions accepted different focus contracts")
+        return false
+    }
+
+    let manifest = ActionPluginManifest(
+        schemaVersion: 1,
+        id: "context-only",
+        name: "Context Only",
+        version: "1",
+        runtimeConfigPaths: ["runtime.json"],
+        actions: [action]
+    )
+    guard ActionPluginManifestLoader.validate(manifest) else {
+        print("FAILED: context-only manifest validation")
+        return false
+    }
+    let binding = ActionPluginRuntimeBinding(config: ActionPluginRuntimeConfig(
+        pluginId: manifest.id,
+        apiBase: "http://127.0.0.1:47701/v1/plugin",
+        token: "context-only-token",
+        updatedAt: 1,
+        instanceId: "context-only-instance",
+        processId: 1
+    ))
+    func status(contextId: String) -> ActionPluginStatus {
+        ActionPluginStatus(
+            available: true,
+            contextId: contextId,
+            mode: "direct",
+            actionId: action.id,
+            label: "生成评论",
+            targetSummary: "页面评论目标",
+            updatedAt: Date().timeIntervalSince1970
+        )
+    }
+    let initialContextID = "context-only-target-a"
+    let template = ActionPluginPrepareResponse(
+        protocolVersion: ActionPluginPrepareContract.protocolVersion,
+        resultFormat: ActionPluginPrepareContract.resultFormat,
+        pluginId: manifest.id,
+        runtimeInstanceId: "context-only-instance",
+        requestId: "template",
+        actionId: action.id,
+        contextId: initialContextID,
+        prompt: "CONTEXT ONLY PROMPT\nReturn blocks-v1.",
+        targetSummary: "页面评论目标"
+    )
+    let response = ActionPluginInvokeResponse(
+        requestId: "unused",
+        actionId: action.id,
+        contextId: initialContextID,
+        blocks: [ActionPluginResultBlock(text: "legacy must not run", title: nil)],
+        targetSummary: nil
+    )
+    let transport = ActionPluginTransportStub(
+        status: status(contextId: initialContextID),
+        response: response,
+        binding: binding
+    )
+    transport.prepareResult = .success(template)
+    let connector = PreparedActionConnectorStub()
+    connector.holdsCompletion = true
+    let focusBox = ActionPluginFocusBox()
+    let model = BufferModel()
+    let bus = InboundBus()
+    let plugin = InstalledActionPlugin(
+        manifest: manifest,
+        directory: URL(fileURLWithPath: "/tmp/context-only.etplugin", isDirectory: true)
+    )
+    let host = ActionPluginHost(
+        rootURL: URL(fileURLWithPath: "/tmp/context-only-plugin-root", isDirectory: true),
+        client: transport,
+        focus: focusBox.access,
+        bufferModel: model,
+        inboundBus: bus,
+        pluginLoader: { _ in [plugin] },
+        connectorProvider: { connector },
+        runtimeBindingIsCurrent: { _, candidate in candidate == binding }
+    )
+
+    host.refreshStatuses(force: true)
+    guard runMainLoopUntil({ host.presentations.first?.canInvoke == true }),
+          focusBox.token == nil,
+          host.presentations.first?.available == true,
+          let key = host.presentations.first?.key else {
+        print("FAILED: context-only action stayed disabled without IMK focus")
+        return false
+    }
+    connector.availability = .unavailable("连接器不可用")
+    guard host.presentations.first?.canInvoke == false else {
+        print("FAILED: context-only action ignored connector availability")
+        return false
+    }
+    connector.availability = .ready
+    focusBox.secureInput = true
+    guard host.presentations.first?.canInvoke == false else {
+        print("FAILED: context-only action ignored secure input")
+        return false
+    }
+    focusBox.secureInput = false
+
+    host.invoke(key)
+    guard runMainLoopUntil({
+        connector.requests.count == 1
+            && model.transientLoadingActive
+            && host.presentations.first?.waitingForFirstContent == true
+    }), transport.prepareRequestCount == 1,
+       transport.invokeRequestCount == 0 else {
+        print("FAILED: context-only action did not invoke its prepared connector")
+        return false
+    }
+    connector.emitHeld(AITextProviderBlock(index: 0,
+                                           text: "无焦点流式候选",
+                                           title: "候选"))
+    guard runMainLoopUntil({ model.blocks.count == 1 }),
+          let provisional = model.blocks[0].pluginMetadata,
+          provisional.focusToken == nil,
+          provisional.reviewedAsPlainText,
+          provisional.incomplete,
+          model.blocks[0].text == "无焦点流式候选" else {
+        print("FAILED: context-only stream was not staged as unbound reviewed text")
+        return false
+    }
+
+    var deliveryEpochs = FocusEpochState()
+    let temporaryDeliveryFocus = deliveryEpochs.activate()
+    var deliveryFocus: FocusToken? = temporaryDeliveryFocus
+    var deliveredTexts: [String] = []
+    var validationCalled = false
+    let deliveryCoordinator = BufferDeliveryCoordinator(
+        model: model,
+        dependencies: .init(
+            resolveTarget: { expected in
+                guard let deliveryFocus,
+                      expected == nil || expected == deliveryFocus else { return nil }
+                return .init(
+                    token: deliveryFocus,
+                    compositionActive: false,
+                    resolveComposition: {},
+                    deliver: { block in
+                        deliveredTexts.append(block.text)
+                        return true
+                    }
+                )
+            },
+            secureInputEnabled: { false },
+            validatePlugin: { _, _, completion in
+                validationCalled = true
+                completion(.rejected(.targetChanged))
+            },
+            refreshUI: {}
+        )
+    )
+    guard deliveryCoordinator.availability() == .blocked(.pluginResultIncomplete) else {
+        print("FAILED: context-only partial result became deliverable")
+        return false
+    }
+    deliveryFocus = nil
+    connector.complete()
+    guard runMainLoopUntil({
+        model.blocks.count == 1
+            && model.blocks[0].pluginMetadata?.incomplete == false
+    }), let finalMetadata = model.blocks[0].pluginMetadata,
+       finalMetadata.focusToken == nil,
+       finalMetadata.reviewedAsPlainText,
+       !finalMetadata.stale,
+       focusBox.token == nil else {
+        print("FAILED: context-only final result acquired a synthetic focus lease")
+        return false
+    }
+    guard deliveryCoordinator.availability() == .blocked(.noFocusedField),
+          deliveryCoordinator.sendNext().blockedReason == .noFocusedField,
+          deliveredTexts.isEmpty else {
+        print("FAILED: unbound result delivered without a fresh target")
+        return false
+    }
+
+    let freshDeliveryFocus = deliveryEpochs.activate()
+    deliveryFocus = freshDeliveryFocus
+    let delivered = deliveryCoordinator.sendNext(expectedToken: freshDeliveryFocus)
+    guard delivered.succeeded,
+          deliveredTexts == ["连接器生成结果"],
+          !validationCalled,
+          model.blocks.isEmpty else {
+        print("FAILED: reviewed context-only result did not use the fresh target boundary")
+        return false
+    }
+
+    transport.statusResult = .success(status(contextId: initialContextID))
+    host.refreshStatuses(force: true)
+    guard runMainLoopUntil({ host.presentations.first?.canInvoke == true }) else {
+        print("FAILED: context-only target-change fixture did not refresh")
+        return false
+    }
+    host.invoke(key)
+    guard runMainLoopUntil({ connector.requests.count == 2 }) else {
+        print("FAILED: second context-only invocation did not start")
+        return false
+    }
+    connector.emitHeld(AITextProviderBlock(index: 0,
+                                           text: "目标变化前的部分结果",
+                                           title: nil))
+    guard runMainLoopUntil({ model.blocks.count == 1 }) else {
+        print("FAILED: target-change fixture did not stage its partial result")
+        return false
+    }
+    transport.statusResult = .success(status(contextId: "context-only-target-b"))
+    host.refreshStatuses(force: true)
+    guard runMainLoopUntil({
+        model.blocks.isEmpty && host.presentations.first?.running == false
+    }) else {
+        print("FAILED: context change did not revoke visible partial output")
+        return false
+    }
+    connector.complete()
+    guard runMainLoopUntil({ bus.pendingCount == 1 }),
+          bus.pending[0].pluginMetadata?.stale == true,
+          bus.pending[0].pluginMetadata?.focusToken == nil,
+          bus.pending[0].pluginMetadata?.reviewedAsPlainText == false,
+          model.blocks.isEmpty else {
+        print("FAILED: context-changed result did not route to the review inbox")
+        return false
+    }
+    return true
+}
+
 func runActionPluginSmokeTest() -> Bool {
     print("== RimeBuffer action plugin smoke test ==")
     guard runActionPluginManagerSmokeTest() else { return false }
     guard runActionPluginStreamSmokeTest() else { return false }
     guard runContextualActionPresentationSmokeTest() else { return false }
+    guard runPreparedActionConnectorSmokeTest() else { return false }
+    guard runContextOnlyPreparedActionSmokeTest() else { return false }
     let fileManager = FileManager.default
     let root = fileManager.temporaryDirectory
         .appendingPathComponent("rimebuffer-plugin-smoke-\(UUID().uuidString)",
@@ -2953,7 +3618,7 @@ func runBufferWindowSmokeTest() -> Bool {
             eventClass: OSType(kEventClassKeyboard),
             eventKind: UInt32(kEventHotKeyPressed),
             identifier: workbenchHotKeyID
-          ) == .openAndResume,
+          ) == .toggleVisibility,
           WorkbenchGlobalHotKeyRouting.route(
             eventClass: OSType(kEventClassKeyboard),
             eventKind: UInt32(kEventHotKeyReleased),
@@ -2971,6 +3636,16 @@ func runBufferWindowSmokeTest() -> Bool {
     let ready = BufferDeliveryCoordinator.Availability.ready
     let readyText = BufferWorkbenchStatusText.text(for: ready, secureInput: false)
     let readyHelp = BufferWorkbenchStatusText.help(for: ready, secureInput: false)
+    let contextOnlyNoFocusText = BufferWorkbenchStatusText.text(
+        for: .blocked(.noFocusedField),
+        secureInput: false,
+        canGenerateWithoutFocus: true
+    )
+    let contextOnlyNoFocusHelp = BufferWorkbenchStatusText.help(
+        for: .blocked(.noFocusedField),
+        secureInput: false,
+        canGenerateWithoutFocus: true
+    )
     let standardSourceOffset = BufferWorkbenchMetrics.mainControlYOffset(
         row: .source, mode: .standard
     )
@@ -3002,6 +3677,18 @@ func runBufferWindowSmokeTest() -> Bool {
           !BufferWorkbenchLayout.windowBackgroundDraggable,
           FirstMouseButton(frame: .zero).acceptsFirstMouse(for: nil),
           readyText == "可发送",
+          contextOnlyNoFocusText == "可生成 · 发送前点选输入框",
+          contextOnlyNoFocusHelp.contains("可以先生成内容"),
+          contextOnlyNoFocusHelp.contains("发送前"),
+          BufferWorkbenchStatusText.text(
+            for: .blocked(.noFocusedField),
+            secureInput: false
+          ) == "等待输入框",
+          BufferWorkbenchStatusText.text(
+            for: .blocked(.noFocusedField),
+            secureInput: true,
+            canGenerateWithoutFocus: true
+          ) == "安全输入，内容已隐藏",
           !readyText.contains("ChatGPT"),
           !readyText.contains("→"),
           !readyHelp.contains("ChatGPT"),
@@ -3316,25 +4003,365 @@ func runBufferWindowSmokeTest() -> Bool {
         print("FAILED: expired lease must clear a surviving controller session")
         return false
     }
+
+    let ordinaryHost = FocusHostRules.resolveKnownFrontmost(
+        incomingBundleID: "app.a",
+        frontmostBundleID: "app.a",
+        frontmostProcessIdentifier: 101,
+        trustedOverlayProcessIdentifier: nil
+    )
+    let spotlightHost = FocusHostRules.resolveKnownFrontmost(
+        incomingBundleID: "com.apple.Spotlight",
+        frontmostBundleID: "app.a",
+        frontmostProcessIdentifier: 101,
+        trustedOverlayProcessIdentifier: 202
+    )
+    let spotlightLease = FocusHostResolution(
+        kind: .nonactivatingSystemOverlay,
+        clientProcessIdentifier: 202,
+        foregroundAnchorBundleID: "app.a",
+        foregroundAnchorProcessIdentifier: 101
+    )
+    let ordinaryAuthority = FocusHostRules.applicationAuthorityMatches(
+        kind: .frontmostApplication,
+        leaseBundleID: "app.a",
+        leaseProcessIdentifier: 101,
+        foregroundAnchorBundleID: "app.a",
+        foregroundAnchorProcessIdentifier: 101,
+        currentFrontmostBundleID: "app.a",
+        currentFrontmostProcessIdentifier: 101,
+        currentTrustedOverlayProcessIdentifier: nil,
+        trustedOverlayVisible: false
+    )
+    let ordinaryNilBundleAuthority = FocusHostRules.applicationAuthorityMatches(
+        kind: .frontmostApplication,
+        leaseBundleID: "app.a",
+        leaseProcessIdentifier: 101,
+        foregroundAnchorBundleID: "app.a",
+        foregroundAnchorProcessIdentifier: 101,
+        currentFrontmostBundleID: nil,
+        currentFrontmostProcessIdentifier: 101,
+        currentTrustedOverlayProcessIdentifier: nil,
+        trustedOverlayVisible: false
+    )
+    let ordinaryBundleMismatchAuthority = FocusHostRules.applicationAuthorityMatches(
+        kind: .frontmostApplication,
+        leaseBundleID: "app.a",
+        leaseProcessIdentifier: 101,
+        foregroundAnchorBundleID: "app.a",
+        foregroundAnchorProcessIdentifier: 101,
+        currentFrontmostBundleID: "app.b",
+        currentFrontmostProcessIdentifier: 101,
+        currentTrustedOverlayProcessIdentifier: nil,
+        trustedOverlayVisible: false
+    )
+    let ordinaryPIDMismatchAuthority = FocusHostRules.applicationAuthorityMatches(
+        kind: .frontmostApplication,
+        leaseBundleID: "app.a",
+        leaseProcessIdentifier: 101,
+        foregroundAnchorBundleID: "app.a",
+        foregroundAnchorProcessIdentifier: 101,
+        currentFrontmostBundleID: "app.a",
+        currentFrontmostProcessIdentifier: 303,
+        currentTrustedOverlayProcessIdentifier: nil,
+        trustedOverlayVisible: false
+    )
+    let spotlightAuthority = FocusHostRules.applicationAuthorityMatches(
+        kind: .nonactivatingSystemOverlay,
+        leaseBundleID: "com.apple.Spotlight",
+        leaseProcessIdentifier: 202,
+        foregroundAnchorBundleID: "app.a",
+        foregroundAnchorProcessIdentifier: 101,
+        currentFrontmostBundleID: "app.a",
+        currentFrontmostProcessIdentifier: 101,
+        currentTrustedOverlayProcessIdentifier: 202,
+        trustedOverlayVisible: true
+    )
+    let nilAnchorBundleAuthority = FocusHostRules.applicationAuthorityMatches(
+        kind: .nonactivatingSystemOverlay,
+        leaseBundleID: "com.apple.Spotlight",
+        leaseProcessIdentifier: 202,
+        foregroundAnchorBundleID: "app.a",
+        foregroundAnchorProcessIdentifier: 101,
+        currentFrontmostBundleID: nil,
+        currentFrontmostProcessIdentifier: 101,
+        currentTrustedOverlayProcessIdentifier: 202,
+        trustedOverlayVisible: true
+    )
+    let changedAnchorBundleAuthority = FocusHostRules.applicationAuthorityMatches(
+        kind: .nonactivatingSystemOverlay,
+        leaseBundleID: "com.apple.Spotlight",
+        leaseProcessIdentifier: 202,
+        foregroundAnchorBundleID: "app.a",
+        foregroundAnchorProcessIdentifier: 101,
+        currentFrontmostBundleID: "app.b",
+        currentFrontmostProcessIdentifier: 101,
+        currentTrustedOverlayProcessIdentifier: 202,
+        trustedOverlayVisible: true
+    )
+    let changedAnchorPIDAuthority = FocusHostRules.applicationAuthorityMatches(
+        kind: .nonactivatingSystemOverlay,
+        leaseBundleID: "com.apple.Spotlight",
+        leaseProcessIdentifier: 202,
+        foregroundAnchorBundleID: "app.a",
+        foregroundAnchorProcessIdentifier: 101,
+        currentFrontmostBundleID: "app.a",
+        currentFrontmostProcessIdentifier: 303,
+        currentTrustedOverlayProcessIdentifier: 202,
+        trustedOverlayVisible: true
+    )
+    let deadOverlayAuthority = FocusHostRules.applicationAuthorityMatches(
+        kind: .nonactivatingSystemOverlay,
+        leaseBundleID: "com.apple.Spotlight",
+        leaseProcessIdentifier: 202,
+        foregroundAnchorBundleID: "app.a",
+        foregroundAnchorProcessIdentifier: 101,
+        currentFrontmostBundleID: "app.a",
+        currentFrontmostProcessIdentifier: 101,
+        currentTrustedOverlayProcessIdentifier: nil,
+        trustedOverlayVisible: true
+    )
+    let restartedOverlayAuthority = FocusHostRules.applicationAuthorityMatches(
+        kind: .nonactivatingSystemOverlay,
+        leaseBundleID: "com.apple.Spotlight",
+        leaseProcessIdentifier: 202,
+        foregroundAnchorBundleID: "app.a",
+        foregroundAnchorProcessIdentifier: 101,
+        currentFrontmostBundleID: "app.a",
+        currentFrontmostProcessIdentifier: 101,
+        currentTrustedOverlayProcessIdentifier: 203,
+        trustedOverlayVisible: true
+    )
+    let hiddenOverlayAuthority = FocusHostRules.applicationAuthorityMatches(
+        kind: .nonactivatingSystemOverlay,
+        leaseBundleID: "com.apple.Spotlight",
+        leaseProcessIdentifier: 202,
+        foregroundAnchorBundleID: "app.a",
+        foregroundAnchorProcessIdentifier: 101,
+        currentFrontmostBundleID: "app.a",
+        currentFrontmostProcessIdentifier: 101,
+        currentTrustedOverlayProcessIdentifier: 202,
+        trustedOverlayVisible: false
+    )
+    let ordinaryUnknownAnchorMatches = ordinaryHost.map {
+        FocusHostRules.resolutionMatchesLease(
+            $0,
+            hostKind: .frontmostApplication,
+            clientProcessIdentifier: 101,
+            foregroundAnchorBundleID: nil,
+            foregroundAnchorProcessIdentifier: 101
+        )
+    } ?? false
+    guard ordinaryHost == FocusHostResolution(
+            kind: .frontmostApplication,
+            clientProcessIdentifier: 101,
+            foregroundAnchorBundleID: "app.a",
+            foregroundAnchorProcessIdentifier: 101
+          ),
+          spotlightHost == spotlightLease,
+          FocusHostRules.isTrustedNonactivatingSystemOverlay(
+            bundleID: "com.apple.Spotlight",
+            bundlePath: "/System/Library/CoreServices/Spotlight.app"
+          ),
+          !FocusHostRules.isTrustedNonactivatingSystemOverlay(
+            bundleID: "com.apple.Spotlight",
+            bundlePath: "/Applications/FakeSpotlight.app"
+          ),
+          !FocusHostRules.isNonactivatingSystemOverlayBundle("com.apple.SearchUI"),
+          FocusHostRules.uniqueTrustedOverlayProcessIdentifier(
+            bundleID: "com.apple.Spotlight",
+            runningCandidates: [
+                (202, "/System/Library/CoreServices/Spotlight.app"),
+            ]
+          ) == 202,
+          FocusHostRules.uniqueTrustedOverlayProcessIdentifier(
+            bundleID: "com.apple.Spotlight",
+            runningCandidates: [
+                (202, "/System/Library/CoreServices/Spotlight.app"),
+                (203, "/Applications/FakeSpotlight.app"),
+            ]
+          ) == nil,
+          FocusHostRules.resolveKnownFrontmost(
+            incomingBundleID: "com.apple.Spotlight",
+            frontmostBundleID: "app.a",
+            frontmostProcessIdentifier: 101,
+            trustedOverlayProcessIdentifier: nil
+          ) == nil,
+          FocusHostRules.resolveKnownFrontmost(
+            incomingBundleID: "app.background",
+            frontmostBundleID: "app.a",
+            frontmostProcessIdentifier: 101,
+            trustedOverlayProcessIdentifier: 202
+          ) == nil,
+          FocusHostRules.resolutionMatchesLease(
+            spotlightLease,
+            hostKind: .nonactivatingSystemOverlay,
+            clientProcessIdentifier: 202,
+            foregroundAnchorBundleID: "app.a",
+            foregroundAnchorProcessIdentifier: 101
+          ),
+          !FocusHostRules.resolutionMatchesLease(
+            spotlightLease,
+            hostKind: .nonactivatingSystemOverlay,
+            clientProcessIdentifier: 203,
+            foregroundAnchorBundleID: "app.a",
+            foregroundAnchorProcessIdentifier: 101
+          ),
+          !FocusHostRules.resolutionMatchesLease(
+            spotlightLease,
+            hostKind: .nonactivatingSystemOverlay,
+            clientProcessIdentifier: 202,
+            foregroundAnchorBundleID: "app.b",
+            foregroundAnchorProcessIdentifier: 101
+          ),
+          !FocusHostRules.resolutionMatchesLease(
+            spotlightLease,
+            hostKind: .nonactivatingSystemOverlay,
+            clientProcessIdentifier: 202,
+            foregroundAnchorBundleID: "app.a",
+            foregroundAnchorProcessIdentifier: 303
+          ),
+          ordinaryUnknownAnchorMatches,
+          ordinaryAuthority.bundle,
+          ordinaryAuthority.process,
+          ordinaryNilBundleAuthority.bundle,
+          ordinaryNilBundleAuthority.process,
+          !ordinaryBundleMismatchAuthority.bundle,
+          ordinaryBundleMismatchAuthority.process,
+          ordinaryPIDMismatchAuthority.bundle,
+          !ordinaryPIDMismatchAuthority.process,
+          spotlightAuthority.bundle,
+          spotlightAuthority.process,
+          nilAnchorBundleAuthority.bundle,
+          nilAnchorBundleAuthority.process,
+          !changedAnchorBundleAuthority.bundle,
+          changedAnchorBundleAuthority.process,
+          changedAnchorPIDAuthority.bundle,
+          !changedAnchorPIDAuthority.process,
+          !deadOverlayAuthority.bundle,
+          !deadOverlayAuthority.process,
+          !restartedOverlayAuthority.bundle,
+          !restartedOverlayAuthority.process,
+          !hiddenOverlayAuthority.bundle,
+          !hiddenOverlayAuthority.process,
+          FocusHostRules.callbackMayUseResolution(
+            kind: .nonactivatingSystemOverlay,
+            explicitActivation: true,
+            eventCanEstablishOverlay: false,
+            continuesExactLease: false,
+            trustedOverlayVisible: false
+          ),
+          FocusHostRules.callbackMayUseResolution(
+            kind: .nonactivatingSystemOverlay,
+            explicitActivation: false,
+            eventCanEstablishOverlay: true,
+            continuesExactLease: false,
+            trustedOverlayVisible: true
+          ),
+          !FocusHostRules.callbackMayUseResolution(
+            kind: .nonactivatingSystemOverlay,
+            explicitActivation: false,
+            eventCanEstablishOverlay: false,
+            continuesExactLease: false,
+            trustedOverlayVisible: true
+          ),
+          FocusHostRules.callbackMayUseResolution(
+            kind: .nonactivatingSystemOverlay,
+            explicitActivation: false,
+            eventCanEstablishOverlay: false,
+            continuesExactLease: true,
+            trustedOverlayVisible: true
+          ),
+          !FocusHostRules.callbackMayUseResolution(
+            kind: .nonactivatingSystemOverlay,
+            explicitActivation: false,
+            eventCanEstablishOverlay: true,
+            continuesExactLease: true,
+            trustedOverlayVisible: false
+          ),
+          !FocusHostRules.frontmostChangeInvalidatesLease(
+            hostKind: .frontmostApplication,
+            leaseBundleID: "app.a",
+            leaseProcessIdentifier: 101,
+            foregroundAnchorBundleID: "app.a",
+            foregroundAnchorProcessIdentifier: 101,
+            activatedBundleID: "app.a",
+            activatedProcessIdentifier: 101
+          ),
+          FocusHostRules.frontmostChangeInvalidatesLease(
+            hostKind: .frontmostApplication,
+            leaseBundleID: "app.a",
+            leaseProcessIdentifier: 101,
+            foregroundAnchorBundleID: "app.a",
+            foregroundAnchorProcessIdentifier: 101,
+            activatedBundleID: "app.b",
+            activatedProcessIdentifier: 101
+          ),
+          FocusHostRules.frontmostChangeInvalidatesLease(
+            hostKind: .frontmostApplication,
+            leaseBundleID: "app.a",
+            leaseProcessIdentifier: 101,
+            foregroundAnchorBundleID: "app.a",
+            foregroundAnchorProcessIdentifier: 101,
+            activatedBundleID: "app.a",
+            activatedProcessIdentifier: 303
+          ),
+          FocusHostRules.frontmostChangeInvalidatesLease(
+            hostKind: .nonactivatingSystemOverlay,
+            leaseBundleID: "com.apple.Spotlight",
+            leaseProcessIdentifier: 202,
+            foregroundAnchorBundleID: "app.a",
+            foregroundAnchorProcessIdentifier: 101,
+            activatedBundleID: "app.a",
+            activatedProcessIdentifier: 101
+          ),
+          FocusHostRules.displacedLeaseRequiresNoClientCleanup(
+            hostKind: .nonactivatingSystemOverlay
+          ),
+          !FocusHostRules.displacedLeaseRequiresNoClientCleanup(
+            hostKind: .frontmostApplication
+          ),
+          targetAllowed(
+            frontmostApplicationMatches: spotlightAuthority.bundle,
+            frontmostProcessMatches: spotlightAuthority.process
+          ) else {
+        print("FAILED: trusted nonactivating focus overlay gate")
+        return false
+    }
+
     guard FocusEventRules.isOrdered(12.0, activationFloor: 11.5, lastAccepted: 11.9),
           !FocusEventRules.isOrdered(11.4, activationFloor: 11.5, lastAccepted: nil),
           !FocusEventRules.isOrdered(9.70, activationFloor: 9.75, lastAccepted: nil),
           !FocusEventRules.isOrdered(11.8, activationFloor: nil, lastAccepted: 11.9),
+          FocusEventRules.isFreshNonactivatingOverlayEvent(20.25, now: 20.50),
+          !FocusEventRules.isFreshNonactivatingOverlayEvent(19.0, now: 20.50),
+          !FocusEventRules.isFreshNonactivatingOverlayEvent(20.75, now: 20.50),
           FocusEventRules.mayTakeOwnership(incomingBundleID: "app.b",
                                            currentOwnerBundleID: "app.a",
-                                           frontmostBundleID: "app.b"),
+                                           frontmostBundleID: "app.b",
+                                           incomingHostKind: .frontmostApplication),
           !FocusEventRules.mayTakeOwnership(incomingBundleID: "app.a",
                                             currentOwnerBundleID: "app.b",
-                                            frontmostBundleID: "app.b"),
+                                            frontmostBundleID: "app.b",
+                                            incomingHostKind: .frontmostApplication),
           !FocusEventRules.mayTakeOwnership(incomingBundleID: "app.c",
                                             currentOwnerBundleID: "app.a",
-                                            frontmostBundleID: "app.b"),
+                                            frontmostBundleID: "app.b",
+                                            incomingHostKind: .frontmostApplication),
           !FocusEventRules.mayTakeOwnership(incomingBundleID: "app.b",
                                             currentOwnerBundleID: "app.a",
-                                            frontmostBundleID: nil),
+                                            frontmostBundleID: nil,
+                                            incomingHostKind: .frontmostApplication),
           FocusEventRules.mayTakeOwnership(incomingBundleID: "app.a",
                                            currentOwnerBundleID: "app.a",
-                                           frontmostBundleID: nil),
+                                           frontmostBundleID: nil,
+                                           incomingHostKind: .frontmostApplication),
+          FocusEventRules.mayTakeOwnership(
+            incomingBundleID: "com.apple.Spotlight",
+            currentOwnerBundleID: "app.a",
+            frontmostBundleID: "app.a",
+            incomingHostKind: .nonactivatingSystemOverlay
+          ),
           FocusEventRules.mayEstablishProcessBoundLease(
             ownerExists: false,
             frontmostProcessIdentifier: 101,
@@ -3362,6 +4389,18 @@ func runBufferWindowSmokeTest() -> Bool {
             isProvisional: true,
             sameControllerAndClient: true,
             age: 0.30
+          ),
+          FocusActivationRules.shouldConfirmProvisional(
+            isProvisional: true,
+            sameControllerAndClient: true,
+            age: 0.75,
+            hostKind: .nonactivatingSystemOverlay
+          ),
+          !FocusActivationRules.shouldConfirmProvisional(
+            isProvisional: true,
+            sameControllerAndClient: true,
+            age: 2.10,
+            hostKind: .nonactivatingSystemOverlay
           ),
           !FocusActivationRules.lifecycleCallbackMayApply(
             now: 10.05,

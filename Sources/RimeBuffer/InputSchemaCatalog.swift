@@ -95,9 +95,9 @@ enum InputConfigurationResolver {
 
     static func profile(schemaID: String) -> RuntimeInputProfile? {
         // F4 can identify the Rime schema but cannot encode the host-side
-        // strict/independent settlement policy.  FlyYao is now canonically the
-        // mutual scheme; callers that are already on my_combo preserve their
-        // complete configuration in InputConfigurationStore.adoptRuntimeSchema.
+        // same-batch/cross-batch settlement policy. FlyYao is now canonically
+        // the mutual scheme; callers that are already on my_combo preserve
+        // their complete configuration in InputConfigurationStore.adoptRuntimeSchema.
         if schemaID == "my_combo" {
             return profile(for: .init(encoding: .fullPinyin, keyingMode: .mutual))
         }
@@ -160,7 +160,7 @@ final class InputConfigurationStore {
                 // Before 互击 existed, every FlyYao user was necessarily saved
                 // as `.chord` even though the runtime already allowed one-sided
                 // keys.  Reclassify that one legacy state exactly once; a user
-                // selecting strict 并击 after this version is then preserved.
+                // selecting same-batch 并击 after this version is then preserved.
                 if semanticsVersion < Self.currentSemanticsVersion,
                    stored == .init(encoding: .fullPinyin, keyingMode: .chord) {
                     let migrated = InputConfiguration(

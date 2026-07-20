@@ -18,11 +18,11 @@ enum HostMarkedTextPresentationRules {
                              secureInput: Bool,
                              stagedChordGuardActive: Bool = false) -> HostMarkedTextPresentation {
         guard !secureInput else { return .none }
-        // Strict FlyYao 并击 keeps a one-sided press outside Rime while it
-        // waits for the complementary keyboard half.  Establish an invisible
-        // marked-text session during that interval even when the workbench is
-        // off, otherwise hostile fields can observe the physical key before
-        // IMK's handled result arrives.
+        // FlyYao stages every current timer batch outside Rime until its
+        // settlement boundary. Establish an invisible marked-text session
+        // during that interval even when the workbench is off, otherwise
+        // hostile fields can observe the physical key before IMK's handled
+        // result arrives.
         if stagedChordGuardActive {
             return .bufferGuard(rimeComposing: rimeComposing)
         }

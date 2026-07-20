@@ -48,6 +48,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
     private var registryObserver: NSObjectProtocol?
     private var activeBufferPluginObserver: NSObjectProtocol?
     private var inputConfigurationObserver: NSObjectProtocol?
+    private var aiConnectorObserver: NSObjectProtocol?
 
     private var encodingRadios: [InputEncoding: NSButton] = [:]
     private var keyingModeRadios: [KeyingMode: NSButton] = [:]
@@ -67,6 +68,17 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
     private let aiModelField = NSTextField(string: "")
     private let aiAPIKeyField = NSSecureTextField(string: "")
     private let aiConfigurationStatus = NSTextField(labelWithString: "")
+    private var aiConnectorRadios: [AITextProviderKind: NSButton] = [:]
+    private let codexLoginButton = NSButton(title: "登录 Codex", target: nil, action: nil)
+    private let codexCopyLoginLinkButton = NSButton(title: "复制登录链接", target: nil, action: nil)
+    private let codexLoginSpinner = NSProgressIndicator()
+    private let codexLoginStatusLabel = NSTextField(wrappingLabelWithString: "")
+    private var codexLoginOperation: AITextCodexLoginOperation?
+    private var codexLoginSessionID: UUID?
+    private var codexLoginCancelling = false
+    private var codexAuthorizationURL: URL?
+    private var codexLoginFeedback: String?
+    private var codexLoginFeedbackIsError = false
     private var candidateMetricFields: [CandidateWindowMetric: NSTextField] = [:]
     private var candidateMetricSliders: [CandidateWindowMetric: NSSlider] = [:]
     private var candidateMetricHints: [CandidateWindowMetric: NSTextField] = [:]
@@ -308,11 +320,26 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
             self?.refreshInputConfigurationSelection()
         }
 
+        aiConnectorObserver = NotificationCenter.default.addObserver(
+            forName: .aiTextConnectorDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.refreshAIConnectorSelection()
+        }
+
         window = win
     }
 
     func windowWillClose(_ notification: Notification) {
         guard notification.object as? NSWindow === window else { return }
+        if let operation = codexLoginOperation {
+            codexLoginCancelling = true
+            codexAuthorizationURL = nil
+            codexLoginFeedback = "正在取消 Codex 登录…"
+            codexLoginFeedbackIsError = false
+            operation.cancel()
+        }
         // The controller is a process-lifetime singleton, but dynamic plugin
         // pages must not be: they observe high-frequency metric stores. Drop
         // the hosted view/controller so a closed Settings window does no
@@ -343,6 +370,29 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
             button.widthAnchor.constraint(equalToConstant: 150).isActive = true
             keyingModeRadios[mode] = button
         }
+        for (index, kind) in AITextProviderKind.allCases.enumerated() {
+            let button = NSButton(radioButtonWithTitle: kind.displayName,
+                                  target: self,
+                                  action: #selector(aiConnectorSelected(_:)))
+            button.tag = index
+            button.font = .systemFont(ofSize: 13, weight: .medium)
+            button.translatesAutoresizingMaskIntoConstraints = false
+            button.widthAnchor.constraint(equalToConstant: 220).isActive = true
+            aiConnectorRadios[kind] = button
+        }
+        codexLoginButton.target = self
+        codexLoginButton.action = #selector(codexLoginButtonPressed)
+        codexCopyLoginLinkButton.target = self
+        codexCopyLoginLinkButton.action = #selector(copyCodexLoginLink)
+        codexCopyLoginLinkButton.isHidden = true
+        codexLoginSpinner.style = .spinning
+        codexLoginSpinner.controlSize = .small
+        codexLoginSpinner.isDisplayedWhenStopped = false
+        codexLoginSpinner.translatesAutoresizingMaskIntoConstraints = false
+        codexLoginSpinner.widthAnchor.constraint(equalToConstant: 16).isActive = true
+        codexLoginSpinner.heightAnchor.constraint(equalToConstant: 16).isActive = true
+        codexLoginStatusLabel.font = .systemFont(ofSize: 11)
+        codexLoginStatusLabel.textColor = .tertiaryLabelColor
         bufferCheck.target = self
         bufferCheck.action = #selector(bufferToggled)
         bufferWindowVisibleCheck.target = self
@@ -720,7 +770,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         note.textColor = .tertiaryLabelColor
 
         let chordNote = NSTextField(wrappingLabelWithString:
-            "飞耀方案使用此间隔划分每一击；互击允许左侧声母、右侧韵母分别成击，并击则要求同一击左右两侧都参与。默认 0.10 秒，修改后立即生效。")
+            "飞耀方案使用此间隔划分每一击；并击只组合当前时间窗内的按键，单侧击也会正常结算；互击还允许相邻的左侧声母与右侧韵母跨击配对。默认 0.10 秒，修改后立即生效。")
         chordNote.font = .systemFont(ofSize: 11)
         chordNote.textColor = .tertiaryLabelColor
 
@@ -1043,8 +1093,39 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
     }
 
     private func aiModelConnectionsPage() -> NSView {
-        let codexReady = CodexCLITextProvider().availability == .ready
-        let claudeReady = ClaudeCodeCLITextProvider().availability == .ready
+        let connectors = AITextConnectorRegistry.shared
+        let codexAvailability = connectors.availability(for: .codexCLI)
+        let claudeAvailability = connectors.availability(for: .claudeCodeCLI)
+        let codexReady = codexAvailability == .ready
+        let claudeReady = claudeAvailability == .ready
+        let codexDetail: String
+        switch codexAvailability {
+        case .ready:
+            codexDetail = "使用 RimeBuffer 专用的 ChatGPT 登录；不会读取 ~/.codex 中的 MCP、工具、Hook 或技能。"
+        case let .unavailable(message):
+            codexDetail = message
+        }
+        let claudeDetail: String
+        switch claudeAvailability {
+        case .ready:
+            claudeDetail = "使用本机已登录的 claude 命令行；工具调用与会话持久化被关闭。"
+        case let .unavailable(message):
+            claudeDetail = message
+        }
+        refreshCodexLoginControls(codexReady: codexReady)
+        codexLoginButton.removeFromSuperview()
+        codexCopyLoginLinkButton.removeFromSuperview()
+        codexLoginSpinner.removeFromSuperview()
+        codexLoginStatusLabel.removeFromSuperview()
+        let codexLoginActions = NSStackView(views: [
+            codexLoginButton,
+            codexCopyLoginLinkButton,
+            codexLoginSpinner,
+            flexSpacer(),
+        ])
+        codexLoginActions.orientation = .horizontal
+        codexLoginActions.alignment = .centerY
+        codexLoginActions.spacing = 8
         let save = NSButton(title: "保存配置",
                             target: self,
                             action: #selector(saveAIModelConfiguration))
@@ -1057,7 +1138,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         actions.spacing = 8
 
         let privacy = NSTextField(wrappingLabelWithString:
-            "Codex CLI 与 Claude Code CLI 在本机启动，但并不代表本地推理：点击生成后，缓冲区全文会通过各自已登录的 CLI 服务发送。OpenAI 兼容 API 插件只会在你点击生成时把全文发送到这里配置的端点。")
+            "Codex CLI 与 Claude Code CLI 在本机启动，但并不代表本地推理：点击生成后，缓冲区全文会通过所选 CLI 的订阅登录态发送。RimeBuffer 不会把环境中的 API Key 透传给这两个 CLI。通用 Open API（OpenAI 兼容）连接器只会在你点击生成时把全文发送到这里配置的端点。")
         privacy.font = .systemFont(ofSize: 11)
         privacy.textColor = .tertiaryLabelColor
 
@@ -1068,24 +1149,25 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
 
         return contentColumn([
             title("AI 模型"),
-            caption("配置三个显式生成型缓冲插件；生成结果进入独立下层缓冲区，由你确认后发送。"),
+            caption("“AI 生成”是一个统一缓冲插件；在这里切换它使用的模型连接器。生成结果进入独立下层缓冲区，由你确认后发送。"),
             spacer(8),
+            sectionLabel("当前连接器"),
+            aiConnectorSelectionView(),
+            spacer(12),
             sectionLabel("本地 CLI"),
             inputModeCard(title: "Codex CLI",
-                          detail: codexReady
-                            ? "使用本机已登录的 codex 命令行；正文只通过标准输入传入。"
-                            : "未找到可执行的 codex 命令，请先安装或配置 RIMEBUFFER_CODEX_PATH。",
+                          detail: codexDetail,
                           active: codexReady,
-                          inactiveLabel: "未找到"),
+                          inactiveLabel: "不可用"),
+            codexLoginActions,
+            codexLoginStatusLabel,
             inputModeCard(title: "Claude Code CLI",
-                          detail: claudeReady
-                            ? "使用本机已登录的 claude 命令行；工具调用与会话持久化被关闭。"
-                            : "未找到可执行的 claude 命令，请先安装或配置 RIMEBUFFER_CLAUDE_PATH。",
+                          detail: claudeDetail,
                           active: claudeReady,
-                          inactiveLabel: "未找到"),
+                          inactiveLabel: "不可用"),
             privacy,
             spacer(16),
-            sectionLabel("OpenAI 兼容 Chat Completions"),
+            sectionLabel("通用 Open API（OpenAI 兼容 Chat Completions）"),
             labeledSettingsRow("Base URL", control: aiBaseURLField),
             labeledSettingsRow("模型", control: aiModelField),
             labeledSettingsRow("API Key", control: aiAPIKeyField),
@@ -1093,6 +1175,13 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
             aiConfigurationStatus,
             keyNote,
         ])
+    }
+
+    private func aiConnectorSelectionView() -> NSView {
+        refreshAIConnectorSelection()
+        return radioSelectionView(AITextProviderKind.allCases.compactMap { kind in
+            aiConnectorRadios[kind]
+        })
     }
 
     private func labeledSettingsRow(_ labelText: String, control: NSView) -> NSView {
@@ -1159,9 +1248,8 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
                 apiKey: enteredKey.isEmpty ? (previous?.apiKey ?? "") : enteredKey
             )
             try OpenAICompatibleConfigurationStore.shared.save(configuration)
-            refreshAIModelConfiguration(statusMessage: "OpenAI 兼容配置已保存")
-            AITextPluginRuntimeRegistry.shared.workspace(for: .openAICompatible)?
-                .configurationDidChange()
+            refreshAIModelConfiguration(statusMessage: "通用 Open API 配置已保存")
+            AITextPluginRuntimeRegistry.shared.workspace.configurationDidChange()
         } catch let error as AITextProviderError {
             refreshAIModelConfiguration(statusMessage: error.userFacingMessage,
                                         isError: true)
@@ -1181,8 +1269,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
             configuration.apiKey = ""
             try OpenAICompatibleConfigurationStore.shared.save(configuration)
             refreshAIModelConfiguration(statusMessage: "已清除本地 API Key")
-            AITextPluginRuntimeRegistry.shared.workspace(for: .openAICompatible)?
-                .configurationDidChange()
+            AITextPluginRuntimeRegistry.shared.workspace.configurationDidChange()
         } catch {
             refreshAIModelConfiguration(statusMessage: "清除失败，请检查本地目录权限",
                                         isError: true)
@@ -1531,6 +1618,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         gatewayEnableCheck.state = LocalGateway.shared.enabled ? .on : .off
         gatewayConfigField.stringValue = gatewayConfigJSON()
         gatewayCommandField.stringValue = gatewayCommand()
+        refreshAIConnectorSelection()
         refreshAIModelConfiguration()
         if let idx = (0..<appearancePopUp.numberOfItems).first(where: {
             appearancePopUp.item(at: $0)?.representedObject as? String == RimeUI.appearance.rawValue
@@ -1553,6 +1641,13 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         }
     }
 
+    private func refreshAIConnectorSelection() {
+        let selected = AITextConnectorSelectionStore.shared.selectedKind
+        for kind in AITextProviderKind.allCases {
+            aiConnectorRadios[kind]?.state = kind == selected ? .on : .off
+        }
+    }
+
     private func refreshAIModelConfiguration(statusMessage: String? = nil,
                                              isError: Bool = false) {
         do {
@@ -1568,7 +1663,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
                 aiConfigurationStatus.textColor = isError ? .systemRed : .secondaryLabelColor
             } else {
                 aiConfigurationStatus.stringValue = configuration == nil
-                    ? "尚未保存 OpenAI 兼容端点"
+                    ? "尚未保存通用 Open API 端点"
                     : "配置已保存在本机"
                 aiConfigurationStatus.textColor = .tertiaryLabelColor
             }
@@ -1577,6 +1672,51 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
             aiAPIKeyField.placeholderString = "无法读取已保存密钥"
             aiConfigurationStatus.stringValue = statusMessage ?? "读取配置失败，请检查本地文件权限"
             aiConfigurationStatus.textColor = .systemRed
+        }
+    }
+
+    private func refreshCodexLoginControls(codexReady: Bool? = nil) {
+        let ready = codexReady
+            ?? (AITextConnectorRegistry.shared.availability(for: .codexCLI) == .ready)
+        let isRunning = codexLoginOperation != nil
+        codexLoginButton.title = isRunning
+            ? "取消登录"
+            : (ready ? "重新授权 Codex" : "登录 Codex")
+        codexLoginButton.isEnabled = !codexLoginCancelling
+        codexCopyLoginLinkButton.isHidden = codexAuthorizationURL == nil
+        if isRunning {
+            codexLoginSpinner.startAnimation(nil)
+        } else {
+            codexLoginSpinner.stopAnimation(nil)
+        }
+        if let codexLoginFeedback {
+            codexLoginStatusLabel.stringValue = codexLoginFeedback
+            codexLoginStatusLabel.textColor = codexLoginFeedbackIsError
+                ? .systemRed
+                : .secondaryLabelColor
+        } else if ready {
+            codexLoginStatusLabel.stringValue = "ChatGPT 订阅登录已保存在 RimeBuffer 专用目录中。"
+            codexLoginStatusLabel.textColor = .systemGreen
+        } else {
+            codexLoginStatusLabel.stringValue = "登录仅供输入法连接器使用，不会读取或修改 ~/.codex。"
+            codexLoginStatusLabel.textColor = .tertiaryLabelColor
+        }
+    }
+
+    private func codexLoginErrorMessage(_ error: AITextProviderError) -> String {
+        switch error {
+        case let .unavailable(message), let .invalidConfiguration(message):
+            return message
+        case .invalidResult:
+            return "Codex 登录响应无效，请重试。"
+        case .resultTooLarge:
+            return "Codex 登录响应异常过大，已安全中止。"
+        case .timedOut:
+            return "等待 Codex 登录超时，请重新发起授权。"
+        case .cancelled:
+            return "已取消 Codex 登录。"
+        case .failed:
+            return "Codex 登录暂时不可用，请重试。"
         }
     }
 
@@ -2024,6 +2164,106 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         }
         RimeBufferController.applyStoredInputConfiguration()
         reload()
+    }
+
+    @objc private func aiConnectorSelected(_ sender: NSButton) {
+        guard AITextProviderKind.allCases.indices.contains(sender.tag) else { return }
+        let kind = AITextProviderKind.allCases[sender.tag]
+        _ = AITextConnectorRegistry.shared.select(kind)
+        refreshAIConnectorSelection()
+        BufferWindowController.shared.refresh()
+        RimeBufferController.refreshActiveUI()
+    }
+
+    @objc private func codexLoginButtonPressed() {
+        if let operation = codexLoginOperation {
+            codexLoginCancelling = true
+            codexAuthorizationURL = nil
+            codexLoginFeedback = "正在取消 Codex 登录…"
+            codexLoginFeedbackIsError = false
+            refreshCodexLoginControls()
+            operation.cancel()
+            return
+        }
+
+        let sessionID = UUID()
+        codexLoginSessionID = sessionID
+        codexLoginCancelling = false
+        codexAuthorizationURL = nil
+        codexLoginFeedback = AITextCodexLoginStatus.launching.displayText
+        codexLoginFeedbackIsError = false
+
+        let operation = AITextCodexLoginOperation(
+            onAuthorizationURL: { [weak self] url in
+                guard let self,
+                      self.codexLoginSessionID == sessionID,
+                      !self.codexLoginCancelling else { return }
+                self.codexAuthorizationURL = url
+                if NSWorkspace.shared.open(url) {
+                    self.codexLoginFeedback = AITextCodexLoginStatus.waitingForBrowser.displayText
+                    self.codexLoginFeedbackIsError = false
+                } else {
+                    self.codexLoginFeedback = "浏览器未能自动打开；可复制登录链接后继续授权。"
+                    self.codexLoginFeedbackIsError = true
+                }
+                self.refreshCodexLoginControls()
+            },
+            onStatus: { [weak self] status in
+                guard let self,
+                      self.codexLoginSessionID == sessionID,
+                      !self.codexLoginCancelling else { return }
+                self.codexLoginFeedback = status.displayText
+                self.codexLoginFeedbackIsError = false
+                self.refreshCodexLoginControls()
+            },
+            completion: { [weak self] result in
+                guard let self, self.codexLoginSessionID == sessionID else { return }
+                self.codexLoginOperation = nil
+                self.codexLoginSessionID = nil
+                self.codexLoginCancelling = false
+                self.codexAuthorizationURL = nil
+                var authorizationChanged = false
+                switch result {
+                case .success:
+                    self.codexLoginFeedback = "ChatGPT 订阅授权成功，Codex 连接器已就绪。"
+                    self.codexLoginFeedbackIsError = false
+                    authorizationChanged = true
+                case .failure(.cancelled):
+                    self.codexLoginFeedback = "已取消 Codex 登录。"
+                    self.codexLoginFeedbackIsError = false
+                case let .failure(error):
+                    self.codexLoginFeedback = self.codexLoginErrorMessage(error)
+                    self.codexLoginFeedbackIsError = true
+                }
+                self.refreshCodexLoginControls()
+                if authorizationChanged {
+                    AITextPluginRuntimeRegistry.shared.workspace.configurationDidChange()
+                    BufferWindowController.shared.refresh()
+                    RimeBufferController.refreshActiveUI()
+                }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self,
+                          self.window?.isVisible == true,
+                          self.selectedCoreRoute == .connectors,
+                          self.navigation.selectedSubpage()?.rawValue == "ai-model" else { return }
+                    self.reload()
+                    self.showCurrentRoute()
+                }
+            }
+        )
+        codexLoginOperation = operation
+        refreshCodexLoginControls()
+        operation.start()
+    }
+
+    @objc private func copyCodexLoginLink() {
+        guard let url = codexAuthorizationURL else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(url.absoluteString, forType: .string)
+        codexLoginFeedback = "登录链接已复制；请在浏览器中打开并完成授权。"
+        codexLoginFeedbackIsError = false
+        refreshCodexLoginControls()
     }
 
     private func persistSchemaSelection(_ ids: [String]? = nil) throws {

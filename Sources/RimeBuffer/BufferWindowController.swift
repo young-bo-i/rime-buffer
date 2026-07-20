@@ -186,7 +186,8 @@ enum BufferWorkbenchLayout {
 enum BufferWorkbenchStatusText {
     static func text(for availability: BufferDeliveryCoordinator.Availability,
                      secureInput: Bool,
-                     pluginFailure: String? = nil) -> String {
+                     pluginFailure: String? = nil,
+                     canGenerateWithoutFocus: Bool = false) -> String {
         if secureInput { return "安全输入，内容已隐藏" }
         if let pluginFailure = normalized(pluginFailure) { return pluginFailure }
         switch availability {
@@ -194,7 +195,10 @@ enum BufferWorkbenchStatusText {
             return "可发送"
         case let .blocked(reason):
             switch reason {
-            case .noFocusedField: return "等待输入框"
+            case .noFocusedField:
+                return canGenerateWithoutFocus
+                    ? "可生成 · 发送前点选输入框"
+                    : "等待输入框"
             case .composing: return "正在组字"
             case .secureInput: return "安全输入，内容已隐藏"
             case .nothingPending: return "等待内容"
@@ -212,7 +216,8 @@ enum BufferWorkbenchStatusText {
 
     static func help(for availability: BufferDeliveryCoordinator.Availability,
                      secureInput: Bool,
-                     pluginFailure: String? = nil) -> String {
+                     pluginFailure: String? = nil,
+                     canGenerateWithoutFocus: Bool = false) -> String {
         if secureInput { return "安全输入已开启，缓冲内容已隐藏且不能发送" }
         if let pluginFailure = normalized(pluginFailure) {
             if pluginFailure.contains("未保存") {
@@ -224,6 +229,9 @@ enum BufferWorkbenchStatusText {
         case .ready:
             return "当前输入框可以接收缓冲内容"
         case let .blocked(reason):
+            if reason == .noFocusedField, canGenerateWithoutFocus {
+                return "可以先生成内容；发送前请点选要接收文字的外部输入框"
+            }
             return reason.message
         }
     }
@@ -641,6 +649,10 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         let pluginFailure = derivedWorkspaceSelected
             ? nil
             : ActionPluginHost.shared.workbenchFailureMessage
+        let canGenerateWithoutFocus = !derivedWorkspaceSelected
+            && ActionPluginHost.shared.presentations.contains {
+                !$0.requiresFocus && $0.canInvoke
+            }
         lastSecureInputState = secureInputEnabled
         if !secureInputEnabled, translationSelected {
             statusLabel.stringValue = AppleTranslationWorkspace.shared.statusText
@@ -650,7 +662,8 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
             statusLabel.stringValue = BufferWorkbenchStatusText.text(
                 for: availability,
                 secureInput: secureInputEnabled,
-                pluginFailure: pluginFailure
+                pluginFailure: pluginFailure,
+                canGenerateWithoutFocus: canGenerateWithoutFocus
             )
         }
         statusLabel.toolTip = !secureInputEnabled && derivedWorkspaceSelected
@@ -658,7 +671,8 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
             : BufferWorkbenchStatusText.help(
                 for: availability,
                 secureInput: secureInputEnabled,
-                pluginFailure: pluginFailure
+                pluginFailure: pluginFailure,
+                canGenerateWithoutFocus: canGenerateWithoutFocus
             )
         statusLabel.textColor = RimeUI.textSecondary
 

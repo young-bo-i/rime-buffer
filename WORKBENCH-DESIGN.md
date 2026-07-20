@@ -13,13 +13,13 @@
 
 > **2026-07-19 本地翻译覆盖决策（当前）**：苹果翻译已作为只出现在缓冲插件列表的内置 `.bufferAction` 落地，与 Marine 共用唯一 owner。源文复用 `BufferModel`，在上方连续轨合并显示且不分 block；译文位于下方独立 `AppleTranslationWorkspace` 分块轨，两轨分别横向滚动。翻译态折叠/展开为 78/112pt，普通工作台仍严格为 44/78pt，模式切换保持底边。拖拽与展开按钮对齐上方原文行，发送按钮对齐下方目标语言行。仅完成且 generation 匹配的译文可由统一投递协调器手动发送。框架保持 macOS 13 最低版本，macOS 15+ 通过工作台内的 SwiftUI `translationTask` 弱链接桥接本地语言模型。本文后续将 Translation 标记为“计划”或描述无头 initializer 的内容均已被此决策覆盖。
 >
-> **2026-07-19 AI 缓冲插件/快捷键覆盖决策（当前）**：Codex CLI、Claude Code CLI 与 OpenAI 兼容 API 已作为三个互斥内置 `.bufferAction` 落地。它们只在用户点击“生成”时冻结当前缓冲全文，在下方 target rail 以稳定 block 原位更新流式结果；只有目标块全部成功发送后才消费上方对应 source blocks。展开工作台内的紧凑选择器可直接切换所有缓冲插件；owner 切换只取消在途工作，不撤销已完成 Marine block 原有的 runtime/context/focus 投递复核权限。`Command+Shift+B` 全局打开工作台并恢复缓冲捕获。
+> **2026-07-20 AI 插件/连接器覆盖决策（当前）**：内置 `.bufferAction` 已收敛为唯一「AI 生成」插件；Codex CLI、Claude Code CLI 与 OpenAI 兼容 API 是“连接器 › AI 模型”中的三个独立可切换模型源，不再占用缓冲插件 owner。用户点击“生成”时冻结当前缓冲全文，在下方 target rail 以稳定 block 原位更新流式结果；只有目标块全部成功发送后才消费上方对应 source blocks。展开工作台内的紧凑选择器继续切换缓冲插件；模型源选择独立持久化。owner 切换只取消在途工作，不撤销已完成 Marine block 原有的 runtime/context/focus 投递复核权限。`Command+Shift+B` 是全局显隐切换：关闭时打开并恢复捕获，打开时安全收束组字、保留缓冲并关闭暂停。
 
 ---
 
 ## 0. 一句话定位
 
-把 Enter输入法从「Rime 提交的暂存队列」升级为**上屏前的文本工作台与插件宿主**：当前本地打字、已接受的 MCP/HTTP 内容、用户主动请求的 Action Plugin 结果、苹果本地翻译与三个显式 AI 生成插件可进入工作台，经人工确认后投递；SSE/SSH 和工作台内传入轨是后续路线图。配对设备保留既有加密直通，是不进入工作台的明确例外。
+把 Enter输入法从「Rime 提交的暂存队列」升级为**上屏前的文本工作台与插件宿主**：当前本地打字、已接受的 MCP/HTTP 内容、用户主动请求的 Action Plugin 结果、苹果本地翻译与唯一「AI 生成」插件可进入工作台，经人工确认后投递；AI 插件使用三个可切换模型连接器之一。SSE/SSH 和工作台内传入轨是后续路线图。配对设备保留既有加密直通，是不进入工作台的明确例外。
 
 产品负责人拍定的六条需求（本方案的边界即由此划定）：
 
@@ -59,7 +59,7 @@
 └────────────────────────────────────────────────┘
 ```
 
-实现载体：`BufferWindowController` 拥有独立 `nonactivatingPanel`。折叠态是 44pt 单行主条：拖拽图标 → 展开箭头 → `BufferInlineView` → 发送；向上工具层只有状态 → 缓冲插件选择器与当前动作 → 刷新/重置 → 关闭，展开后总高 78pt。选择器直接切换唯一 owner；刷新/重置不清除缓冲正文，只重置当前插件的请求、失败与 generation。切换 owner/展开态时保持窗口底边不动，因此条下方候选锚点稳定；只有 22pt 拖拽图标可移动面板。`Command+Shift+B` 通过全局 Carbon hot key 调用 `openAndResume()`，即使工作台先前被关闭/暂停也会重新显示并恢复捕获。窗口仍可调整宽度、关闭、固定到所有桌面/全屏空间，frame 与展开态持久化并在多屏变化后校正。`CandidateWindow` 继续独占候选状态。苹果翻译与三个 AI 插件都使用上 source/下 target 双轨，拖拽/展开对齐源文行，发送对齐目标行。
+实现载体：`BufferWindowController` 拥有独立 `nonactivatingPanel`。折叠态是 44pt 单行主条：拖拽图标 → 展开箭头 → `BufferInlineView` → 发送；向上工具层只有状态 → 缓冲插件选择器与当前动作 → 刷新/重置 → 关闭，展开后总高 78pt。选择器直接切换唯一 owner；刷新/重置不清除缓冲正文，只重置当前插件的请求、失败与 generation。切换 owner/展开态时保持窗口底边不动，因此条下方候选锚点稳定；只有 22pt 拖拽图标可移动面板。`Command+Shift+B` 通过全局 Carbon hot key 调用 `toggleVisibility()`：关闭时显示并恢复捕获，打开时复用普通关闭语义，收束当前组字、保留内容并暂停捕获。窗口仍可调整宽度、关闭、固定到所有桌面/全屏空间，frame 与展开态持久化并在多屏变化后校正。`CandidateWindow` 继续独占候选状态。苹果翻译与唯一「AI 生成」插件都使用上 source/下 target 双轨，拖拽/展开对齐源文行，发送对齐目标行。
 
 各层职责：
 
@@ -73,7 +73,7 @@
 1. **打字暂存**（现状不回归）：缓冲模式下打字 → 常规候选窗显示在细条下方 → commit 成块。有未决组字时，本次普通/Shift+Return 只收束为块；没有组字时轻按发送下一块、按住约 1.2 秒发送全部。Backspace 只编辑 Rime/缓冲；两个键在任何引擎/焦点状态下都绝不影响宿主文本框。焦点不可信时只吞不投递；引擎故障但没有未决组字时，已有块仍可发送。发送目标只认 Return keyDown 绑定且当前仍有效的精确焦点；成功块立即离开 live rail。
 2. **智能体推稿**：Claude Code / Codex 通过 MCP 调 `buffer_push` → 当前由专用 toast/`InboundTrayWindow` 显示「MCP · <来源名>」待决项 → 用户点接受 → 成为带来源徽标的块 → 轻按 Enter 逐块发送，或长按/点击主条纸飞机发送全部到微信输入框。传入轨嵌入工作台是后续 UI 路线图。
 3. **翻译**：打开「苹果本地翻译」唯一 owner → 上方原文轨连续展示当前缓冲全文 → 输入节流后译文以下方独立 blocks 更新 → 仅 generation 完全匹配时，用户才能用 Enter 手势或对齐目标语言行的纸飞机手动发送译文。
-4. **AI 生成**：在工作台选 Codex CLI、Claude Code CLI 或 OpenAI 兼容 API → 用户显式点“生成” → 当前缓冲全文冻结在上方 source rail → 下方 target rail 按逻辑 block index 原位更新，不产生逐 token 碎块。用户可逐块/全部发送 target；只有最后一个 target 成功后才消费对应 source blocks。
+4. **AI 生成**：在工作台选择唯一「AI 生成」插件，并在“连接器 › AI 模型”选 Codex CLI、Claude Code CLI 或 OpenAI 兼容 API → 用户显式点“生成” → 当前缓冲全文冻结在上方 source rail → 首字前持续显示安全活动摘要与等待秒数 → 正文 delta 真流式进入，下方 target rail 按短句/分句/列表项/步骤的细粒度 block index 原位更新（URL、数字、引文、代码不切断）。用户可逐块/全部发送 target；只有最后一个 target 成功后才消费对应 source blocks。
 5. **隔空传字（收）**：配对 Mac 发来文字 → 沿既有加密直通路径上屏；若当前没有可用目标则累积到剪贴板。该产品例外不进入缓冲或传入轨（§12.1）。
 6. **安全底线**：焦点在密码框（系统 secure input 生效）时，工作台遮蔽且发送被 `Delivery.insert` 拒绝，缓冲区任何内容不会被投递。当前收件箱的「接受」只把条目放进缓冲，因此不禁用也不显示锁标。
 
@@ -192,7 +192,7 @@ struct AITextGeneration {
 | MarineBridge | 仅留源码 | `MarineBridge.swift` | 旧轮询兼容实现；focus 主路径不再调用，新插件链路不依赖它 |
 | Apple Translation Workspace | 已实现 | `AppleTranslationPlugin.swift` | macOS 15+ 本地翻译、上原文/下译文双缓冲与 SwiftUI session 桥 |
 | AI Text Workspace + Providers | 已实现 | `AITextPlugins.swift` | Codex/Claude CLI、OpenAI 兼容 API、显式生成、稳定流式 block、source/target 投递与 0600 配置 |
-| Global Workbench Hot Key | 已实现 | `GlobalHotKeyController.swift` | Carbon `Command+Shift+B` 打开工作台并恢复缓冲捕获 |
+| Global Workbench Hot Key | 已实现 | `GlobalHotKeyController.swift` | Carbon `Command+Shift+B` 切换工作台显隐与捕获状态 |
 | FocusCoordinator | 新（已实现） | `InputFocusCoordinator.swift` | FocusToken、client 租约、前台与对象身份校验 |
 | BufferDeliveryCoordinator | 新（已实现） | `BufferDeliveryCoordinator.swift` | 逐块复核目标、成功块无历史消费、失败后缀保留 |
 | DeliveryRouter | 后续 | `Delivery.swift` → `Delivery/DeliveryRouter.swift` | 多目标、远端 ACK、持久账本 |
@@ -293,14 +293,15 @@ claude mcp add --transport http etinput http://127.0.0.1:47700/mcp \
 - 输入停顿 300ms 后启动翻译，持续输入最长等待 900ms；运行中只排队最新快照。只有原文、语言与 generation 全部匹配的完整译文可发送。
 - 展开区的刷新/重置保留原文，作废当前译文 generation 并重启当前语言组合；工作台上的拖拽/展开对齐原文行，发送对齐目标语言行。
 
-### 5.3 三个 AI 文本缓冲插件（已实现）
+### 5.3 单一 AI 文本缓冲插件与三个连接器（已实现）
 
-- **Codex CLI**：寻找环境覆盖、`/opt/homebrew/bin`、`/usr/local/bin`、`~/.local/bin` 与 PATH 中的 `codex`，以 `codex exec --json --ephemeral --ignore-user-config --ignore-rules ... -` 运行。每次请求创建私有临时工作目录，并用严格 permission profile 将文件读取限制到该目录、关闭工具网络及 shell/连接器等能力；源正文连同固定输出结构要求只经 stdin 传入，不出现在 argv/日志中。由于 Codex 尚无跨版本的全局 tool deny 开关，宿主只放行完成过实际请求工具面回归的 CLI 版本，未知版本在正文出进程前失败关闭。
-- **Claude Code CLI**：以 `claude -p --output-format stream-json --include-partial-messages`运行，禁用 tools、slash commands、会话持久化与交互式授权；同样只经 stdin 传源正文。
+- **统一插件**：`AITextInternalPlugin` 是唯一占用缓冲插件 owner 的「AI 生成」入口，`AITextConnectorSelectionStore` 单独持久化当前模型源；切换连接器不会变成另一个插件，也不会改写其他缓冲插件的 owner。
+- **Codex CLI 连接器**：寻找环境覆盖、ChatGPT app bundle、`/opt/homebrew/bin`、`/usr/local/bin`、`~/.local/bin` 与 PATH 中的 `codex`，用一次性 app-server 的双向 stdio JSON-RPC 接收 answer delta。专用 ChatGPT 登录持久化在 `~/Library/RimeBuffer/ai/codex-home`，不继承 `~/.codex` 中的 MCP/Hook/插件/技能；设置页可直接发起、取消或重新授权结构化浏览器登录，并在完成事件后复核账户。每次请求创建私有临时工作目录，并在发送正文前用 `mcpServerStatus/list` 再次断言零 MCP。严格 permission profile 将文件读取限制到临时目录并关闭工具网络、shell/连接器等能力；未知版本在正文出进程前失败关闭。
+- **Claude Code CLI 连接器**：以 `claude -p --output-format stream-json --include-partial-messages` 运行，禁用 tools、slash commands、会话持久化与交互式授权；同样只经 stdin 传源正文。
 - 上述两个 CLI 都由 `Process` 直接启动，不调 shell，不显示 stderr/reasoning/tool 输出，且在 0700 临时目录内受 120s/1MiB 上限约束。**这不是本地推理**：点击生成后，缓冲全文会通过各自 CLI 的已登录服务发送。
-- **OpenAI 兼容 API**：用户可在“设置 › 连接器 › AI 模型”配置 Base URL、model 和 API key。请求为 `POST {baseURL}/chat/completions`，`stream: true`，支持标准 SSE `choices[].delta.content`/`[DONE]` 与非流式 JSON fallback。远程地址必须 HTTPS，HTTP 仅允许 `localhost`/`127.0.0.1`/`::1`；拒绝 userinfo、query、fragment 和 redirect，避免 Authorization 泄露。
+- **OpenAI 兼容 API 连接器**：用户可在“设置 › 连接器 › AI 模型”配置 Base URL、model 和 API key。请求为 `POST {baseURL}/chat/completions`，`stream: true`，要求标准 SSE `choices[].delta.content`/`[DONE]`；2xx 非 SSE 响应失败关闭。远程地址必须 HTTPS，HTTP 仅允许 `localhost`/`127.0.0.1`/`::1`；拒绝 userinfo、query、fragment 和 redirect，避免 Authorization 泄露。
 - Base URL/model/key 保存于 **0600 文件** `~/Library/RimeBuffer/ai/openai-compatible.json`，不进 UserDefaults、Keychain 或日志。继续沿用 ad-hoc 签名下避免 Keychain ACL 重复弹窗的决策，Developer ID 后再评估迁移。
-- 三个插件都只在用户显式点击“生成”时发送当前缓冲全文，永不附带输入历史、preedit、剪贴板或屏幕上下文。预置/自定义提示词模板仍属后续，不写成当前能力。
+- 「AI 生成」插件只在用户显式点击“生成”时把当前缓冲全文交给所选连接器，永不附带输入历史、preedit、剪贴板或屏幕上下文。预置/自定义提示词模板仍属后续，不写成当前能力。
 
 ---
 
@@ -449,8 +450,8 @@ claude mcp add --transport http etinput http://127.0.0.1:47700/mcp \
   - ⏹ **远端改道 + 协议 v2**：按 §12.1 决策**作废**。
 - **M2 网关+MCP** — ✅ 主干已实现：`LocalGateway`、MCP tools、`InboundBus`、token 与收件箱可用；传入轨嵌入工作台仍后续。
 - **稳定缓冲窗口** — ✅ 2026-07-19：FocusToken、Return 轻按逐块/长按全部手势、Return/Backspace 宿主隔离、44pt 简化主条/78pt 向上功能层、状态/插件动作/刷新/关闭契约、翻译双轨控件对齐、条下方常规候选窗、成功块无历史消费、多屏/常显与 secure-input 保护已实现；待重新安装后的真实宿主输入交互验收。
-- **AI 缓冲插件 + 工作台快捷入口** — ✅ 2026-07-19：Codex CLI、Claude Code CLI、OpenAI 兼容 API、source/target 双轨、工作台插件选择器、`Command+Shift+B` 全局打开/恢复、OpenAI 0600 配置与 owner 切换后 Marine 权限保留已落地；待安装后的真 CLI/API 和快捷键验收。
+- **AI 生成插件 + 三连接器 + 工作台快捷入口** — ✅ 2026-07-20：唯一「AI 生成」插件、Codex CLI/Claude Code CLI/OpenAI 兼容 API 三连接器、source/target 双轨、工作台插件选择器、`Command+Shift+B` 全局打开/关闭、OpenAI 0600 配置与 owner 切换后 Marine 权限保留已落地；待安装后的真 CLI/API 和快捷键验收。
 
 ### 12.3 下一步真实工作量
 
-M2 已能向收件箱与 BufferModel 喂真实数据，Action Plugin v1 也已能把用户主动请求的有效结果送入 Buffer、把失效结果退回收件箱。苹果本地翻译与三个 AI 生成插件的 source/target 双轨也已落地。下一步是安装后完成 Marine、真 CLI/API、OpenAI 兼容端点和全局快捷键闭环，再考虑把 `InboundBus.pending` 投影为工作台内固定高度的传入轨；多目标/远端 ACK 仍按 M5 独立推进。
+M2 已能向收件箱与 BufferModel 喂真实数据，Action Plugin v1 也已能把用户主动请求的有效结果送入 Buffer、把失效结果退回收件箱。苹果本地翻译与唯一「AI 生成」插件的 source/target 双轨也已落地；该插件可独立切换三个模型连接器。下一步是安装后完成 Marine、真 CLI/API、OpenAI 兼容端点和全局快捷键闭环，再考虑把 `InboundBus.pending` 投影为工作台内固定高度的传入轨；多目标/远端 ACK 仍按 M5 独立推进。

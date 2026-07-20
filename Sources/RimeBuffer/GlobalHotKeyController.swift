@@ -2,7 +2,7 @@ import Carbon.HIToolbox
 import Foundation
 
 enum WorkbenchGlobalHotKeyRoute: Equatable {
-    case openAndResume
+    case toggleVisibility
     case ignore
 }
 
@@ -29,7 +29,7 @@ enum WorkbenchGlobalHotKeyRouting {
               identifier.id == identifierValue else {
             return .ignore
         }
-        return .openAndResume
+        return .toggleVisibility
     }
 }
 
@@ -124,20 +124,20 @@ final class GlobalHotKeyController {
                 eventClass: GetEventClass(event),
                 eventKind: GetEventKind(event),
                 identifier: identifier
-              ) == .openAndResume else {
+              ) == .toggleVisibility else {
             return OSStatus(eventNotHandledErr)
         }
 
         // The application event target normally invokes us on the main loop;
         // retain the same behavior defensively if Carbon ever calls elsewhere.
-        let openWorkbench = {
-            BufferWindowController.shared.openAndResume()
-            IMELog.write("global hotkey opened and resumed buffer workbench")
+        let toggleWorkbench = {
+            BufferWindowController.shared.toggleVisibility()
+            IMELog.write("global hotkey toggled buffer workbench")
         }
         if Thread.isMainThread {
-            openWorkbench()
+            toggleWorkbench()
         } else {
-            DispatchQueue.main.async(execute: openWorkbench)
+            DispatchQueue.main.async(execute: toggleWorkbench)
         }
 
         // This exact registered hot key is ours. Mark it handled so the B key

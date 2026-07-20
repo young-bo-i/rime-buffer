@@ -78,7 +78,9 @@ final class BufferModel {
         let actionId: String
         let requestId: String
         let contextId: String
-        let focusToken: FocusToken
+        /// Original IMK focus authority, when generation began with a live
+        /// target. Context-only generation may deliberately remain unbound.
+        let focusToken: FocusToken?
         let runtimeIdentity: String
         let title: String?
         let targetSummary: String?
@@ -88,16 +90,16 @@ final class BufferModel {
         let incomplete: Bool
         let streamProtocolVersion: Int?
         let streamIndex: Int?
-        /// The user explicitly accepted a stale inbox result as ordinary text.
-        /// Its old browser binding remains display-only provenance and must
-        /// never be consulted as a live delivery target again.
+        /// The result is ordinary reviewed text rather than a target-bound
+        /// delivery grant. This covers accepted stale inbox results and
+        /// context-only generation that never held IMK focus authority.
         let reviewedAsPlainText: Bool
 
         init(pluginId: String,
              actionId: String,
              requestId: String,
              contextId: String,
-             focusToken: FocusToken,
+             focusToken: FocusToken?,
              runtimeIdentity: String,
              title: String? = nil,
              targetSummary: String? = nil,
@@ -297,6 +299,16 @@ final class BufferModel {
         loadingMessage = message
         transientLoadingActive = true
         IMELog.write("buffer transient loading request=\(requestId) message=\(IMELog.redact(message))")
+        notifyChange(reason: .transient)
+    }
+
+    /// Refresh the visible activity for the same asynchronous request without
+    /// changing its lease or treating a heartbeat as generated content.
+    func updateTransientLoading(requestId: String, message: String) {
+        guard loadingRequestId == requestId,
+              transientLoadingActive,
+              loadingMessage != message else { return }
+        loadingMessage = message
         notifyChange(reason: .transient)
     }
 

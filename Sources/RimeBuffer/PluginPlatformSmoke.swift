@@ -47,11 +47,16 @@ func runPluginPlatformSmokeTest() -> Bool {
     )
     guard shippedBufferPluginIDs == Set([
         BuiltInPluginID.appleTranslation,
-        BuiltInPluginID.codexCLI,
-        BuiltInPluginID.claudeCodeCLI,
-        BuiltInPluginID.openAICompatible,
+        BuiltInPluginID.aiText,
     ]) else {
         return fail("shipped buffer plugin registry")
+    }
+    let shippedAIPlugins = BuiltInPlugins.makeAll().filter {
+        $0.descriptor.key.rawID == BuiltInPluginID.aiText
+    }
+    guard shippedAIPlugins.count == 1,
+          shippedAIPlugins[0].descriptor.capabilities == [.bufferAction] else {
+        return fail("unified AI buffer plugin")
     }
 
     let root = fileManager.temporaryDirectory.appendingPathComponent(

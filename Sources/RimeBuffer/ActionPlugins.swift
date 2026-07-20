@@ -28,30 +28,71 @@ struct ActionPluginDefinition: Decodable, Equatable {
     let title: String
     let symbol: String
     let statusPath: String
+    /// Optional Rime-owned execution contract. When present, the plugin only
+    /// prepares a prompt; RimeBuffer runs the selected local AI connector and
+    /// keeps the resulting blocks bound to this plugin's context lease.
+    let preparePath: String?
     let invokePath: String
     let streamPath: String?
     let modes: [String]
+    /// Whether invoking this action requires a live IMK focus lease. Existing
+    /// manifests default to `true`; context-only actions can opt out while
+    /// keeping delivery fail-closed until the user focuses a fresh target.
+    let requiresFocus: Bool
     /// Actions that are mutually selected by runtime context can share one
     /// stable workbench control without collapsing their wire identities.
     let presentationId: String?
     let presentationTitle: String?
 
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case symbol
+        case statusPath
+        case preparePath
+        case invokePath
+        case streamPath
+        case modes
+        case requiresFocus
+        case presentationId
+        case presentationTitle
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        title = try container.decode(String.self, forKey: .title)
+        symbol = try container.decode(String.self, forKey: .symbol)
+        statusPath = try container.decode(String.self, forKey: .statusPath)
+        preparePath = try container.decodeIfPresent(String.self, forKey: .preparePath)
+        invokePath = try container.decode(String.self, forKey: .invokePath)
+        streamPath = try container.decodeIfPresent(String.self, forKey: .streamPath)
+        modes = try container.decode([String].self, forKey: .modes)
+        requiresFocus = try container.decodeIfPresent(Bool.self, forKey: .requiresFocus) ?? true
+        presentationId = try container.decodeIfPresent(String.self, forKey: .presentationId)
+        presentationTitle = try container.decodeIfPresent(String.self, forKey: .presentationTitle)
+    }
+
     init(id: String,
          title: String,
          symbol: String,
          statusPath: String,
+         preparePath: String? = nil,
          invokePath: String,
          streamPath: String? = nil,
          modes: [String],
+         requiresFocus: Bool = true,
          presentationId: String? = nil,
          presentationTitle: String? = nil) {
         self.id = id
         self.title = title
         self.symbol = symbol
         self.statusPath = statusPath
+        self.preparePath = preparePath
         self.invokePath = invokePath
         self.streamPath = streamPath
         self.modes = modes
+        self.requiresFocus = requiresFocus
         self.presentationId = presentationId
         self.presentationTitle = presentationTitle
     }
@@ -80,7 +121,7 @@ struct ActionPluginRuntimeBinding: Equatable {
     }
 }
 
-struct ActionPluginStatus: Decodable, Equatable {
+struct ActionPluginStatus: Decodable, Equatable, Sendable {
     let available: Bool
     let contextId: String?
     let mode: String?
@@ -115,17 +156,60 @@ struct ActionPluginInvokeRequest: Codable, Equatable {
     }
 }
 
-struct ActionPluginResultBlock: Decodable, Equatable {
+struct ActionPluginResultBlock: Decodable, Equatable, Sendable {
     let text: String
     let title: String?
 }
 
-struct ActionPluginInvokeResponse: Decodable, Equatable {
+struct ActionPluginInvokeResponse: Decodable, Equatable, Sendable {
     let requestId: String
     let actionId: String
     let contextId: String
     let blocks: [ActionPluginResultBlock]
     let targetSummary: String?
+}
+
+/// Action Plugin v1's additive prompt-preparation response. The plugin may
+/// provide only text and display metadata; model choice, credentials, CLI
+/// arguments, tools, and the output schema stay exclusively inside RimeBuffer.
+struct ActionPluginPrepareResponse: Decodable, Equatable, Sendable {
+    let protocolVersion: Int
+    let resultFormat: String
+    let pluginId: String
+    let runtimeInstanceId: String
+    let requestId: String
+    let actionId: String
+    let contextId: String
+    let prompt: String
+    let targetSummary: String?
+}
+
+enum ActionPluginPrepareContract {
+    static let protocolVersion = 1
+    static let resultFormat = "blocks-v1"
+    static let maximumPromptBytes = 256 * 1_024
+
+    static func accepts(_ response: ActionPluginPrepareResponse,
+                        expectedIdentity: ActionPluginStreamIdentity) -> Bool {
+        let identity = ActionPluginStreamIdentity(
+            pluginId: response.pluginId,
+            runtimeInstanceId: response.runtimeInstanceId,
+            requestId: response.requestId,
+            actionId: response.actionId,
+            contextId: response.contextId
+        )
+        return response.protocolVersion == protocolVersion
+            && response.resultFormat == resultFormat
+            && identity == expectedIdentity
+            && ActionPluginStreamParser.validIdentity(identity)
+            && !response.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !response.prompt.contains("\0")
+            && response.prompt.utf8.count <= maximumPromptBytes
+            && ActionPluginStreamParser.validOptionalText(
+                response.targetSummary,
+                maximumBytes: ActionPluginStreamParser.maximumSummaryBytes
+            )
+    }
 }
 
 struct ActionPluginStreamIdentity: Equatable {
@@ -158,8 +242,10 @@ enum ActionPluginManifestLoader {
     private struct PresentationContract {
         let title: String
         let statusPath: String
+        let preparePath: String?
         let invokePath: String
         let streamPath: String?
+        let requiresFocus: Bool
         var modes: Set<String>
     }
 
@@ -256,8 +342,10 @@ enum ActionPluginManifestLoader {
                     presentationIsValid = baseIsValid
                         && existing.title == title
                         && existing.statusPath == action.statusPath
+                        && existing.preparePath == action.preparePath
                         && existing.invokePath == action.invokePath
                         && existing.streamPath == action.streamPath
+                        && existing.requiresFocus == action.requiresFocus
                         && existing.modes.isDisjoint(with: modes)
                     if presentationIsValid {
                         var updated = existing
@@ -270,8 +358,10 @@ enum ActionPluginManifestLoader {
                         presentationContracts[identifier] = PresentationContract(
                             title: title,
                             statusPath: action.statusPath,
+                            preparePath: action.preparePath,
                             invokePath: action.invokePath,
                             streamPath: action.streamPath,
+                            requiresFocus: action.requiresFocus,
                             modes: modes
                         )
                     }
@@ -286,6 +376,7 @@ enum ActionPluginManifestLoader {
                   !action.symbol.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   action.symbol.count <= 80,
                   validEndpointPath(action.statusPath),
+                  action.preparePath.map(validEndpointPath) ?? true,
                   validEndpointPath(action.invokePath),
                   action.streamPath.map(validEndpointPath) ?? true,
                   action.modes.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }),
@@ -421,6 +512,12 @@ protocol ActionPluginTransport: AnyObject {
                      action: ActionPluginDefinition,
                      binding: ActionPluginRuntimeBinding?,
                      completion: @escaping (Result<ActionPluginStatusSnapshot, Error>) -> Void)
+    func prepare(plugin: InstalledActionPlugin,
+                 action: ActionPluginDefinition,
+                 binding: ActionPluginRuntimeBinding,
+                 request payload: ActionPluginInvokeRequest,
+                 completion: @escaping (Result<ActionPluginPrepareResponse, Error>) -> Void)
+        -> (any ActionPluginInvocationCancellable)?
     func invoke(plugin: InstalledActionPlugin,
                 action: ActionPluginDefinition,
                 binding: ActionPluginRuntimeBinding,
@@ -428,6 +525,70 @@ protocol ActionPluginTransport: AnyObject {
                 onStreamEvent: @escaping (ActionPluginStreamEvent) -> Void,
                 completion: @escaping (Result<ActionPluginInvokeResponse, Error>) -> Void)
         -> (any ActionPluginInvocationCancellable)?
+}
+
+extension ActionPluginTransport {
+    func prepare(plugin: InstalledActionPlugin,
+                 action: ActionPluginDefinition,
+                 binding: ActionPluginRuntimeBinding,
+                 request payload: ActionPluginInvokeRequest,
+                 completion: @escaping (Result<ActionPluginPrepareResponse, Error>) -> Void)
+        -> (any ActionPluginInvocationCancellable)? {
+        completion(.failure(ActionPluginHTTPError.invalidEndpoint))
+        return nil
+    }
+}
+
+/// Keeps cancellation continuous while a prepared action moves from the
+/// plugin's HTTP request to a locally spawned connector process.
+private final class ActionPluginCancellationChain: ActionPluginInvocationCancellable {
+    private let lock = NSLock()
+    private var cancellation: (() -> Void)?
+    private var cancelled = false
+
+    func install(_ task: (any ActionPluginInvocationCancellable)?) {
+        installCancellation(task.map { task in { task.cancel() } })
+    }
+
+    func installAI(_ task: any AITextCancellable) {
+        installCancellation { task.cancel() }
+    }
+
+    private func installCancellation(_ operation: (() -> Void)?) {
+        lock.lock()
+        if cancelled {
+            lock.unlock()
+            operation?()
+            return
+        }
+        cancellation = operation
+        lock.unlock()
+    }
+
+    func cancel() {
+        lock.lock()
+        guard !cancelled else {
+            lock.unlock()
+            return
+        }
+        cancelled = true
+        let operation = cancellation
+        cancellation = nil
+        lock.unlock()
+        operation?()
+    }
+}
+
+private final class ActionPluginConnectorEventSequence {
+    private let lock = NSLock()
+    private var value = 0
+
+    func next() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        value += 1
+        return value
+    }
 }
 
 /// Incremental NDJSON decoder for Action Plugin stream protocol v1. Every wire
@@ -1022,6 +1183,41 @@ final class ActionPluginHTTPClient: ActionPluginTransport {
         attempt(0, lastError: nil)
     }
 
+    func prepare(plugin: InstalledActionPlugin,
+                 action: ActionPluginDefinition,
+                 binding: ActionPluginRuntimeBinding,
+                 request payload: ActionPluginInvokeRequest,
+                 completion: @escaping (Result<ActionPluginPrepareResponse, Error>) -> Void)
+        -> (any ActionPluginInvocationCancellable)? {
+        guard binding.config.pluginId == plugin.manifest.id,
+              let preparePath = action.preparePath,
+              let runtimeInstanceId = binding.config.instanceId,
+              payload.pluginId == plugin.manifest.id,
+              payload.runtimeInstanceId == runtimeInstanceId else {
+            completion(.failure(ActionPluginHTTPError.runtimeUnavailable))
+            return nil
+        }
+        do {
+            let body = try JSONEncoder().encode(payload)
+            guard let request = Self.makeRequest(
+                config: binding.config,
+                path: preparePath,
+                method: "POST",
+                body: body,
+                timeout: Self.legacyRequestTimeout
+            ) else {
+                completion(.failure(ActionPluginHTTPError.invalidEndpoint))
+                return nil
+            }
+            return perform(request,
+                           decode: ActionPluginPrepareResponse.self,
+                           completion: completion)
+        } catch {
+            completion(.failure(error))
+            return nil
+        }
+    }
+
     func invoke(plugin: InstalledActionPlugin,
                 action: ActionPluginDefinition,
                 binding: ActionPluginRuntimeBinding,
@@ -1127,7 +1323,7 @@ final class ActionPluginHTTPClient: ActionPluginTransport {
     }
 
     @discardableResult
-    private func perform<T: Decodable>(_ request: URLRequest,
+    private func perform<T: Decodable & Sendable>(_ request: URLRequest,
                                        decode type: T.Type,
                                        completion: @escaping (Result<T, Error>) -> Void)
         -> URLSessionDataTask {
@@ -1226,6 +1422,7 @@ struct ActionPluginPresentation: Equatable {
     let targetSummary: String?
     let available: Bool
     let canInvoke: Bool
+    let requiresFocus: Bool
     let running: Bool
     let waitingForFirstContent: Bool
 }
@@ -1307,10 +1504,15 @@ final class ActionPluginHost {
         let action: ActionPluginDefinition
         let requestId: String
         let contextId: String
-        let focusToken: FocusToken
+        /// Nil means the user explicitly invoked a context-only action without
+        /// an IMK target. Such output may stream into the workbench but never
+        /// gains target-bound delivery authority.
+        let focusToken: FocusToken?
         let binding: ActionPluginRuntimeBinding
         let targetSummary: String?
         let streaming: Bool
+        let startedAt: TimeInterval
+        var activityMessage: String
         var markedStale: Bool
         var task: (any ActionPluginInvocationCancellable)?
         var receivedFirstContent: Bool
@@ -1341,6 +1543,7 @@ final class ActionPluginHost {
     private let rootURL: URL
     private let pluginLoader: (URL) -> [InstalledActionPlugin]
     private let pluginIsSelected: (String) -> Bool
+    private let connectorProvider: () -> (any AITextProvider)?
     private let runtimeBindingIsCurrent: (InstalledActionPlugin, ActionPluginRuntimeBinding) -> Bool
     private let invocationTimeout: TimeInterval
     private let runtimeAuthorityRecheckInterval: TimeInterval
@@ -1390,6 +1593,9 @@ final class ActionPluginHost {
              ActionPluginManager.enabledPlugins(from: $0)
          },
          pluginIsSelected: @escaping (String) -> Bool = { _ in true },
+         connectorProvider: @escaping () -> (any AITextProvider)? = {
+             AITextConnectorRegistry.shared.selectedProvider
+         },
          runtimeBindingIsCurrent: @escaping (
              InstalledActionPlugin,
              ActionPluginRuntimeBinding
@@ -1407,6 +1613,7 @@ final class ActionPluginHost {
         self.inboundBus = inboundBus
         self.pluginLoader = pluginLoader
         self.pluginIsSelected = pluginIsSelected
+        self.connectorProvider = connectorProvider
         self.runtimeBindingIsCurrent = runtimeBindingIsCurrent
         self.invocationTimeout = max(0.01, invocationTimeout)
         self.runtimeAuthorityRecheckInterval = max(0, runtimeAuthorityRecheckInterval)
@@ -1446,7 +1653,7 @@ final class ActionPluginHost {
     var presentations: [ActionPluginPresentation] {
         dispatchPrecondition(condition: .onQueue(.main))
         let currentFocusToken = focus.currentToken()
-        let hasSafeFocus = currentFocusToken != nil && !focus.secureInputEnabled()
+        let secureInputEnabled = focus.secureInputEnabled()
         return plugins.values
             .filter { pluginIsSelected($0.manifest.id) }
             .sorted { $0.manifest.name < $1.manifest.name }
@@ -1459,10 +1666,12 @@ final class ActionPluginHost {
                 }
                 let status = observed?.snapshot.value
                 let contextId = status?.contextId ?? ""
-                let available = ActionPluginRoutingRules.focusBindingMatches(
-                    bound: observed?.focusToken,
-                    current: currentFocusToken
-                ) && !contextId.isEmpty
+                let focusRequirementMatches = !action.requiresFocus
+                    || ActionPluginRoutingRules.focusBindingMatches(
+                        bound: observed?.focusToken,
+                        current: currentFocusToken
+                    )
+                let available = focusRequirementMatches && !contextId.isEmpty
                     && ActionPluginRoutingRules.statusMatches(status,
                                                               action: action,
                                                               contextId: contextId)
@@ -1473,8 +1682,22 @@ final class ActionPluginHost {
                         && !$0.markedStale
                         && !$0.receivedFirstContent
                 } ?? false
+                let connectorStatus: (ready: Bool, message: String?)
+                if action.preparePath == nil {
+                    connectorStatus = (true, nil)
+                } else if let connector = connectorProvider() {
+                    switch connector.availability {
+                    case .ready:
+                        connectorStatus = (true, nil)
+                    case let .unavailable(message):
+                        connectorStatus = (false, message)
+                    }
+                } else {
+                    connectorStatus = (false, "请先选择 AI 模型连接器")
+                }
                 let label = status?.label?.trimmingCharacters(in: .whitespacesAndNewlines)
-                let resolvedLabel = (label?.isEmpty == false ? label.map { String($0.prefix(120)) } : nil)
+                let resolvedLabel = connectorStatus.message
+                    ?? (label?.isEmpty == false ? label.map { String($0.prefix(120)) } : nil)
                     ?? (failures[key] ?? action.title)
                 return ActionPluginPresentation(
                     key: key,
@@ -1488,7 +1711,11 @@ final class ActionPluginHost {
                     label: resolvedLabel,
                     targetSummary: status?.targetSummary.map { String($0.prefix(1_000)) },
                     available: available,
-                    canInvoke: available && hasSafeFocus && activeInvocation == nil,
+                    canInvoke: available && connectorStatus.ready
+                        && !secureInputEnabled
+                        && (!action.requiresFocus || currentFocusToken != nil)
+                        && activeInvocation == nil,
+                    requiresFocus: action.requiresFocus,
                     running: running,
                     waitingForFirstContent: waitingForFirstContent
                 )
@@ -1527,6 +1754,7 @@ final class ActionPluginHost {
                     targetSummary: selected.presentation.targetSummary,
                     available: selected.presentation.available,
                     canInvoke: selected.presentation.canInvoke,
+                    requiresFocus: selected.presentation.requiresFocus,
                     running: selected.presentation.running,
                     waitingForFirstContent: selected.presentation.waitingForFirstContent
                 ))
@@ -1585,12 +1813,6 @@ final class ActionPluginHost {
               observed.plugin == plugin,
               observed.action == action,
               livePlugin(withID: key.pluginId) == plugin,
-              let focusToken = focus.currentToken(),
-              ActionPluginRoutingRules.focusBindingMatches(
-                bound: observed.focusToken,
-                current: focusToken
-              ),
-              focus.isValid(focusToken),
               let status = Optional(observed.snapshot.value),
               let contextId = status.contextId,
               ActionPluginRoutingRules.statusMatches(status,
@@ -1599,8 +1821,24 @@ final class ActionPluginHost {
             return
         }
 
+        let focusToken = focus.currentToken()
+        if let focusToken {
+            guard focus.isValid(focusToken) else { return }
+        } else {
+            guard !action.requiresFocus else { return }
+        }
+        if action.requiresFocus {
+            guard ActionPluginRoutingRules.focusBindingMatches(
+                bound: observed.focusToken,
+                current: focusToken
+            ) else { return }
+        }
+
         let binding = observed.snapshot.binding
-        let streaming = action.streamPath != nil
+        let preparedByPlugin = action.preparePath != nil
+        // Locally generated connector snapshots use the same strict streaming
+        // authority and stale-result retention rules as remote NDJSON streams.
+        let streaming = preparedByPlugin || action.streamPath != nil
         guard runtimeBindingIsCurrent(plugin, binding) else {
             failures[key] = "插件运行实例已失效，请稍后重试"
             onChange?()
@@ -1614,6 +1852,11 @@ final class ActionPluginHost {
 
         let requestId = UUID().uuidString.lowercased()
         let nonce = UUID()
+        let cancellationChain = preparedByPlugin ? ActionPluginCancellationChain() : nil
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        let initialActivity = preparedByPlugin
+            ? "正在准备话术"
+            : "正在等待 \(plugin.manifest.name)"
         clearWorkbenchMessages()
         activeInvocation = ActiveInvocation(nonce: nonce,
                                             hostGeneration: hostGeneration,
@@ -1626,8 +1869,10 @@ final class ActionPluginHost {
                                             binding: binding,
                                             targetSummary: status.targetSummary,
                                             streaming: streaming,
+                                            startedAt: startedAt,
+                                            activityMessage: initialActivity,
                                             markedStale: false,
-                                            task: nil,
+                                            task: cancellationChain,
                                             receivedFirstContent: false,
                                             streamBlockIDs: [:],
                                             stagedStreamBlockIDs: [],
@@ -1638,8 +1883,9 @@ final class ActionPluginHost {
         }
         bufferModel.beginTransientLoading(
             requestId: requestId,
-            message: "\(status.label ?? action.title)…"
+            message: "\(initialActivity) · 0 秒"
         )
+        if streaming { scheduleInvocationActivityTick(nonce: nonce) }
         onChange?()
 
         let payload = ActionPluginInvokeRequest(
@@ -1649,24 +1895,45 @@ final class ActionPluginHost {
             pluginId: streaming ? plugin.manifest.id : nil,
             runtimeInstanceId: streaming ? binding.config.instanceId : nil
         )
-        let task = client.invoke(plugin: plugin,
-                                 action: action,
-                                 binding: binding,
-                                 request: payload,
-                                 onStreamEvent: { [weak self] event in
-            self?.enqueueStreamEvent(event, nonce: nonce)
-        }) { [weak self] result in
-            DispatchQueue.main.async {
-                self?.handleInvoke(result,
-                                   nonce: nonce,
-                                   requestId: requestId,
-                                   plugin: plugin,
-                                   action: action)
+        if let cancellationChain {
+            let task = client.prepare(
+                plugin: plugin,
+                action: action,
+                binding: binding,
+                request: payload
+            ) { [weak self] result in
+                DispatchQueue.main.async {
+                    self?.handlePreparation(
+                        result,
+                        nonce: nonce,
+                        requestId: requestId,
+                        plugin: plugin,
+                        action: action,
+                        cancellationChain: cancellationChain
+                    )
+                }
             }
-        }
-        if var invocation = activeInvocation, invocation.nonce == nonce {
-            invocation.task = task
-            activeInvocation = invocation
+            cancellationChain.install(task)
+        } else {
+            let task = client.invoke(plugin: plugin,
+                                     action: action,
+                                     binding: binding,
+                                     request: payload,
+                                     onStreamEvent: { [weak self] event in
+                self?.enqueueStreamEvent(event, nonce: nonce)
+            }) { [weak self] result in
+                DispatchQueue.main.async {
+                    self?.handleInvoke(result,
+                                       nonce: nonce,
+                                       requestId: requestId,
+                                       plugin: plugin,
+                                       action: action)
+                }
+            }
+            if var invocation = activeInvocation, invocation.nonce == nonce {
+                invocation.task = task
+                activeInvocation = invocation
+            }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + invocationTimeout) { [weak self] in
             guard let self,
@@ -1681,7 +1948,8 @@ final class ActionPluginHost {
         dispatchPrecondition(condition: .onQueue(.main))
         statuses = statuses.filter { $0.value.focusToken != token }
         if let invocation = activeInvocation,
-           invocation.focusToken == token {
+           let boundFocusToken = invocation.focusToken,
+           boundFocusToken == token {
             parkInvocationForInbox(invocation)
         } else if workbenchFailureMessage != nil {
             clearWorkbenchMessages()
@@ -1698,7 +1966,8 @@ final class ActionPluginHost {
             }
             return
         }
-        guard focus.currentToken() != invocation.focusToken else { return }
+        guard let boundFocusToken = invocation.focusToken,
+              focus.currentToken() != boundFocusToken else { return }
         parkInvocationForInbox(invocation)
         onChange?()
     }
@@ -1776,7 +2045,8 @@ final class ActionPluginHost {
         dispatchPrecondition(condition: .onQueue(.main))
         guard !metadata.stale,
               !metadata.incomplete,
-              metadata.focusToken == expectedFocusToken,
+              let boundFocusToken = metadata.focusToken,
+              boundFocusToken == expectedFocusToken,
               focus.currentToken() == expectedFocusToken,
               focus.isValid(expectedFocusToken),
               !focus.secureInputEnabled() else {
@@ -1940,6 +2210,64 @@ final class ActionPluginHost {
         }
     }
 
+    private func updateConnectorActivity(_ activity: AITextProviderActivity,
+                                         nonce: UUID) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard var invocation = activeInvocation,
+              invocation.nonce == nonce,
+              invocation.streaming,
+              !invocation.receivedFirstContent else { return }
+        guard streamingRuntimeIsAuthoritative(invocation) else {
+            cancelInvocation(invocation,
+                             failureMessage: "插件运行实例已变化",
+                             preserveLegacyResultRouting: false)
+            return
+        }
+        let normalized = Self.normalizedActivityMessage(activity.message)
+        guard !normalized.isEmpty else { return }
+        let changed = invocation.activityMessage != normalized
+        if changed {
+            invocation.activityMessage = normalized
+            activeInvocation = invocation
+        }
+        let displayText = activityDisplayText(for: invocation)
+        guard changed || bufferModel.loadingMessage != displayText else { return }
+        bufferModel.updateTransientLoading(
+            requestId: invocation.requestId,
+            message: displayText
+        )
+        onChange?()
+    }
+
+    private func scheduleInvocationActivityTick(nonce: UUID) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            guard let self,
+                  let invocation = self.activeInvocation,
+                  invocation.nonce == nonce,
+                  invocation.streaming,
+                  !invocation.receivedFirstContent else { return }
+            self.bufferModel.updateTransientLoading(
+                requestId: invocation.requestId,
+                message: self.activityDisplayText(for: invocation)
+            )
+            self.onChange?()
+            self.scheduleInvocationActivityTick(nonce: nonce)
+        }
+    }
+
+    private func activityDisplayText(for invocation: ActiveInvocation) -> String {
+        let elapsed = max(0, ProcessInfo.processInfo.systemUptime - invocation.startedAt)
+        return "\(invocation.activityMessage) · \(Int(elapsed)) 秒"
+    }
+
+    private static func normalizedActivityMessage(_ value: String) -> String {
+        let oneLine = value
+            .replacingOccurrences(of: "\r", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return String(oneLine.prefix(120))
+    }
+
     @discardableResult
     private func removeStoredInvocation(nonce: UUID) -> ActiveInvocation? {
         streamAuthorityValidatedAt[nonce] = nil
@@ -2076,10 +2404,12 @@ final class ActionPluginHost {
         guard activeInvocation?.nonce == invocation.nonce,
               streamingCachedAuthorityIsValid(invocation),
               !invocation.markedStale,
-              focus.currentToken() == invocation.focusToken,
-              focus.isValid(invocation.focusToken),
               !focus.secureInputEnabled() else { return false }
-        return true
+        guard let boundFocusToken = invocation.focusToken else {
+            return !invocation.action.requiresFocus
+        }
+        return focus.currentToken() == boundFocusToken
+            && focus.isValid(boundFocusToken)
     }
 
     /// Stop exposing partial text after the target changes, while preserving
@@ -2219,7 +2549,19 @@ final class ActionPluginHost {
         case .heartbeat:
             return
         case let .block(snapshot):
-            guard !snapshot.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            guard (0..<ActionPluginStreamParser.maximumBlocks).contains(snapshot.index),
+                  !snapshot.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  ActionPluginStreamParser.validText(
+                      snapshot.text,
+                      maximumBytes: ActionPluginStreamParser.maximumBlockBytes
+                  ),
+                  ActionPluginStreamParser.validOptionalText(
+                      snapshot.title,
+                      maximumBytes: ActionPluginStreamParser.maximumTitleBytes
+                  ) else {
+                cancelInvocation(invocation,
+                                 failureMessage: "连接器流结果无效",
+                                 preserveLegacyResultRouting: false)
                 return
             }
             if invocation.streamBlockIDs[snapshot.index] == nil {
@@ -2287,7 +2629,8 @@ final class ActionPluginHost {
                 stale: false,
                 incomplete: true,
                 streamProtocolVersion: ActionPluginStreamParser.protocolVersion,
-                streamIndex: snapshot.index
+                streamIndex: snapshot.index,
+                reviewedAsPlainText: invocation.focusToken == nil
             )
             return BufferModel.PluginStreamUpdate(id: id,
                                                   index: snapshot.index,
@@ -2387,7 +2730,7 @@ final class ActionPluginHost {
               plugin.manifest.actions.first(where: { $0.id == action.id }) == action else {
             return
         }
-        guard focus.currentToken() == request.focusToken else {
+        guard !action.requiresFocus || focus.currentToken() == request.focusToken else {
             statuses[key] = nil
             onChange?()
             return
@@ -2425,6 +2768,136 @@ final class ActionPluginHost {
             failures[key] = (error as? LocalizedError)?.errorDescription ?? "插件服务不可用"
         }
         if oldStatus != statuses[key] || oldFailure != failures[key] { onChange?() }
+    }
+
+    private func handlePreparation(_ result: Result<ActionPluginPrepareResponse, Error>,
+                                   nonce: UUID,
+                                   requestId: String,
+                                   plugin: InstalledActionPlugin,
+                                   action: ActionPluginDefinition,
+                                   cancellationChain: ActionPluginCancellationChain) {
+        guard let invocation = storedInvocation(nonce: nonce),
+              invocation.requestId == requestId,
+              invocation.plugin == plugin,
+              invocation.action == action,
+              action.preparePath != nil,
+              invocation.streaming else { return }
+        guard plugins[plugin.manifest.id] == plugin,
+              plugin.manifest.actions.first(where: { $0.id == action.id }) == action,
+              streamingRuntimeIsAuthoritative(invocation, force: true) else {
+            cancelInvocation(invocation,
+                             failureMessage: "插件运行实例已变化",
+                             preserveLegacyResultRouting: false)
+            return
+        }
+
+        let preparation: ActionPluginPrepareResponse
+        switch result {
+        case let .failure(error):
+            cancelInvocation(
+                invocation,
+                failureMessage: (error as? LocalizedError)?.errorDescription ?? "插件话术准备失败",
+                preserveLegacyResultRouting: false
+            )
+            return
+        case let .success(response):
+            let expectedIdentity = ActionPluginStreamIdentity(
+                pluginId: plugin.manifest.id,
+                runtimeInstanceId: invocation.binding.config.instanceId ?? "",
+                requestId: invocation.requestId,
+                actionId: action.id,
+                contextId: invocation.contextId
+            )
+            guard ActionPluginPrepareContract.accepts(
+                response,
+                expectedIdentity: expectedIdentity
+            ) else {
+                cancelInvocation(invocation,
+                                 failureMessage: "插件返回的话术身份或格式无效",
+                                 preserveLegacyResultRouting: false)
+                return
+            }
+            preparation = response
+        }
+
+        guard let connector = connectorProvider() else {
+            cancelInvocation(invocation,
+                             failureMessage: "请先在“连接器 › AI 模型”选择一个模型源",
+                             preserveLegacyResultRouting: false)
+            return
+        }
+        if case let .unavailable(message) = connector.availability {
+            cancelInvocation(invocation,
+                             failureMessage: message,
+                             preserveLegacyResultRouting: false)
+            return
+        }
+
+        let identity = ActionPluginStreamIdentity(
+            pluginId: plugin.manifest.id,
+            runtimeInstanceId: invocation.binding.config.instanceId ?? "",
+            requestId: invocation.requestId,
+            actionId: action.id,
+            contextId: invocation.contextId
+        )
+        let sequence = ActionPluginConnectorEventSequence()
+        let connectorRequestID = UUID(uuidString: requestId) ?? UUID()
+        updateConnectorActivity(
+            AITextProviderActivity(kind: .launching,
+                                   message: "正在启动 \(connector.kind.displayName)"),
+            nonce: nonce
+        )
+        let task = connector.generate(
+            AITextProviderRequest(
+                requestID: connectorRequestID,
+                sourceText: "",
+                preparedPrompt: preparation.prompt
+            ),
+            onEvent: { [weak self] event in
+                switch event {
+                case let .activity(activity):
+                    DispatchQueue.main.async {
+                        self?.updateConnectorActivity(activity, nonce: nonce)
+                    }
+                case let .blockSnapshot(block):
+                    self?.enqueueStreamEvent(
+                        .block(ActionPluginStreamBlockSnapshot(
+                            identity: identity,
+                            sequence: sequence.next(),
+                            index: block.index,
+                            text: block.text,
+                            title: block.title
+                        )),
+                        nonce: nonce
+                    )
+                }
+            },
+            completion: { [weak self] connectorResult in
+                let invocationResult: Result<ActionPluginInvokeResponse, Error>
+                switch connectorResult {
+                case let .failure(error):
+                    invocationResult = .failure(error)
+                case let .success(blocks):
+                    invocationResult = .success(ActionPluginInvokeResponse(
+                        requestId: requestId,
+                        actionId: action.id,
+                        contextId: preparation.contextId,
+                        blocks: blocks.map {
+                            ActionPluginResultBlock(text: $0.text, title: $0.title)
+                        },
+                        targetSummary: preparation.targetSummary ?? invocation.targetSummary
+                    ))
+                }
+                DispatchQueue.main.async {
+                    self?.handleInvoke(invocationResult,
+                                       nonce: nonce,
+                                       requestId: requestId,
+                                       plugin: plugin,
+                                       action: action)
+                }
+            }
+        )
+        cancellationChain.installAI(task)
     }
 
     private func handleInvoke(_ result: Result<ActionPluginInvokeResponse, Error>,
@@ -2528,7 +3001,8 @@ final class ActionPluginHost {
                     // A background result belongs to an old focus epoch. Its
                     // terminal revalidation must not overwrite a newer focus's
                     // status cache or disable the new foreground action.
-                    if self.focus.currentToken() == current.focusToken {
+                    if (!current.action.requiresFocus && current.focusToken == nil)
+                        || self.focus.currentToken() == current.focusToken {
                         if let currentSnapshot {
                             self.statuses[current.key] = ObservedStatus(
                                 snapshot: currentSnapshot,
@@ -2540,9 +3014,15 @@ final class ActionPluginHost {
                             self.statuses[current.key] = nil
                         }
                     }
-                    let focusValid = self.focus.isValid(current.focusToken)
-                        && self.focus.currentToken() == current.focusToken
-                        && !self.focus.secureInputEnabled()
+                    let focusValid: Bool
+                    if let boundFocusToken = current.focusToken {
+                        focusValid = self.focus.isValid(boundFocusToken)
+                            && self.focus.currentToken() == boundFocusToken
+                            && !self.focus.secureInputEnabled()
+                    } else {
+                        focusValid = !current.action.requiresFocus
+                            && !self.focus.secureInputEnabled()
+                    }
                     let statusMatches = ActionPluginRoutingRules.statusMatches(
                         currentStatus,
                         action: action,
@@ -2618,7 +3098,8 @@ final class ActionPluginHost {
                 stale: false,
                 incomplete: false,
                 streamProtocolVersion: ActionPluginStreamParser.protocolVersion,
-                streamIndex: index
+                streamIndex: index,
+                reviewedAsPlainText: invocation.focusToken == nil
             )
             return BufferModel.PluginStreamFinalBlock(id: id,
                                                       index: index,
@@ -2636,7 +3117,9 @@ final class ActionPluginHost {
                              preserveLegacyResultRouting: false)
             return
         }
-        registerDeliveryAuthority(invocation)
+        if invocation.focusToken != nil {
+            registerDeliveryAuthority(invocation)
+        }
         _ = removeStoredInvocation(nonce: invocation.nonce)
         foregroundFailureMessage = nil
         onChange?()
@@ -2686,12 +3169,14 @@ final class ActionPluginHost {
         let origin = Origin.plugin(id: plugin.manifest.id)
         let targetSummary = (response.targetSummary ?? invocation.targetSummary)
             .map { String($0.prefix(1_000)) }
-        let usableBlocks = response.blocks.prefix(20).compactMap { block -> ActionPluginResultBlock? in
+        let usableBlocks = response.blocks
+            .prefix(ActionPluginStreamParser.maximumBlocks)
+            .compactMap { block -> ActionPluginResultBlock? in
             let text = String(block.text.prefix(InboundBus.maxTextCount))
             guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             return ActionPluginResultBlock(text: text,
                                            title: block.title.map { String($0.prefix(200)) })
-        }
+            }
         guard !usableBlocks.isEmpty else {
             if wasForeground {
                 bufferModel.failTransientLoading(requestId: invocation.requestId,
@@ -2703,7 +3188,7 @@ final class ActionPluginHost {
             return
         }
 
-        if direct {
+        if direct, invocation.focusToken != nil {
             registerDeliveryAuthority(invocation)
         }
 
@@ -2718,7 +3203,8 @@ final class ActionPluginHost {
                 runtimeIdentity: invocation.binding.identity,
                 title: block.title,
                 targetSummary: targetSummary,
-                stale: !direct
+                stale: !direct,
+                reviewedAsPlainText: direct && invocation.focusToken == nil
             )
             if direct {
                 bufferModel.stageExternal(block.text,
