@@ -1,25 +1,27 @@
 #!/bin/bash
-# Builds ETInput.app (Enter输入法, an IMK input method) as a SELF-CONTAINED bundle:
+# Builds RIMES as a SELF-CONTAINED IMK input method. ETInput.app remains the
+# frozen internal compatibility path used by existing installs and updates:
 # librime + the Rime shared data are packaged inside, so no separate Squirrel
 # install is needed. Installs into the per-user Input Methods folder and
 # registers + enables + selects it so it shows in System Settings / the input menu.
 #
 # IMPORTANT invariants (learned the hard way — see RELEASE.md):
-#   * The .app directory name MUST be ASCII (ETInput.app). The Chinese product
-#     name lives only in CFBundleName/CFBundleDisplayName + InfoPlist.strings.
-#     A CJK bundle path breaks the System Settings picker's name/icon resolution.
+#   * The .app directory remains ETInput.app. The RIMES product name lives in
+#     CFBundleName/CFBundleDisplayName + InfoPlist.strings. Renaming the path
+#     would strand old updaters and duplicate the same TIS identity.
 #   * There must be EXACTLY ONE bundle with this id on disk. A stray copy (e.g.
 #     left in the repo working tree) registers the same input-source id at a
 #     second path and poisons TIS/LaunchServices → blank/greyed picker row. So
 #     we assemble in a throwaway staging dir and delete it after installing.
 #
 # (The SPM target / source dir stay named "RimeBuffer" — internal codename / repo;
-# the shipped product is ETInput / Enter输入法.)
+# the shipped product is RIMES.)
 set -euo pipefail
 cd "$(dirname "$0")"
+source scripts/lib/rime-user-state.sh
 
 CONFIG="${1:-release}"
-APP="ETInput.app"                   # ASCII bundle dir name (display name is Chinese via InfoPlist.strings)
+APP="ETInput.app"                   # Frozen compatibility path; display name is RIMES.
 EXE="ETInput"
 STAGE=".build/stage"                # assemble here, not in the repo root
 APP_PATH="$STAGE/$APP"
@@ -49,22 +51,24 @@ done
 
 # Its OWN Rime user dir (never fights Squirrel over the userdb LevelDB lock).
 # IMPORT: if you have a live ~/Library/Rime (Squirrel), carry your real config
-# in — your schemes, learned userdb, custom_phrase, lua, dicts — so ETInput uses
-# your actual setup. We then force ETInput's product schema list (并击、自然码双拼、
+# in — your schemes, learned userdb, custom_phrase, lua, dicts — so RIMES uses
+# your actual setup. We then force RIMES's product schema list (并击、自然码双拼、
 # 雾凇拼音、英文) + 9 candidates; everything else you have is preserved. With no ~/Library/Rime, the
 # app deploys from the bundled schemas instead. RB_KEEP_USERDB=1 skips reseeding.
 RB_USER="$HOME/Library/RimeBuffer"
+if [ -L "$RB_USER" ]; then
+    echo "!! refusing to update symlinked RimeBuffer user directory: $RB_USER"
+    exit 1
+fi
 if [ "${RB_KEEP_USERDB:-0}" != "1" ]; then
     if [ -d "$HOME/Library/Rime" ]; then
         echo "==> importing your ~/Library/Rime into $RB_USER (schemes, userdb, custom_phrase, lua…)"
-        rm -rf "$RB_USER"; mkdir -p "$RB_USER"
-        rsync -a --exclude 'sync' --exclude 'build' --exclude '*.log' \
-              --exclude 'installation.yaml' "$HOME/Library/Rime/" "$RB_USER/"
+        import_rime_user_dir_preserving_product_state "$HOME/Library/Rime" "$RB_USER"
     else
         echo "==> no ~/Library/Rime; deploying from the bundled schemas"
-        rm -rf "$RB_USER"; mkdir -p "$RB_USER"
+        reset_rime_user_dir_preserving_product_state "$RB_USER"
     fi
-    # Enforce ETInput's four product schemas + 9 candidates. Your learned
+    # Enforce RIMES's four product schemas + 9 candidates. Your learned
     # userdb and unrelated tweaks are kept.
     cp rime-data/default.custom.yaml "$RB_USER/default.custom.yaml"
 fi
@@ -115,7 +119,7 @@ if [ -f "Logo/AppIcon.icns" ]; then
     cp "Logo/AppIcon.icns" "$APP_PATH/Contents/Resources/AppIcon.icns"
 fi
 
-# Localized input-source display name (Enter输入法) + the input-mode menu icon.
+# Localized input-source display name (RIMES) + the input-mode menu icon.
 # Without the .lproj the source shows its raw id; without the icon it renders as
 # a blank row and won't enable.
 cp -R Resources/*.lproj "$APP_PATH/Contents/Resources/" 2>/dev/null || true
@@ -129,7 +133,7 @@ codesign --force --deep --sign - "$APP_PATH"
 
 echo "==> handing active clients to a safe fallback input source"
 if ! /bin/launchctl asuser "$(id -u)" "$APP_PATH/Contents/MacOS/$EXE" --prepare-update; then
-    echo "!! could not leave the active ETInput source safely; refusing a hot replacement"
+    echo "!! could not leave the active RIMES source safely; refusing a hot replacement"
     exit 1
 fi
 sleep 0.5
@@ -163,7 +167,7 @@ fi
 rm -rf "$STAGE/$APP"                 # don't leave a staging copy lying around
 
 restore_previous_install() {
-    echo "!! restoring the previous ETInput installation"
+    echo "!! restoring the previous RIMES installation"
     pkill -x "$EXE" 2>/dev/null || true
     "$LSREGISTER" -u "$DEST" 2>/dev/null || true
     rm -rf "$DEST"
@@ -211,9 +215,9 @@ rm -rf "$DEST_BACKUP"
 
 cat <<EOF
 
-==> done. Installed a single ASCII-named bundle and self-enabled it.
+==> done. Installed and self-enabled RIMES using its single compatibility bundle.
 
-If Enter输入法 doesn't appear in the input menu (⌃Space) immediately, run:
+If RIMES doesn't appear in the input menu (⌃Space) immediately, run:
   killall TextInputMenuAgent SystemUIServer
 (or log out / back in once). Then switch to it and press F4 to choose an input scheme.
 

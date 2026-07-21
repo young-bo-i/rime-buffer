@@ -49,7 +49,7 @@ enum UpdateStatus: Equatable {
     }
 }
 
-/// Pulls Enter输入法 (ETInput) releases from GitHub and installs them in place.
+/// Pulls RIMES releases from GitHub while preserving the legacy ETInput update path.
 ///
 /// Design mirrors Toolbit's UpdateManager (silent check → silent download →
 /// notify → user-confirmed install), but:
@@ -260,7 +260,7 @@ final class UpdateManager {
     func promptAndInstall() {
         guard case let .readyToInstall(version, zip) = status else { return }
         let alert = NSAlert()
-        alert.messageText = "更新到 Enter输入法 v\(version)？"
+        alert.messageText = "更新到 \(ProductIdentity.displayName) v\(version)？"
         alert.informativeText = "输入法进程会关闭并以新版本重启。若正在输入，请先完成再更新。"
         alert.addButton(withTitle: "立即更新")
         alert.addButton(withTitle: "稍后")
@@ -285,7 +285,7 @@ final class UpdateManager {
 
             let contents = try fm.contentsOfDirectory(at: extractDir, includingPropertiesForKeys: nil)
             guard let newApp = contents.first(where: { $0.pathExtension == "app" }) else {
-                setStatus(.error("解压后未找到 ETInput.app")); return
+                setStatus(.error("解压后未找到 \(ProductIdentity.displayName) 更新应用")); return
             }
             runTool("/usr/bin/xattr", ["-cr", newApp.path])
 

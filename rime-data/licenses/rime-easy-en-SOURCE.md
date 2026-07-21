@@ -5,6 +5,6 @@
 - Imported asset: `easy_en.dict.yaml`
 - License: GNU Lesser General Public License v3.0; see `rime-easy-en-LICENSE`.
 
-The upstream Lua/wordninja enhancement is intentionally not bundled. Enter输入法
+The upstream Lua/wordninja enhancement is intentionally not bundled. RIMES
 uses the dictionary through its own `english.schema.yaml` and existing
 `lua/en_spacer.lua` filter.

@@ -232,7 +232,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 980, height: 680),
                            styleMask: [.titled, .closable, .resizable],
                            backing: .buffered, defer: false)
-        win.title = "Enter输入法 设置"
+        win.title = "\(ProductIdentity.displayName) 设置"
         win.isReleasedWhenClosed = false
         win.delegate = self
         win.minSize = NSSize(width: 860, height: 600)
@@ -1149,7 +1149,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         let codexDetail: String
         switch codexAvailability {
         case .ready:
-            codexDetail = "使用 RimeBuffer 专用的 ChatGPT 登录；不会读取 ~/.codex 中的 MCP、工具、Hook 或技能。"
+            codexDetail = "使用 \(ProductIdentity.displayName) 专用的 ChatGPT 登录；不会读取 ~/.codex 中的 MCP、工具、Hook 或技能。"
         case let .unavailable(message):
             codexDetail = message
         }
@@ -1198,7 +1198,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         actions.spacing = 8
 
         let privacy = NSTextField(wrappingLabelWithString:
-            "Codex CLI 与 Claude Code CLI 在本机启动，但并不代表本地推理：点击生成后，缓冲区全文会通过所选 CLI 的授权状态发送。RimeBuffer 不会把环境中的 API Key 透传给这两个 CLI。通用 Open API（OpenAI 兼容）连接器只会在你点击生成时把全文发送到这里配置的端点。")
+            "Codex CLI 与 Claude Code CLI 在本机启动，但并不代表本地推理：点击生成后，缓冲区全文会通过所选 CLI 的授权状态发送。\(ProductIdentity.displayName) 不会把环境中的 API Key 透传给这两个 CLI。通用 Open API（OpenAI 兼容）连接器只会在你点击生成时把全文发送到这里配置的端点。")
         privacy.font = .systemFont(ofSize: 11)
         privacy.textColor = .tertiaryLabelColor
 
@@ -1311,7 +1311,6 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
             )
             try OpenAICompatibleConfigurationStore.shared.save(configuration)
             refreshAIModelConfiguration(statusMessage: "通用 Open API 配置已保存")
-            AITextPluginRuntimeRegistry.shared.workspace.configurationDidChange()
         } catch let error as AITextProviderError {
             refreshAIModelConfiguration(statusMessage: error.userFacingMessage,
                                         isError: true)
@@ -1331,7 +1330,6 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
             configuration.apiKey = ""
             try OpenAICompatibleConfigurationStore.shared.save(configuration)
             refreshAIModelConfiguration(statusMessage: "已清除本地 API Key")
-            AITextPluginRuntimeRegistry.shared.workspace.configurationDidChange()
         } catch {
             refreshAIModelConfiguration(statusMessage: "清除失败，请检查本地目录权限",
                                         isError: true)
@@ -1525,7 +1523,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         installNote.textColor = .tertiaryLabelColor
 
         if subpageID == "logs-data" {
-            let openConfigBtn = NSButton(title: "打开 RimeBuffer 数据目录",
+            let openConfigBtn = NSButton(title: "打开 \(ProductIdentity.displayName) 数据目录",
                                          target: self,
                                          action: #selector(openDir))
             let dataNote = NSTextField(wrappingLabelWithString:
@@ -1757,7 +1755,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
                 ? .systemRed
                 : .secondaryLabelColor
         } else if ready {
-            codexLoginStatusLabel.stringValue = "ChatGPT 订阅登录已保存在 RimeBuffer 专用目录中。"
+            codexLoginStatusLabel.stringValue = "ChatGPT 订阅登录已保存在 \(ProductIdentity.displayName) 专用目录中。"
             codexLoginStatusLabel.textColor = .systemGreen
         } else {
             codexLoginStatusLabel.stringValue = "登录仅供输入法连接器使用，不会读取或修改 ~/.codex。"
@@ -1804,7 +1802,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
             claudeLoginStatusLabel.stringValue = "Claude Code CLI 授权已就绪。"
             claudeLoginStatusLabel.textColor = .systemGreen
         } else {
-            claudeLoginStatusLabel.stringValue = "登录由本机 Claude Code CLI 管理；RimeBuffer 不读取或展示凭据。"
+            claudeLoginStatusLabel.stringValue = "登录由本机 Claude Code CLI 管理；\(ProductIdentity.displayName) 不读取或展示凭据。"
             claudeLoginStatusLabel.textColor = .tertiaryLabelColor
         }
     }
@@ -2474,7 +2472,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         }
 
         let alert = NSAlert()
-        alert.messageText = "重新安装 Enter输入法？"
+        alert.messageText = "重新安装 \(ProductIdentity.displayName)？"
         alert.informativeText = "将从 \(script.deletingLastPathComponent().path) 运行 build_install.sh。构建完成后当前输入法进程会被重启。"
         alert.addButton(withTitle: "重新安装")
         alert.addButton(withTitle: "取消")
@@ -2682,7 +2680,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         let kind = sender.lexiconKind
         let panel = NSOpenPanel()
         panel.title = "导入\(kind.displayName)"
-        panel.message = "选择由 ETInput 或 Rime 用户词典管理器导出的 TSV；记录会合并，不会替换现有学习数据。"
+        panel.message = "选择由 \(ProductIdentity.displayName) 或 Rime 用户词典管理器导出的 TSV；记录会合并，不会替换现有学习数据。"
         panel.prompt = "选择并导入"
         panel.canChooseDirectories = false
         panel.canChooseFiles = true

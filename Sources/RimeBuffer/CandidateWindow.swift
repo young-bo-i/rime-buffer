@@ -322,9 +322,10 @@ final class CandidateWindow {
     /// Page offset of the top rendered row: the three-row viewport slides over
     /// `expandedPages` so the whole candidate list stays reachable.
     private var expandedWindowBase = 0
-    /// Candidate index of the leftmost rendered column. Slides the same way when
-    /// a page holds more candidates than the panel can show at once.
-    private var expandedColumnBase = 0
+    /// Candidate index of the leftmost rendered item in each Rime page. Every
+    /// matrix row owns its own horizontal viewport: a long candidate in one row
+    /// must neither stretch nor scroll any other row.
+    private var expandedColumnBases: [Int: Int] = [:]
     private var expandedSelectionPageOffset = 0
     private var characterSelectionText = ""
     private var characterSelectionIndex = 0
@@ -671,7 +672,7 @@ final class CandidateWindow {
         guard !usablePages.isEmpty else { return false }
         expandedPages = usablePages
         expandedSelectionPageOffset = min(expandedSelectionPageOffset, expandedPages.count - 1)
-        expandedColumnBase = 0
+        expandedColumnBases.removeAll()
         scrollExpandedWindowToSelection()
         guard expandedCandidateCount(pageOffset: expandedSelectionPageOffset) > 0 else {
             IMELog.write("candidate matrix skipped; selected row has no candidates")
@@ -727,12 +728,6 @@ final class CandidateWindow {
         return base..<min(base + Self.expandedMaxRows, expandedPages.count)
     }
 
-    private func expandedWindowPages() -> [RimeContextModel] {
-        let range = expandedWindowRange()
-        guard !range.isEmpty else { return [] }
-        return Array(expandedPages[range])
-    }
-
     @discardableResult
     func collapseExpanded() -> Bool {
         guard isExpanded else { return false }
@@ -765,7 +760,7 @@ final class CandidateWindow {
     private func resetExpandedState() {
         expandedPages.removeAll()
         expandedWindowBase = 0
-        expandedColumnBase = 0
+        expandedColumnBases.removeAll()
         expandedSelectionPageOffset = 0
     }
 
@@ -970,24 +965,23 @@ final class CandidateWindow {
         // Rows carry their absolute page offset: button tags encode it, and
         // selection replays it as page-downs from the anchor.
         let baseOffset = expandedPages.isEmpty ? 0 : windowRange.lowerBound
-        let naturalWidths = expandedMatrixNaturalWidths(pages: pages)
-        let columnBase = min(max(0, expandedColumnBase), max(0, naturalWidths.count - 1))
-        let columnCount = naturalWidths.isEmpty ? 0 : Self.fittedColumnCount(
-            widths: naturalWidths,
-            separator: separatorRunWidth(),
-            available: available,
-            base: columnBase
-        )
 
         for (rowIndex, page) in pages.enumerated() {
             let pageOffset = baseOffset + rowIndex
             let isActiveRow = pageOffset == expandedSelectionPageOffset
+            let naturalWidths = expandedRowNaturalWidths(page: page)
+            let columnRange = Self.fittedColumnRange(
+                widths: naturalWidths,
+                separator: separatorRunWidth(),
+                available: available,
+                base: expandedColumnBases[pageOffset] ?? 0
+            )
             // Candidates carry their absolute index within the page, so tags and
-            // number labels stay correct after the column viewport scrolls.
+            // number labels stay correct after this row's viewport scrolls.
             let renderedCandidates = Array(
                 page.candidates.enumerated()
-                    .dropFirst(columnBase)
-                    .prefix(columnCount)
+                    .dropFirst(columnRange.lowerBound)
+                    .prefix(columnRange.count)
             )
             let row = NSStackView()
             row.orientation = .horizontal
@@ -1018,26 +1012,17 @@ final class CandidateWindow {
         }
     }
 
-    /// Every matrix row shares the same width for a given column. Width
-    /// measurement reserves the number label and selected font weight for all
-    /// rows, although only the active row renders labels, so neither horizontal
-    /// nor vertical navigation reflows the grid. Index == candidate index
-    /// within a page; this covers ALL columns, fitting happens separately.
-    private func expandedMatrixNaturalWidths(pages: [RimeContextModel]) -> [CGFloat] {
-        let columnCount = pages.map { $0.candidates.count }.max() ?? 0
-        guard columnCount > 0 else { return [] }
-
-        var naturalWidths = Array(repeating: CGFloat(0), count: columnCount)
-        for page in pages {
-            for (index, candidate) in page.candidates.enumerated() {
-                let width = ceil(measuredCandidateWidth(candidate,
-                                                        highlighted: true,
-                                                        compact: true,
-                                                        showsLabel: true))
-                naturalWidths[index] = max(naturalWidths[index], width)
-            }
+    /// Each row measures only its own candidates. We still reserve the number
+    /// label and selected font weight even while the row is inactive, so moving
+    /// the active-row highlight does not reflow that row. No width is shared
+    /// across rows.
+    private func expandedRowNaturalWidths(page: RimeContextModel) -> [CGFloat] {
+        page.candidates.map { candidate in
+            ceil(measuredCandidateWidth(candidate,
+                                        highlighted: true,
+                                        compact: true,
+                                        showsLabel: true))
         }
-        return naturalWidths
     }
 
     /// How many whole columns fit starting at `base`. Pure for `matrix-smoke`.
@@ -1058,6 +1043,19 @@ final class CandidateWindow {
         return max(count, 1)
     }
 
+    /// The independently fitted candidate range for one matrix row. Keeping
+    /// this pure lets `matrix-smoke` pin row isolation without a window server.
+    static func fittedColumnRange(widths: [CGFloat], separator: CGFloat,
+                                  available: CGFloat, base: Int) -> Range<Int> {
+        guard !widths.isEmpty else { return 0..<0 }
+        let resolvedBase = min(max(0, base), widths.count - 1)
+        let count = fittedColumnCount(widths: widths,
+                                      separator: separator,
+                                      available: available,
+                                      base: resolvedBase)
+        return resolvedBase..<min(resolvedBase + count, widths.count)
+    }
+
     /// Slide the column viewport so `selection` stays visible. Pure for the
     /// smoke: the result always yields a window containing `selection`.
     static func columnBase(selection: Int, currentBase: Int, widths: [CGFloat],
@@ -1074,19 +1072,22 @@ final class CandidateWindow {
         return base
     }
 
-    /// Candidate indices rendered in every row: [columnBase, columnBase+fitted).
-    /// Measured across the rendered row window so the grid stays aligned.
+    /// Candidate indices rendered in the active row. Number keys and horizontal
+    /// navigation belong to that row; inactive rows keep independent widths and
+    /// viewport bases.
     private func expandedColumnRange() -> Range<Int> {
-        let widths = expandedMatrixNaturalWidths(pages: expandedWindowPages())
-        guard !widths.isEmpty else { return 0..<0 }
-        let base = min(max(0, expandedColumnBase), widths.count - 1)
-        let count = Self.fittedColumnCount(
+        guard expandedPages.indices.contains(expandedSelectionPageOffset) else {
+            return 0..<0
+        }
+        let widths = expandedRowNaturalWidths(
+            page: expandedPages[expandedSelectionPageOffset]
+        )
+        return Self.fittedColumnRange(
             widths: widths,
             separator: separatorRunWidth(),
             available: candidateAvailableWidth(panelWidth: activePanelWidth()),
-            base: base
+            base: expandedColumnBases[expandedSelectionPageOffset] ?? 0
         )
-        return base..<min(base + count, widths.count)
     }
 
     /// Selection is bounded by the page's real candidate count, not by what
@@ -1097,11 +1098,16 @@ final class CandidateWindow {
     }
 
     private func scrollExpandedColumnsToSelection() {
-        let widths = expandedMatrixNaturalWidths(pages: expandedWindowPages())
+        guard expandedPages.indices.contains(expandedSelectionPageOffset) else {
+            return
+        }
+        let widths = expandedRowNaturalWidths(
+            page: expandedPages[expandedSelectionPageOffset]
+        )
         guard !widths.isEmpty else { return }
-        expandedColumnBase = Self.columnBase(
+        expandedColumnBases[expandedSelectionPageOffset] = Self.columnBase(
             selection: selectedIndex,
-            currentBase: expandedColumnBase,
+            currentBase: expandedColumnBases[expandedSelectionPageOffset] ?? 0,
             widths: widths,
             separator: separatorRunWidth(),
             available: candidateAvailableWidth(panelWidth: activePanelWidth())

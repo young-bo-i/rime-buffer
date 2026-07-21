@@ -1,9 +1,9 @@
 #!/bin/bash
 # =============================================================================
-# Enter输入法 (ETInput) 发布脚本
+# RIMES 发布脚本
 #
 # 打一个 v 开头的 tag 并推到 GitHub（origin），触发 .github/workflows/release.yml
-# 构建 → 打包 → 创建 Release。已安装的 Enter输入法 会自动检测到这个 Release 并提示更新。
+# 构建 → 打包 → 创建 Release。已安装的 RIMES 会自动检测到这个 Release 并提示更新。
 #
 # 用法：
 #   ./scripts/release.sh          # patch +1 (0.1.0 -> 0.1.1)

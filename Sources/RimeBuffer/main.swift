@@ -4,6 +4,23 @@ import Network
 import CryptoKit
 import Carbon
 
+// Safe maintenance seam used by installers and support diagnostics. Loading
+// applies narrowly scoped, atomic configuration migrations without printing
+// Base URLs, model names, or API keys.
+if CommandLine.arguments.contains("openai-config-migrate") {
+    do {
+        guard try OpenAICompatibleConfigurationStore.shared.load() != nil else {
+            print("OpenAI-compatible configuration is not set")
+            exit(2)
+        }
+        print("OpenAI-compatible configuration is ready")
+        exit(0)
+    } catch {
+        print("OpenAI-compatible configuration is invalid")
+        exit(1)
+    }
+}
+
 // `swift run RimeBuffer smoke` validates the engine end-to-end without IMK.
 if CommandLine.arguments.contains("stats-smoke") {
     exit(runStatsSmokeTest() ? 0 : 1)
@@ -34,6 +51,9 @@ if CommandLine.arguments.contains("translation-smoke") {
 }
 if CommandLine.arguments.contains("ai-text-smoke") {
     exit(runAITextPluginSmokeTest() ? 0 : 1)
+}
+if CommandLine.arguments.contains("stream-input-smoke") {
+    exit(runStreamInputPluginSmokeTest() ? 0 : 1)
 }
 if CommandLine.arguments.contains("settings-routing-smoke") {
     exit(runSettingsRoutingSmokeTest() ? 0 : 1)
@@ -138,7 +158,8 @@ if let i = CommandLine.arguments.firstIndex(of: "settings-render"),
         : "failed to render one or more settings routes")
     exit(rendered ? 0 : 1)
 }
-// Dev-only: `ETInput panel-render <path>` renders the actual compact workbench.
+// Dev-only: `ETInput panel-render <path> [expanded] [translation]
+// [hover=<control>]` renders the actual compact workbench.
 if let i = CommandLine.arguments.firstIndex(of: "panel-render"),
    i + 1 < CommandLine.arguments.count {
     let app = NSApplication.shared
@@ -155,6 +176,10 @@ if let i = CommandLine.arguments.firstIndex(of: "panel-render"),
     let translation = options.contains("translation")
     let scaleValue = options.first { Double($0) != nil }.flatMap { Double($0) }
     let scale = CGFloat(scaleValue ?? 2)
+    let hoveredControl = options.compactMap { option -> BufferWorkbenchControl? in
+        guard option.hasPrefix("hover=") else { return nil }
+        return BufferWorkbenchControl(rawValue: String(option.dropFirst("hover=".count)))
+    }.first
     let translationSnapshot = translation ? TranslationRailSnapshot(
         sourceText: "今天终于把翻译缓冲区分成上下两个区域了。",
         outputBlocks: [
@@ -169,7 +194,8 @@ if let i = CommandLine.arguments.firstIndex(of: "panel-render"),
         to: CommandLine.arguments[i + 1],
         expanded: expanded,
         scale: scale,
-        translationSnapshot: translationSnapshot
+        translationSnapshot: translationSnapshot,
+        hoveredControl: hoveredControl
     )
     print(rendered
         ? "rendered \(translation ? "translation " : "")\(expanded ? "expanded" : "collapsed") workbench @\(scale)x"
@@ -207,11 +233,33 @@ let bufferPluginSelectionObserver = NotificationCenter.default.addObserver(
     forName: .activeBufferPluginDidChange,
     object: BufferPluginSelectionStore.shared,
     queue: .main
-) { _ in
+) { notification in
+    if notification.userInfo?["current"] as? PluginKey
+        == StreamInputWorkspace.pluginKey {
+        // Stream input has one product-level input profile. Persist and apply
+        // it in this same selection callback so there is no interval where the
+        // plugin is visible while an old schema can still receive raw letters.
+        _ = InputConfigurationStore.shared.set(
+            StreamInputCaptureRules.requiredConfiguration
+        )
+        RimeBufferController.applyStoredInputConfiguration()
+
+        if BufferModel.shared.enabled,
+           let target = InputFocusCoordinator.shared.liveTarget(
+            forceOverlayVisibilityRefresh: true
+           ) {
+            // A pre-existing Rime composition belongs to the old workspace.
+            // Settle it before the first stream key can be captured; the two
+            // source models must never coexist as one invisible composition.
+            target.controller?.resolveCompositionForWorkbenchTransition(
+                target: target
+            )
+        }
+    }
     ActionPluginHost.shared.bufferPluginSelectionDidChange()
     BufferWindowController.shared.refresh()
 }
-IMELog.reset("=== Enter输入法 (ETInput) IME launch ===")
+IMELog.reset("=== \(ProductIdentity.displayName) IME launch ===")
 let connectionName = (Bundle.main.infoDictionary?["InputMethodConnectionName"] as? String)
     ?? "RimeBuffer_1_Connection"
 
@@ -260,11 +308,13 @@ BufferModel.shared.onChange = {
 }
 InputFocusCoordinator.shared.onChange = {
     ActionPluginHost.shared.focusDidChange()
+    StreamInputWorkspace.shared.focusDidChange()
     BufferWindowController.shared.refresh()
 }
 InputFocusCoordinator.shared.onInvalidated = { owner in
     candidateWindow.hide(owner: owner)
     ActionPluginHost.shared.focusInvalidated(owner)
+    StreamInputWorkspace.shared.focusInvalidated(owner)
 }
 ActionPluginHost.shared.onChange = {
     BufferWindowController.shared.refresh()
@@ -495,7 +545,7 @@ func selectFallbackInputSourceForUpdate() -> Bool {
         }
     }
 
-    print("prepare-update: could not select a non-ETInput ASCII fallback")
+    print("prepare-update: could not select a non-\(ProductIdentity.displayName) ASCII fallback")
     return false
 }
 
@@ -605,7 +655,7 @@ func installInputSource() -> Bool {
 
 func runEngineSmokeTest() -> Bool {
     let engine = RimeEngine()
-    print("== RimeBuffer engine smoke test ==")
+    print("== \(ProductIdentity.displayName) engine smoke test ==")
     let ok = engine.start()
     print("start:", ok, "healthy:", engine.isHealthy)
     guard ok, engine.isHealthy else {
@@ -969,6 +1019,7 @@ func runEngineSmokeTest() -> Bool {
     guard candidatePagingProbe.allPressesHandled,
           candidatePagingProbe.context.input == "ni'hao",
           candidatePagingProbe.context.candidates.map(\.text).contains("你好"),
+          !candidatePages.texts.contains(candidatePagingProbe.context.input),
           !candidatePagingProbe.context.isLastPage,
           candidatePages.pagingWorked,
           candidatePages.contexts.count > 1,
@@ -1142,7 +1193,7 @@ func runEngineSmokeTest() -> Bool {
 }
 
 func runSchemaListStoreSmokeTest() -> Bool {
-    print("== RimeBuffer schema-list store smoke test ==")
+    print("== \(ProductIdentity.displayName) schema-list store smoke test ==")
     let root = URL(fileURLWithPath: NSTemporaryDirectory())
         .appendingPathComponent("rimebuffer-schema-list-\(UUID().uuidString)")
     let config = root.appendingPathComponent("default.custom.yaml")
@@ -1465,7 +1516,7 @@ func runSchemaListStoreSmokeTest() -> Bool {
 }
 
 func runStatsSmokeTest() -> Bool {
-    print("== RimeBuffer key-frequency smoke test ==")
+    print("== \(ProductIdentity.displayName) key-frequency smoke test ==")
     let root = URL(fileURLWithPath: NSTemporaryDirectory())
         .appendingPathComponent("rimebuffer-key-frequency-\(UUID().uuidString)")
     defer { try? FileManager.default.removeItem(at: root) }
@@ -1523,7 +1574,7 @@ func runStatsSmokeTest() -> Bool {
 /// always keep the selected row on screen — a wrong base here would render one
 /// row while selecting a different page's candidate.
 func runCandidateMatrixSmokeTest() -> Bool {
-    print("== RimeBuffer candidate matrix smoke test ==")
+    print("== \(ProductIdentity.displayName) candidate matrix smoke test ==")
     let maxRows = CandidateWindow.expandedMaxRows
     guard maxRows == 3 else {
         print("FAILED: expected a three-row viewport, got \(maxRows)")
@@ -1653,6 +1704,28 @@ func runCandidateMatrixSmokeTest() -> Bool {
         return false
     }
 
+    // Every matrix row lays itself out independently. A long phrase in the
+    // first row must neither widen cells nor reduce the visible count below it.
+    let longRow = [CGFloat(250), 40, 40, 40, 40, 40]
+    let shortRow = Array(repeating: CGFloat(40), count: 6)
+    let longRange = CandidateWindow.fittedColumnRange(
+        widths: longRow, separator: 8, available: 320, base: 0
+    )
+    let shortRange = CandidateWindow.fittedColumnRange(
+        widths: shortRow, separator: 8, available: 320, base: 0
+    )
+    guard longRange == 0..<2, shortRange == 0..<6 else {
+        print("FAILED: matrix rows did not fit independently", longRange, shortRange)
+        return false
+    }
+    let scrolledShortRange = CandidateWindow.fittedColumnRange(
+        widths: shortRow, separator: 8, available: 120, base: 3
+    )
+    guard scrolledShortRange == 3..<5 else {
+        print("FAILED: per-row viewport base was not preserved", scrolledShortRange)
+        return false
+    }
+
     print("candidate matrix smoke OK")
     return true
 }
@@ -1667,7 +1740,7 @@ func runCandidateMatrixSmokeTest() -> Bool {
 /// accept moves an item into the buffer carrying its origin. A wrong verdict
 /// here would let unverified external text reach the buffer without review.
 func runInboundBusSmokeTest() -> Bool {
-    print("== RimeBuffer inbound bus smoke test ==")
+    print("== \(ProductIdentity.displayName) inbound bus smoke test ==")
 
     // DNS-rebinding defence: command-line clients omit Origin, while browser
     // origins must parse to an exact loopback host (prefix lookalikes are not local).
@@ -2680,7 +2753,7 @@ private func runContextOnlyPreparedActionSmokeTest() -> Bool {
 }
 
 func runActionPluginSmokeTest() -> Bool {
-    print("== RimeBuffer action plugin smoke test ==")
+    print("== \(ProductIdentity.displayName) action plugin smoke test ==")
     guard runActionPluginManagerSmokeTest() else { return false }
     guard runActionPluginStreamSmokeTest() else { return false }
     guard runContextualActionPresentationSmokeTest() else { return false }
@@ -3545,7 +3618,7 @@ func runActionPluginSmokeTest() -> Bool {
 }
 
 func runOriginSmokeTest() -> Bool {
-    print("== RimeBuffer origin/echo smoke test ==")
+    print("== \(ProductIdentity.displayName) origin/echo smoke test ==")
 
     // Only remote-peer origins are barred from mirroring; every other source
     // (local typing, agent drafts, network inbound) mirrors as before.
@@ -3588,7 +3661,7 @@ func runOriginSmokeTest() -> Bool {
 }
 
 func runBufferSmokeTest() -> Bool {
-    print("== RimeBuffer buffer smoke test ==")
+    print("== \(ProductIdentity.displayName) buffer smoke test ==")
     guard RimeKey.fromVirtualKeyCode(22) == 0x36,
           RimeKey.fromVirtualKeyCode(27) == 0x2d,
           RimeBufferController.shouldConsumeCodexBufferControlText(
@@ -3721,8 +3794,102 @@ func runBufferSmokeTest() -> Bool {
     return true
 }
 
+private func runWorkbenchShelfAlignmentProbe() -> Bool {
+    let host = NSView(frame: NSRect(x: 0, y: 0, width: 760, height: 33))
+    let shelf = NSStackView()
+    shelf.translatesAutoresizingMaskIntoConstraints = false
+    host.addSubview(shelf)
+
+    let status = NSTextField(labelWithString: "可发送")
+    status.lineBreakMode = .byTruncatingTail
+    status.setContentHuggingPriority(.defaultLow, for: .horizontal)
+    status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+    let selector = NSView()
+    selector.translatesAutoresizingMaskIntoConstraints = false
+    let selectorWidth = selector.widthAnchor.constraint(equalToConstant: 64)
+    selectorWidth.isActive = true
+    selector.heightAnchor.constraint(equalToConstant: 18).isActive = true
+
+    let spinner = NSView()
+    spinner.translatesAutoresizingMaskIntoConstraints = false
+    spinner.widthAnchor.constraint(equalToConstant: 12).isActive = true
+    spinner.heightAnchor.constraint(equalToConstant: 12).isActive = true
+    spinner.isHidden = true
+
+    let actionRow = NSStackView()
+    actionRow.orientation = .horizontal
+    actionRow.spacing = 2
+    actionRow.detachesHiddenViews = false
+    actionRow.setContentHuggingPriority(.required, for: .horizontal)
+    actionRow.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+    let pluginActions = NSStackView(views: [selector, spinner, actionRow])
+    pluginActions.orientation = .horizontal
+    pluginActions.alignment = .centerY
+    pluginActions.distribution = .fill
+    pluginActions.spacing = 4
+    pluginActions.edgeInsets = NSEdgeInsets(top: 1, left: 5, bottom: 1, right: 3)
+    pluginActions.detachesHiddenViews = false
+    pluginActions.setContentHuggingPriority(.required, for: .horizontal)
+    pluginActions.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+
+    let flexibleSpace = NSView()
+    let refresh = NSView()
+    let close = NSView()
+    for control in [refresh, close] {
+        control.translatesAutoresizingMaskIntoConstraints = false
+        control.widthAnchor.constraint(equalToConstant: 22).isActive = true
+        control.heightAnchor.constraint(equalToConstant: 22).isActive = true
+    }
+    BufferWorkbenchShelfLayout.configure(
+        shelf,
+        status: status,
+        pluginActions: pluginActions,
+        flexibleSpace: flexibleSpace,
+        refresh: refresh,
+        close: close
+    )
+    NSLayoutConstraint.activate([
+        shelf.leadingAnchor.constraint(equalTo: host.leadingAnchor),
+        shelf.trailingAnchor.constraint(equalTo: host.trailingAnchor),
+        shelf.topAnchor.constraint(equalTo: host.topAnchor),
+        shelf.bottomAnchor.constraint(equalTo: host.bottomAnchor),
+    ])
+
+    func positions() -> (selector: CGFloat, refresh: CGFloat, close: CGFloat) {
+        host.layoutSubtreeIfNeeded()
+        return (
+            selector.convert(selector.bounds, to: host).minX,
+            refresh.convert(refresh.bounds, to: host).minX,
+            close.convert(close.bounds, to: host).minX
+        )
+    }
+    let baseline = positions()
+
+    status.stringValue = "可生成 · 发送前点选输入框"
+    selectorWidth.constant = 108
+    spinner.isHidden = false
+    let action = NSView()
+    action.translatesAutoresizingMaskIntoConstraints = false
+    action.widthAnchor.constraint(equalToConstant: 80).isActive = true
+    action.heightAnchor.constraint(equalToConstant: 18).isActive = true
+    actionRow.addArrangedSubview(action)
+    let dynamic = positions()
+
+    let epsilon: CGFloat = 0.5
+    let stable = abs(baseline.selector - dynamic.selector) <= epsilon
+        && abs(baseline.refresh - dynamic.refresh) <= epsilon
+        && abs(baseline.close - dynamic.close) <= epsilon
+    if !stable {
+        print("FAILED: workbench shelf alignment moved",
+              "baseline=\(baseline)", "dynamic=\(dynamic)")
+    }
+    return stable
+}
+
 func runBufferWindowSmokeTest() -> Bool {
-    print("== RimeBuffer buffer window smoke test ==")
+    print("== \(ProductIdentity.displayName) buffer window smoke test ==")
 
     let workbenchHotKeyID = WorkbenchGlobalHotKeyRouting.identifier
     let unrelatedHotKeyID = EventHotKeyID(
@@ -3780,10 +3947,45 @@ func runBufferWindowSmokeTest() -> Bool {
           BufferWorkbenchLayout.expandedShelf
             == [.status, .pluginActions, .refresh, .close],
           BufferWorkbenchLayout.dragControls == [.dragHandle],
+          BufferWorkbenchLayout.hoverControls
+            == [.dragHandle, .disclosure, .send, .pluginActions, .refresh, .close],
+          BufferWorkbenchLayout.passiveControls == [.bufferRail, .status],
           BufferWorkbenchLayout.dragCursor == .pointingHand,
+          BufferWorkbenchPointerRules.state(
+            enabled: true, hovered: false, pressed: false
+          ) == .idle,
+          BufferWorkbenchPointerRules.state(
+            enabled: true, hovered: true, pressed: false
+          ) == .hovered,
+          BufferWorkbenchPointerRules.state(
+            enabled: true, hovered: true, pressed: true
+          ) == .pressed,
+          BufferWorkbenchPointerRules.state(
+            enabled: false, hovered: true, pressed: true
+          ) == .disabled,
+          BufferWorkbenchPointerRules.cursor(enabled: true) == .pointingHand,
+          BufferWorkbenchPointerRules.cursor(enabled: false) == .arrow,
           BufferWorkbenchMetrics.controlSize == 22,
+          ProductIdentity.displayName == "RIMES",
           BufferWorkbenchMetrics.mainSpacing == 3,
           BufferWorkbenchMetrics.shelfSpacing == 4,
+          BufferWorkbenchMetrics.shelfStatusWidth == 88,
+          BufferWorkbenchShelfLayout.flexiblePriority.rawValue == 1,
+          BufferWorkbenchShelfLayout.statusWidthPriority.rawValue == 749,
+          runWorkbenchShelfAlignmentProbe(),
+          BufferInlineMetrics.blockSpacing == 3,
+          BufferInlineMetrics.railHorizontalInset == 5,
+          BufferInlineMetrics.chipHorizontalInset == 4,
+          BufferInlineMetrics.chipVerticalInset == 1,
+          BufferInlineMetrics.chipHeight == 20,
+          BufferInlineMetrics.chipCornerRadius == 5,
+          BufferInlineMetrics.contentSpacing == 3,
+          BufferInlineMetrics.originBadgeSize == 5,
+          BufferInlineMetrics.messageHorizontalInset == 5,
+          BufferInlineMetrics.packedBlockChromeWidth(
+            blockCount: 3,
+            badgedBlockCount: 2
+          ) == 46,
           standardSourceOffset == 0,
           standardTargetOffset == 0,
           translationSourceOffset == -15.5,
@@ -4737,22 +4939,22 @@ func runBufferWindowSmokeTest() -> Bool {
     model.enabled = true
     model.append("shield-smoke")
     let rail = BufferInlineView()
-    _ = rail.refresh()
+    _ = rail.renderStandardForPreview()
     let renderedBeforeShield = !rail.isHidden && rail.renderedBlockCount == 1
     model.failTransientLoading(requestId: "visible-error",
                                message: "收信箱已满，插件结果未保存")
-    _ = rail.refresh()
+    _ = rail.renderStandardForPreview()
     let renderedErrorBesideContent = rail.renderedTextFragments.contains {
         $0.contains("收信箱已满")
     }
     model.finishTransientLoading(requestId: "visible-error")
-    _ = rail.refresh()
+    _ = rail.renderStandardForPreview()
     let stableRenderPass = rail.renderPassCount
-    let rebuiltUnchangedRail = rail.refresh()
+    let rebuiltUnchangedRail = rail.renderStandardForPreview()
     let skippedUnchangedRail = !rebuiltUnchangedRail && rail.renderPassCount == stableRenderPass
     rail.setEnterHoldProgress(0.6)
     let showedEnterHoldProgress = rail.isEnterHoldProgressVisible
-    _ = rail.refresh(shielded: true)
+    _ = rail.renderStandardForPreview(shielded: true)
     let scrubbedByShield = rail.isHidden
         && rail.renderedBlockCount == 0
         && !rail.isEnterHoldProgressVisible
@@ -4770,11 +4972,13 @@ func runBufferWindowSmokeTest() -> Bool {
     let sourcePreview = "上方原文缓冲"
     let targetPreviewA = "下方译文"
     let targetPreviewB = "第二块"
+    let targetPreviewAID = UUID()
+    let targetPreviewBID = UUID()
     let translationPreview = TranslationRailSnapshot(
         sourceText: sourcePreview,
         outputBlocks: [
-            TranslationOutputBlock(id: UUID(), text: targetPreviewA),
-            TranslationOutputBlock(id: UUID(), text: targetPreviewB),
+            TranslationOutputBlock(id: targetPreviewAID, text: targetPreviewA),
+            TranslationOutputBlock(id: targetPreviewBID, text: targetPreviewB),
         ],
         phase: .ready
     )
@@ -4784,6 +4988,33 @@ func runBufferWindowSmokeTest() -> Bool {
     let translationFragments = translationRail.renderedTextFragments
     let sourcePosition = translationFragments.firstIndex(of: sourcePreview)
     let targetPosition = translationFragments.firstIndex(of: targetPreviewA)
+    let stableTargetViews = translationRail.renderedTranslationTargetViewIdentities
+    let continuedPreview = TranslationRailSnapshot(
+        sourceText: "\(sourcePreview)续",
+        outputBlocks: [
+            TranslationOutputBlock(
+                id: targetPreviewAID,
+                text: "\(targetPreviewA)续",
+                ordinal: 1,
+                selected: true,
+                retainedTailStart: targetPreviewA.utf16.count
+            ),
+            TranslationOutputBlock(
+                id: targetPreviewBID,
+                text: targetPreviewB,
+                ordinal: 2
+            ),
+        ],
+        phase: .translating,
+        message: "继续全局猜测"
+    )
+    _ = translationRail.renderTranslationForPreview(continuedPreview)
+    let updatedTargetViews = translationRail.renderedTranslationTargetViewIdentities
+    let reusedTargetViews = stableTargetViews == updatedTargetViews
+        && stableTargetViews.count == 2
+        && translationRail.renderedTextFragments.contains(where: {
+            $0.contains("\(targetPreviewA)续")
+        })
     _ = translationRail.refresh(shielded: true)
     let translationShielded = !translationRail.renderedTextFragments.contains(sourcePreview)
         && !translationRail.renderedTextFragments.contains(targetPreviewA)
@@ -4793,6 +5024,7 @@ func runBufferWindowSmokeTest() -> Bool {
           targetPosition != nil,
           sourcePosition! < targetPosition!,
           !translationFragments.contains("→"),
+          reusedTargetViews,
           translationShielded else {
         print("FAILED: translation rail must render two stacked, independently shielded buffers")
         return false
@@ -4941,7 +5173,7 @@ func runBufferWindowSmokeTest() -> Bool {
 }
 
 func runMarineBridgeSmokeTest() -> Bool {
-    print("== ETInput Marine bridge smoke test ==")
+    print("== \(ProductIdentity.displayName) Marine bridge smoke test ==")
     let model = BufferModel.shared
     let oldEnabled = model.enabled
     let oldOnChange = model.onChange
@@ -4986,7 +5218,7 @@ func runMarineBridgeSmokeTest() -> Bool {
 // MARK: - Remote-typing transport smoke (crypto + framing + loopback socket)
 
 func runRemoteSmokeTest() -> Bool {
-    print("== ETInput remote-typing smoke test ==")
+    print("== \(ProductIdentity.displayName) remote-typing smoke test ==")
     print("identity fp:", RemoteIdentity.fingerprint)   // must be stable across launches (Keychain)
 
     // 1) ECDH session key: two identities derive the SAME key; and AES-GCM
@@ -5102,7 +5334,7 @@ func runRemoteSmokeTest() -> Bool {
 /// clipped or silently absorbed by the layout. A wrong verdict here means the
 /// settings sliders would offer sizes that cannot render faithfully.
 func runCandidateMetricsSmokeTest() -> Bool {
-    print("== RimeBuffer candidate metrics smoke test ==")
+    print("== \(ProductIdentity.displayName) candidate metrics smoke test ==")
     var ok = true
     func check(_ cond: Bool, _ msg: String) {
         if !cond { print("FAILED: \(msg)"); ok = false }
@@ -5178,7 +5410,7 @@ func runCandidateMetricsSmokeTest() -> Bool {
 /// Guards the fixed day palette against regressions to dynamic semantic colors
 /// or foregrounds that disappear on the small candidate/workbench typography.
 func runThemeSmokeTest() -> Bool {
-    print("== RimeBuffer theme contrast smoke test ==")
+    print("== \(ProductIdentity.displayName) theme contrast smoke test ==")
     var ok = true
     func check(_ condition: Bool, _ message: String) {
         if !condition {

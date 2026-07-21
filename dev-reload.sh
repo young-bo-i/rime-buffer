@@ -55,4 +55,4 @@ if [ -z "$EXPECTED_UUID" ] || [ "$INSTALLED_UUID" != "$EXPECTED_UUID" ]; then
 fi
 
 echo "==> 完成。build=$BUILD_NUMBER UUID=$INSTALLED_UUID"
-echo "    切回 Enter输入法打字即用，无需等菜单重建。"
+echo "    切回 RIMES 打字即用，无需等菜单重建。"

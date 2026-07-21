@@ -1,0 +1,954 @@
+import Foundation
+
+private final class StreamInputSmokeTask: AITextCancellable {
+    private(set) var isCancelled = false
+
+    func cancel() { isCancelled = true }
+}
+
+private final class StreamInputSmokeProvider: AITextProvider {
+    struct Pending {
+        let request: AITextProviderRequest
+        let onEvent: (AITextProviderEvent) -> Void
+        let completion: (Result<[AITextProviderBlock], AITextProviderError>) -> Void
+        let task: StreamInputSmokeTask
+    }
+
+    let kind: AITextProviderKind = .openAICompatible
+    var availability: AITextProviderAvailability = .ready
+    private(set) var pending: [Pending] = []
+
+    @discardableResult
+    func generate(
+        _ request: AITextProviderRequest,
+        onEvent: @escaping (AITextProviderEvent) -> Void,
+        completion: @escaping (Result<[AITextProviderBlock], AITextProviderError>) -> Void
+    ) -> any AITextCancellable {
+        let task = StreamInputSmokeTask()
+        pending.append(Pending(request: request,
+                               onEvent: onEvent,
+                               completion: completion,
+                               task: task))
+        return task
+    }
+
+    func emit(_ event: AITextProviderEvent, at index: Int) {
+        pending[index].onEvent(event)
+    }
+
+    func complete(
+        _ result: Result<[AITextProviderBlock], AITextProviderError>,
+        at index: Int
+    ) {
+        pending[index].completion(result)
+    }
+}
+
+private final class StreamInputSmokeRuntimeBox {
+    var bufferEnabled = true
+    var pluginSelected = true
+    var configuration = StreamInputCaptureRules.requiredConfiguration
+    var secureInput = false
+    var exactFocus = true
+
+    var runtime: StreamInputRuntime {
+        StreamInputRuntime(
+            bufferEnabled: { [self] in bufferEnabled },
+            pluginSelected: { [self] in pluginSelected },
+            configuration: { [self] in configuration },
+            secureInput: { [self] in secureInput },
+            liveFocus: { [self] _, _ in exactFocus }
+        )
+    }
+}
+
+func runStreamInputPluginSmokeTest() -> Bool {
+    func fail(_ message: String) -> Bool {
+        print("FAILED: stream input \(message)")
+        return false
+    }
+
+    let fullPinyin = StreamInputCaptureRules.requiredConfiguration
+    let letter = StreamInputCaptureRules.letter(
+        keycode: 0x61,
+        mask: 0,
+        bufferEnabled: true,
+        pluginSelected: true,
+        configuration: fullPinyin,
+        secureInput: false,
+        exactExternalFocus: true
+    )
+    guard letter == "a" else { return fail("valid letter capture") }
+
+    let rejectedGates: [(Bool, Bool, InputConfiguration, Bool, Bool)] = [
+        (false, true, fullPinyin, false, true),
+        (true, false, fullPinyin, false, true),
+        (true, true, .init(encoding: .naturalDoublePinyin,
+                          keyingMode: .sequential), false, true),
+        (true, true, .init(encoding: .fullPinyin,
+                          keyingMode: .mutual), false, true),
+        (true, true, fullPinyin, true, true),
+        (true, true, fullPinyin, false, false),
+    ]
+    for gate in rejectedGates {
+        guard StreamInputCaptureRules.letter(
+            keycode: 0x61,
+            mask: 0,
+            bufferEnabled: gate.0,
+            pluginSelected: gate.1,
+            configuration: gate.2,
+            secureInput: gate.3,
+            exactExternalFocus: gate.4
+        ) == nil else { return fail("authority gate") }
+    }
+
+    for mask in [RimeKey.shiftMask, RimeKey.lockMask] {
+        guard StreamInputCaptureRules.letter(
+            keycode: 0x61,
+            mask: mask,
+            bufferEnabled: true,
+            pluginSelected: true,
+            configuration: fullPinyin,
+            secureInput: false,
+            exactExternalFocus: true
+        ) == "a" else { return fail("shift and caps normalization") }
+    }
+    for mask in [RimeKey.controlMask,
+                 RimeKey.altMask,
+                 RimeKey.superMask] {
+        guard StreamInputCaptureRules.letter(
+            keycode: 0x61,
+            mask: mask,
+            bufferEnabled: true,
+            pluginSelected: true,
+            configuration: fullPinyin,
+            secureInput: false,
+            exactExternalFocus: true
+        ) == nil else { return fail("modifier ownership") }
+    }
+    for keycode: Int32 in [0x20, 0x27, 0x30, 0x60] {
+        guard StreamInputCaptureRules.disposition(
+            keycode: keycode,
+            mask: 0,
+            bufferEnabled: true,
+            pluginSelected: true,
+            configuration: fullPinyin,
+            secureInput: false,
+            exactExternalFocus: true
+        ) == .consumeOwned else { return fail("separator ownership") }
+    }
+    guard StreamInputCaptureRules.disposition(
+        keycode: 0x61,
+        mask: 0,
+        bufferEnabled: true,
+        pluginSelected: true,
+        configuration: fullPinyin,
+        secureInput: true,
+        exactExternalFocus: true
+    ) == .consumeUntrusted,
+    StreamInputCaptureRules.disposition(
+        keycode: 0x61,
+        mask: 0,
+        bufferEnabled: true,
+        pluginSelected: true,
+        configuration: fullPinyin,
+        secureInput: false,
+        exactExternalFocus: false
+    ) == .consumeUntrusted,
+    StreamInputCaptureRules.disposition(
+        keycode: 0x7f,
+        mask: 0,
+        bufferEnabled: true,
+        pluginSelected: true,
+        configuration: fullPinyin,
+        secureInput: false,
+        exactExternalFocus: true
+    ) == .passThrough else {
+        return fail("fail-closed printable ownership")
+    }
+
+    guard StreamInputRefreshPolicy.deadline(lastChange: 10.50,
+                                            burstStarted: 10.00) == 10.72,
+          StreamInputRefreshPolicy.deadline(lastChange: 10.75,
+                                            burstStarted: 10.00) == 10.80 else {
+        return fail("bounded refresh policy")
+    }
+
+    let raw = "xiufuyigewenti"
+    let prompt = StreamInputPrompt.request(for: raw)
+    guard prompt.contains("\"rawPinyin\":\"\(raw)\""),
+          prompt.contains("\"syllableHints\""),
+          prompt.contains("xiu'fu'yi'ge'wen'ti"),
+          prompt.contains("ASCII Space"),
+          prompt.contains("竖线表示用户输入的 Space 短句边界"),
+          prompt.contains("English"),
+          prompt.contains("不可信的数据"),
+          prompt.contains("完整正文"),
+          prompt.contains("1–3"),
+          prompt.contains("互斥") else {
+        return fail("prompt contract")
+    }
+
+    let ambiguousHints = StreamInputPinyinHints.compactHints(for: "fangan")
+    let mixedCandidates = StreamInputPinyinHints.candidates(
+        for: "wozaicodexlixiuyigebug"
+    )
+    let spacedCandidates = StreamInputPinyinHints.candidates(for: "wo shi")
+    let longRaw = String(repeating: "a", count: 513)
+    let longHints = StreamInputPinyinHints.candidates(for: longRaw)
+    guard ambiguousHints.contains("fang'an"),
+          ambiguousHints.contains("fan'gan") else {
+        return fail("ambiguous pinyin boundary hints")
+    }
+    guard mixedCandidates.first?.compact.contains("[codex]") == true,
+          mixedCandidates.first?.compact.contains("[bug]") == true,
+          mixedCandidates.allSatisfy({
+              $0.segments.map(\.spelling).joined()
+                  == "wozaicodexlixiuyigebug"
+          }) else {
+        return fail("mixed-English pinyin boundary hints")
+    }
+    guard !spacedCandidates.isEmpty,
+          spacedCandidates.allSatisfy({
+              $0.segments.map(\.spelling).joined() == "wo shi"
+                  && $0.compact.contains(" | ")
+          }) else {
+        return fail("space-aware pinyin boundary hints")
+    }
+    guard longHints.isEmpty,
+          StreamInputPinyinHints.compactHints(for: "FanGan").isEmpty else {
+        return fail("bounded pinyin boundary hint omission")
+    }
+
+    let providerPolicyRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("RimeBuffer-Stream-Provider-\(UUID().uuidString)")
+    let providerPolicyWorkspace = StreamInputWorkspace(
+        openAIConfigurationStore: OpenAICompatibleConfigurationStore(
+            rootDirectory: providerPolicyRoot
+        ),
+        runtime: StreamInputSmokeRuntimeBox().runtime,
+        observesRuntimeNotifications: false
+    )
+    guard providerPolicyWorkspace.providerKindForTesting == .openAICompatible else {
+        return fail("default provider must stay OpenAI-compatible")
+    }
+
+    // Space ends a short sentence and immediately requests the complete raw
+    // snapshot. Leading/repeated spaces do not create revisions or requests.
+    // Continuing to type creates the ordinary trailing debounce, whose request
+    // re-evaluates the complete latest input rather than only the new suffix.
+    do {
+        var epochs = FocusEpochState()
+        let focus = epochs.activate()
+        let runtime = StreamInputSmokeRuntimeBox()
+        let provider = StreamInputSmokeProvider()
+        let workspace = StreamInputWorkspace(
+            provider: provider,
+            runtime: runtime.runtime,
+            observesRuntimeNotifications: false
+        )
+        workspace.start()
+        defer { workspace.stop() }
+
+        guard workspace.consumeIgnoredKey(keycode: 0x20, focusToken: focus),
+              workspace.rawInput.isEmpty,
+              provider.pending.isEmpty,
+              workspace.capture(letter: "a", focusToken: focus),
+              workspace.capture(letter: "b", focusToken: focus),
+              workspace.consumeIgnoredKey(keycode: 0x20, focusToken: focus),
+              workspace.rawInput == "ab ",
+              provider.pending.count == 1,
+              provider.pending[0].request.sourceText == "ab ",
+              provider.pending[0].request.preparedPrompt?.contains(
+                "\"rawPinyin\":\"ab \""
+              ) == true,
+              workspace.maximumWaitTimerForTesting == nil else {
+            return fail("Space must create one immediate whole-raw request")
+        }
+        guard workspace.consumeIgnoredKey(keycode: 0x20, focusToken: focus),
+              workspace.rawInput == "ab ",
+              provider.pending.count == 1,
+              workspace.capture(letter: "c", focusToken: focus),
+              workspace.capture(letter: "d", focusToken: focus),
+              workspace.rawInput == "ab cd",
+              provider.pending.count == 1,
+              workspace.maximumWaitTimerForTesting != nil else {
+            return fail("repeated Space must coalesce and later typing must debounce")
+        }
+        workspace.fireDebounceForTesting()
+        guard provider.pending.count == 2,
+              provider.pending[1].request.sourceText == "ab cd",
+              provider.pending[1].request.preparedPrompt?.contains(
+                "\"rawPinyin\":\"ab cd\""
+              ) == true,
+              provider.pending.allSatisfy({ !$0.task.isCancelled }) else {
+            return fail("trailing debounce must request the latest complete raw")
+        }
+        provider.complete(.success([
+            AITextProviderBlock(index: 0, text: "最新完整短句结果", title: nil),
+        ]), at: 1)
+        guard provider.pending[0].task.isCancelled,
+              workspace.phase == .ready,
+              workspace.outputBlocks.first?.text == "最新完整短句结果",
+              workspace.deliveryPendingBlocks.first?.text == "最新完整短句结果" else {
+            return fail("latest post-Space whole-raw result must be authoritative")
+        }
+    }
+
+    // Provider-fast and provider-slow paths must expose identical Return
+    // semantics, and model segmentation must never leak into partial delivery.
+    do {
+        var epochs = FocusEpochState()
+        let focus = epochs.activate()
+        let runtime = StreamInputSmokeRuntimeBox()
+        let provider = StreamInputSmokeProvider()
+        let workspace = StreamInputWorkspace(
+            provider: provider,
+            runtime: runtime.runtime,
+            observesRuntimeNotifications: false
+        )
+        workspace.start()
+        defer { workspace.stop() }
+
+        guard workspace.capture(letter: "a", focusToken: focus),
+              workspace.settleForReturn(focusToken: focus),
+              provider.pending.count == 1,
+              provider.pending[0].request.outputContract == .alternativeGuesses else {
+            return fail("first Return forces current inference")
+        }
+        provider.complete(.success([
+            AITextProviderBlock(index: 0, text: "修复一个问题", title: "ignored"),
+            AITextProviderBlock(index: 1, text: "修复仪表问题", title: nil),
+        ]), at: 0)
+        guard workspace.phase == .ready,
+              (1...3).contains(workspace.outputBlocks.count),
+              workspace.outputBlocks.map(\.text) == ["修复一个问题", "修复仪表问题"],
+              workspace.outputBlocks.allSatisfy({ $0.title == nil }),
+              workspace.deliveryPendingBlocks.count == 1,
+              workspace.deliveryPendingBlocks.first?.text == "修复一个问题",
+              !workspace.settleForReturn(focusToken: focus) else {
+            return fail("alternative results and second Return delivery")
+        }
+
+        guard workspace.consumeIgnoredKey(keycode: 0x32,
+                                          focusToken: focus),
+              workspace.deliveryPendingBlocks.count == 1,
+              workspace.deliveryPendingBlocks.first?.text == "修复仪表问题",
+              let selectedID = workspace.deliveryPendingBlocks.first?.id else {
+            return fail("digit selection exposes only selected alternative")
+        }
+        let resultGeneration = workspace.deliveryGeneration
+        workspace.consumeDelivered(blockIDs: [selectedID],
+                                   generation: resultGeneration)
+        guard workspace.rawInput.isEmpty,
+              workspace.outputBlocks.isEmpty,
+              workspace.deliveryPendingBlocks.isEmpty,
+              workspace.phase == .idle else {
+            return fail("selected delivery clears every alternative")
+        }
+    }
+
+
+    // A new raw-input revision revokes delivery but keeps stable, inert chips
+    // visible while another whole-input request catches up. Early stream
+    // prefixes must not collapse the old sentence. A very short divergent
+    // prefix also keeps the baseline until it becomes readable; final output
+    // is always exactly the latest global result.
+    do {
+        var epochs = FocusEpochState()
+        let focus = epochs.activate()
+        let runtime = StreamInputSmokeRuntimeBox()
+        let provider = StreamInputSmokeProvider()
+        let workspace = StreamInputWorkspace(
+            provider: provider,
+            runtime: runtime.runtime,
+            observesRuntimeNotifications: false
+        )
+        workspace.start()
+        defer { workspace.stop() }
+
+        guard workspace.capture(letter: "a", focusToken: focus),
+              workspace.settleForReturn(focusToken: focus),
+              provider.pending.count == 1 else {
+            return fail("continuity setup")
+        }
+        provider.complete(.success([
+            AITextProviderBlock(index: 0, text: "修复一个问题", title: nil),
+            AITextProviderBlock(index: 1, text: "修复仪表问题", title: nil),
+        ]), at: 0)
+        let stableIDs = workspace.outputBlocks.map(\.id)
+        let staleGeneration = workspace.deliveryGeneration
+        guard stableIDs.count == 2,
+              workspace.capture(letter: "b", focusToken: focus),
+              workspace.rawInput == "ab",
+              workspace.phase == .waiting,
+              workspace.outputBlocks.map(\.id) == stableIDs,
+              workspace.outputBlocks.map(\.text)
+                == ["修复一个问题", "修复仪表问题"],
+              workspace.deliveryPendingBlocks.isEmpty,
+              workspace.deliveryBlock(id: stableIDs[0],
+                                      generation: staleGeneration) == nil else {
+            return fail("inert carryover across full-context revisions")
+        }
+        workspace.consumeDelivered(blockIDs: [stableIDs[0]],
+                                   generation: staleGeneration)
+        guard workspace.rawInput == "ab",
+              workspace.settleForReturn(focusToken: focus),
+              provider.pending.count == 2,
+              provider.pending[1].request.sourceText == "ab",
+              provider.pending[1].request.preparedPrompt?.contains(
+                "\"rawPinyin\":\"ab\""
+              ) == true,
+              provider.pending[1].request.preparedPrompt?.contains("修复一个问题") == false else {
+            return fail("latest request must contain only complete current raw input")
+        }
+
+        provider.emit(.blockSnapshot(
+            AITextProviderBlock(index: 0, text: "修复", title: nil)
+        ), at: 1)
+        guard workspace.outputBlocks[0].text == "修复一个问题",
+              workspace.outputBlocks[0].id == stableIDs[0],
+              workspace.railSnapshot.outputBlocks[0].retainedTailStart
+                == "修复".utf16.count else {
+            return fail("prefix latch must avoid visual collapse")
+        }
+        provider.emit(.blockSnapshot(
+            AITextProviderBlock(index: 0, text: "修理", title: nil)
+        ), at: 1)
+        guard workspace.outputBlocks[0].text == "修复一个问题",
+              workspace.outputBlocks[0].id == stableIDs[0],
+              workspace.railSnapshot.outputBlocks[0].retainedTailStart
+                == "修".utf16.count else {
+            return fail("short divergent partial must retain the baseline")
+        }
+        provider.emit(.blockSnapshot(
+            AITextProviderBlock(index: 0, text: "修理这个", title: nil)
+        ), at: 1)
+        guard workspace.outputBlocks[0].text == "修理这个",
+              workspace.outputBlocks[0].id == stableIDs[0],
+              workspace.railSnapshot.outputBlocks[0].retainedTailStart == nil else {
+            return fail("readable divergent partial must replace the baseline")
+        }
+        provider.complete(.success([
+            AITextProviderBlock(index: 0, text: "修理这个问题", title: nil),
+            AITextProviderBlock(index: 1, text: "修正那个问题", title: nil),
+        ]), at: 1)
+        guard workspace.phase == .ready,
+              workspace.outputBlocks.map(\.text)
+                == ["修理这个问题", "修正那个问题"],
+              workspace.outputBlocks.map(\.id) == stableIDs,
+              workspace.railSnapshot.outputBlocks.allSatisfy({
+                $0.retainedTailStart == nil
+              }) else {
+            return fail("latest final must converge exactly in stable slots")
+        }
+
+        guard workspace.capture(letter: "c", focusToken: focus),
+              workspace.settleForReturn(focusToken: focus),
+              provider.pending.count == 3 else {
+            return fail("failed refresh setup")
+        }
+        provider.complete(.failure(.failed), at: 2)
+        guard case .failed = workspace.phase,
+              workspace.outputBlocks.map(\.id) == stableIDs,
+              workspace.deliveryPendingBlocks.isEmpty else {
+            return fail("failed refresh keeps inert display only")
+        }
+    }
+
+    // Continuous typing must not starve inference by resetting the 800 ms
+    // burst deadline, and a useful older request may finish as an inert visual
+    // baseline while the latest complete raw snapshot waits for its boundary.
+    do {
+        var epochs = FocusEpochState()
+        let focus = epochs.activate()
+        let runtime = StreamInputSmokeRuntimeBox()
+        let provider = StreamInputSmokeProvider()
+        let workspace = StreamInputWorkspace(
+            provider: provider,
+            runtime: runtime.runtime,
+            observesRuntimeNotifications: false
+        )
+        workspace.start()
+        defer { workspace.stop() }
+
+        guard workspace.capture(letter: "a", focusToken: focus),
+              workspace.settleForReturn(focusToken: focus),
+              provider.pending.count == 1,
+              workspace.capture(letter: "b", focusToken: focus),
+              let maximumWait = workspace.maximumWaitTimerForTesting,
+              !provider.pending[0].task.isCancelled,
+              workspace.capture(letter: "c", focusToken: focus),
+              workspace.maximumWaitTimerForTesting === maximumWait,
+              !provider.pending[0].task.isCancelled else {
+            return fail("continuous burst must retain deadline and old request")
+        }
+
+        provider.emit(.blockSnapshot(
+            AITextProviderBlock(index: 0, text: "旧请求的前段猜测", title: nil)
+        ), at: 0)
+        let provisionalGeneration = workspace.deliveryGeneration
+        guard workspace.phase == .waiting,
+              workspace.outputBlocks.first?.text == "旧请求的前段猜测",
+              workspace.outputBlocks.first?.incomplete == true,
+              workspace.railSnapshot.outputBlocks.allSatisfy({ !$0.selected }),
+              workspace.statusText.contains("补全前段猜测"),
+              workspace.railSnapshot.message?.contains("补全前段猜测") == true,
+              workspace.deliveryPendingBlocks.isEmpty,
+              workspace.outputBlocks.first.map({
+                  workspace.deliveryBlock(
+                    id: $0.id,
+                    generation: provisionalGeneration
+                  ) == nil
+              }) == true,
+              workspace.maximumWaitTimerForTesting === maximumWait else {
+            return fail("old partial must remain provisional during typing")
+        }
+
+        provider.complete(.success([
+            AITextProviderBlock(index: 0, text: "旧请求的完整猜测", title: nil),
+        ]), at: 0)
+        guard workspace.phase == .waiting,
+              workspace.outputBlocks.first?.text == "旧请求的完整猜测",
+              workspace.outputBlocks.first?.incomplete == true,
+              workspace.railSnapshot.outputBlocks.allSatisfy({ !$0.selected }),
+              workspace.deliveryPendingBlocks.isEmpty,
+              workspace.maximumWaitTimerForTesting === maximumWait else {
+            return fail("old final must stay an inert visual baseline")
+        }
+
+        workspace.fireDebounceForTesting()
+        guard provider.pending.count == 2,
+              provider.pending[1].request.sourceText == "abc",
+              provider.pending[1].request.preparedPrompt?.contains(
+                "\"rawPinyin\":\"abc\""
+              ) == true,
+              provider.pending[1].request.preparedPrompt?.contains(
+                "旧请求的完整猜测"
+              ) == false,
+              workspace.maximumWaitTimerForTesting == nil else {
+            return fail("debounce must start one latest whole-raw request")
+        }
+        provider.complete(.success([
+            AITextProviderBlock(index: 0, text: "最新完整输入的猜测", title: nil),
+        ]), at: 1)
+        guard workspace.phase == .ready,
+              workspace.outputBlocks.first?.text == "最新完整输入的猜测",
+              workspace.railSnapshot.outputBlocks.first?.selected == true,
+              workspace.deliveryPendingBlocks.first?.text == "最新完整输入的猜测" else {
+            return fail("latest whole-raw result must become authoritative")
+        }
+    }
+
+    // Even when an older request fails after producing a useful partial, the
+    // next request boundary must capture the newest on-screen text. Otherwise
+    // the first short latest partial would collapse the rail and regrow it.
+    do {
+        var epochs = FocusEpochState()
+        let focus = epochs.activate()
+        let runtime = StreamInputSmokeRuntimeBox()
+        let provider = StreamInputSmokeProvider()
+        let workspace = StreamInputWorkspace(
+            provider: provider,
+            runtime: runtime.runtime,
+            observesRuntimeNotifications: false
+        )
+        workspace.start()
+        defer { workspace.stop() }
+
+        guard workspace.capture(letter: "m", focusToken: focus),
+              workspace.settleForReturn(focusToken: focus),
+              workspace.capture(letter: "n", focusToken: focus) else {
+            return fail("failed provisional baseline setup")
+        }
+        provider.emit(.blockSnapshot(
+            AITextProviderBlock(index: 0, text: "旧请求留下的较长片段", title: nil)
+        ), at: 0)
+        provider.complete(.failure(.failed), at: 0)
+        guard workspace.phase == .waiting,
+              workspace.outputBlocks.first?.text == "旧请求留下的较长片段",
+              workspace.deliveryPendingBlocks.isEmpty else {
+            return fail("failed old request must leave only visual text")
+        }
+        workspace.fireDebounceForTesting()
+        guard provider.pending.count == 2,
+              provider.pending[1].request.sourceText == "mn" else {
+            return fail("failed old request latest handoff")
+        }
+        provider.emit(.blockSnapshot(
+            AITextProviderBlock(index: 0, text: "旧", title: nil)
+        ), at: 1)
+        guard workspace.outputBlocks.first?.text == "旧请求留下的较长片段",
+              workspace.railSnapshot.outputBlocks.first?.retainedTailStart
+                == "旧".utf16.count,
+              workspace.deliveryPendingBlocks.isEmpty else {
+            return fail("request boundary must retain failed-request partial")
+        }
+    }
+
+    // If the old request is still running at the debounce/max boundary, start
+    // the latest whole-raw request without breaking the visible old stream.
+    // The first useful new snapshot tombstones the old callbacks.
+    do {
+        var epochs = FocusEpochState()
+        let focus = epochs.activate()
+        let runtime = StreamInputSmokeRuntimeBox()
+        let provider = StreamInputSmokeProvider()
+        let workspace = StreamInputWorkspace(
+            provider: provider,
+            runtime: runtime.runtime,
+            observesRuntimeNotifications: false
+        )
+        workspace.start()
+        defer { workspace.stop() }
+
+        guard workspace.capture(letter: "x", focusToken: focus),
+              workspace.settleForReturn(focusToken: focus),
+              workspace.capture(letter: "y", focusToken: focus),
+              !provider.pending[0].task.isCancelled else {
+            return fail("async handoff setup")
+        }
+        provider.emit(.blockSnapshot(
+            AITextProviderBlock(index: 0, text: "旧的局部", title: nil)
+        ), at: 0)
+        workspace.fireDebounceForTesting()
+        guard !provider.pending[0].task.isCancelled,
+              provider.pending.count == 2,
+              provider.pending[1].request.sourceText == "xy",
+              workspace.phase == .running,
+              workspace.deliveryPendingBlocks.isEmpty else {
+            return fail("boundary must overlap stale and latest raw")
+        }
+        provider.emit(.blockSnapshot(
+            AITextProviderBlock(index: 0, text: "旧", title: nil)
+        ), at: 1)
+        guard provider.pending[0].task.isCancelled,
+              workspace.outputBlocks.first?.text == "旧的局部",
+              workspace.railSnapshot.outputBlocks.first?.retainedTailStart
+                == "旧".utf16.count else {
+            return fail("first new snapshot must atomically hand off the baseline")
+        }
+
+        provider.emit(.blockSnapshot(
+            AITextProviderBlock(index: 0, text: "迟到旧 partial", title: nil)
+        ), at: 0)
+        provider.complete(.success([
+            AITextProviderBlock(index: 0, text: "迟到旧 final", title: nil),
+        ]), at: 0)
+        guard workspace.phase == .running,
+              workspace.outputBlocks.first?.text == "旧的局部",
+              workspace.deliveryPendingBlocks.isEmpty else {
+            return fail("cancelled old callbacks must stay tombstoned")
+        }
+
+        provider.complete(.success([
+            AITextProviderBlock(index: 0, text: "最新全局结果", title: nil),
+        ]), at: 1)
+        guard workspace.phase == .ready,
+              workspace.outputBlocks.first?.text == "最新全局结果",
+              workspace.deliveryPendingBlocks.first?.text == "最新全局结果" else {
+            return fail("handoff latest result")
+        }
+        provider.complete(.success([
+            AITextProviderBlock(index: 0, text: "再次迟到旧结果", title: nil),
+        ]), at: 0)
+        guard workspace.phase == .ready,
+              workspace.outputBlocks.first?.text == "最新全局结果",
+              workspace.deliveryPendingBlocks.first?.text == "最新全局结果" else {
+            return fail("late old completion after ready")
+        }
+    }
+
+    // Slow first-token providers need bounded make-before-break. A second
+    // request may overlap the still-silent first one; further boundaries only
+    // replace one latest-only pending marker. The first useful newer snapshot
+    // opens a slot and launches exactly the newest complete raw input.
+    do {
+        var epochs = FocusEpochState()
+        let focus = epochs.activate()
+        let runtime = StreamInputSmokeRuntimeBox()
+        let provider = StreamInputSmokeProvider()
+        let workspace = StreamInputWorkspace(
+            provider: provider,
+            runtime: runtime.runtime,
+            observesRuntimeNotifications: false
+        )
+        workspace.start()
+        defer { workspace.stop() }
+
+        guard workspace.capture(letter: "a", focusToken: focus),
+              workspace.settleForReturn(focusToken: focus),
+              provider.pending.count == 1,
+              workspace.capture(letter: "b", focusToken: focus) else {
+            return fail("slow-first-token setup")
+        }
+        workspace.fireDebounceForTesting()
+        guard provider.pending.count == 2,
+              provider.pending[1].request.sourceText == "ab",
+              provider.pending.allSatisfy({ !$0.task.isCancelled }),
+              workspace.capture(letter: "c", focusToken: focus) else {
+            return fail("slow-first-token overlap before new snapshot")
+        }
+        workspace.fireDebounceForTesting()
+        guard provider.pending.count == 2,
+              provider.pending.allSatisfy({ !$0.task.isCancelled }),
+              workspace.capture(letter: "d", focusToken: focus) else {
+            return fail("two-slot bound at third boundary")
+        }
+        workspace.fireDebounceForTesting()
+        guard provider.pending.count == 2,
+              provider.pending.allSatisfy({ !$0.task.isCancelled }) else {
+            return fail("latest pending must not create a third request")
+        }
+
+        provider.emit(.blockSnapshot(
+            AITextProviderBlock(index: 0, text: "较慢中间猜测", title: nil)
+        ), at: 1)
+        guard provider.pending[0].task.isCancelled,
+              !provider.pending[1].task.isCancelled,
+              provider.pending.count == 3,
+              provider.pending[2].request.sourceText == "abcd",
+              provider.pending[2].request.preparedPrompt?.contains(
+                "\"rawPinyin\":\"abcd\""
+              ) == true,
+              provider.pending[2].request.preparedPrompt?.contains(
+                "较慢中间猜测"
+              ) == false,
+              provider.pending.filter({ !$0.task.isCancelled }).count == 2 else {
+            return fail("first newer snapshot must launch latest-only pending raw")
+        }
+
+        provider.emit(.blockSnapshot(
+            AITextProviderBlock(index: 0, text: "最新全局", title: nil)
+        ), at: 2)
+        guard provider.pending[1].task.isCancelled,
+              !provider.pending[2].task.isCancelled,
+              provider.pending.filter({ !$0.task.isCancelled }).count == 1,
+              workspace.deliveryPendingBlocks.isEmpty else {
+            return fail("latest first snapshot must tombstone its visual predecessor")
+        }
+        provider.complete(.success([
+            AITextProviderBlock(index: 0, text: "最新完整全局结果", title: nil),
+        ]), at: 2)
+        provider.emit(.blockSnapshot(
+            AITextProviderBlock(index: 0, text: "迟到第一路", title: nil)
+        ), at: 0)
+        provider.complete(.success([
+            AITextProviderBlock(index: 0, text: "迟到第二路", title: nil),
+        ]), at: 1)
+        guard workspace.phase == .ready,
+              workspace.outputBlocks.first?.text == "最新完整全局结果",
+              workspace.deliveryPendingBlocks.first?.text == "最新完整全局结果" else {
+            return fail("slow-first-token latest full raw must win authoritatively")
+        }
+    }
+
+    do {
+        var epochs = FocusEpochState()
+        let focus = epochs.activate()
+        let runtime = StreamInputSmokeRuntimeBox()
+        let provider = StreamInputSmokeProvider()
+        let workspace = StreamInputWorkspace(
+            provider: provider,
+            runtime: runtime.runtime,
+            observesRuntimeNotifications: false
+        )
+        workspace.start()
+        defer { workspace.stop() }
+
+        guard workspace.capture(letter: "a", focusToken: focus),
+              workspace.requestRefresh(),
+              provider.pending.count == 1 else {
+            return fail("fast-ready setup")
+        }
+        provider.complete(.success([
+            AITextProviderBlock(index: 0, text: "啊", title: nil),
+        ]), at: 0)
+        guard workspace.phase == .ready,
+              workspace.outputBlocks.count == 1,
+              workspace.outputBlocks.first?.text == "啊",
+              workspace.deliveryPendingBlocks.count == 1,
+              workspace.deliveryPendingBlocks.first?.text == "啊",
+              workspace.settleForReturn(focusToken: focus),
+              !workspace.settleForReturn(focusToken: focus) else {
+            return fail("unambiguous single alternative settlement")
+        }
+    }
+
+    // Reusing the same source text after edits must not let an old A request
+    // resurrect: input revision, rather than source equality, owns callbacks.
+    do {
+        var epochs = FocusEpochState()
+        let focus = epochs.activate()
+        let runtime = StreamInputSmokeRuntimeBox()
+        let provider = StreamInputSmokeProvider()
+        let workspace = StreamInputWorkspace(
+            provider: provider,
+            runtime: runtime.runtime,
+            observesRuntimeNotifications: false
+        )
+        workspace.start()
+        defer { workspace.stop() }
+
+        guard workspace.capture(letter: "a", focusToken: focus),
+              workspace.settleForReturn(focusToken: focus),
+              workspace.capture(letter: "b", focusToken: focus),
+              workspace.deleteBackward(focusToken: focus),
+              workspace.rawInput == "a",
+              workspace.settleForReturn(focusToken: focus),
+              provider.pending.count == 2,
+              !provider.pending[0].task.isCancelled else {
+            return fail("latest-wins overlap")
+        }
+        provider.complete(.success([
+            AITextProviderBlock(index: 0, text: "新", title: nil),
+        ]), at: 1)
+        guard provider.pending[0].task.isCancelled,
+              workspace.phase == .ready,
+              workspace.outputBlocks.first?.text == "新" else {
+            return fail("latest terminal result must tombstone the old request")
+        }
+        provider.emit(.blockSnapshot(
+            AITextProviderBlock(index: 0, text: "旧", title: nil)
+        ), at: 0)
+        provider.complete(.success([
+            AITextProviderBlock(index: 0, text: "旧", title: nil),
+        ]), at: 0)
+        guard workspace.phase == .ready,
+              workspace.outputBlocks.first?.text == "新" else {
+            return fail("A-B-A callback tombstone")
+        }
+    }
+
+    do {
+        var epochs = FocusEpochState()
+        let focus = epochs.activate()
+        let runtime = StreamInputSmokeRuntimeBox()
+        let provider = StreamInputSmokeProvider()
+        let workspace = StreamInputWorkspace(
+            provider: provider,
+            runtime: runtime.runtime,
+            observesRuntimeNotifications: false
+        )
+        workspace.start()
+        defer { workspace.stop() }
+
+        guard workspace.capture(letter: "c", focusToken: focus),
+              workspace.settleForReturn(focusToken: focus) else {
+            return fail("provider cancellation setup")
+        }
+        provider.complete(.failure(.cancelled), at: 0)
+        guard workspace.phase == .waiting,
+              workspace.settleForReturn(focusToken: focus),
+              provider.pending.count == 2 else {
+            return fail("provider cancellation retry")
+        }
+        provider.complete(.failure(.cancelled), at: 1)
+        guard case .failed = workspace.phase else {
+            return fail("provider cancellation terminal state")
+        }
+    }
+
+    // Saving a new endpoint/model/key must tombstone an in-flight request. The
+    // notification carries no configuration payload; the next generation
+    // reloads the private file and keeps raw input plus inert visual continuity.
+    do {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "RimeBuffer-Stream-Config-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = OpenAICompatibleConfigurationStore(rootDirectory: root)
+        do {
+            try store.save(OpenAICompatibleConfiguration(
+                baseURL: "https://example.com/v1",
+                model: "first-model",
+                apiKey: "test-only"
+            ))
+        } catch {
+            return fail("configuration notification setup")
+        }
+
+        var epochs = FocusEpochState()
+        let focus = epochs.activate()
+        let runtime = StreamInputSmokeRuntimeBox()
+        let provider = StreamInputSmokeProvider()
+        let workspace = StreamInputWorkspace(
+            provider: provider,
+            openAIConfigurationStore: store,
+            runtime: runtime.runtime,
+            observesRuntimeNotifications: true
+        )
+        workspace.start()
+        defer { workspace.stop() }
+        guard workspace.capture(letter: "a", focusToken: focus),
+              workspace.settleForReturn(focusToken: focus),
+              provider.pending.count == 1 else {
+            return fail("configuration change in-flight setup")
+        }
+        provider.emit(.blockSnapshot(
+            AITextProviderBlock(index: 0, text: "旧的部分结果", title: nil)
+        ), at: 0)
+        do {
+            try store.save(OpenAICompatibleConfiguration(
+                baseURL: "https://example.com/v1",
+                model: "second-model",
+                apiKey: "test-only"
+            ))
+        } catch {
+            return fail("configuration change save")
+        }
+        guard provider.pending[0].task.isCancelled,
+              workspace.rawInput == "a",
+              workspace.outputBlocks.first?.text == "旧的部分结果",
+              workspace.deliveryPendingBlocks.isEmpty,
+              workspace.phase == .waiting,
+              workspace.settleForReturn(focusToken: focus),
+              provider.pending.count == 2 else {
+            return fail("configuration change must cancel and restart safely")
+        }
+        provider.complete(.success([
+            AITextProviderBlock(index: 0, text: "迟到旧结果", title: nil),
+        ]), at: 0)
+        guard workspace.phase == .running,
+              workspace.outputBlocks.first?.text == "旧的部分结果" else {
+            return fail("old configuration callback tombstone")
+        }
+        provider.complete(.success([
+            AITextProviderBlock(index: 0, text: "最新配置结果", title: nil),
+        ]), at: 1)
+        guard workspace.phase == .ready,
+              workspace.outputBlocks.first?.text == "最新配置结果" else {
+            return fail("new configuration result")
+        }
+    }
+
+    do {
+        var epochs = FocusEpochState()
+        let focus = epochs.activate()
+        let runtime = StreamInputSmokeRuntimeBox()
+        let provider = StreamInputSmokeProvider()
+        let workspace = StreamInputWorkspace(
+            provider: provider,
+            runtime: runtime.runtime,
+            observesRuntimeNotifications: false
+        )
+        workspace.start()
+        defer { workspace.stop() }
+
+        guard workspace.capture(letter: "s", focusToken: focus) else {
+            return fail("secure scrub setup")
+        }
+        runtime.secureInput = true
+        workspace.focusDidChange()
+        guard workspace.rawInput.isEmpty,
+              workspace.outputBlocks.isEmpty,
+              workspace.phase == .idle else {
+            return fail("secure authority scrub")
+        }
+    }
+
+    print("stream input smoke passed")
+    return true
+}

@@ -47,6 +47,7 @@ func runPluginPlatformSmokeTest() -> Bool {
     )
     guard shippedBufferPluginIDs == Set([
         BuiltInPluginID.appleTranslation,
+        BuiltInPluginID.streamInput,
         BuiltInPluginID.aiText,
     ]) else {
         return fail("shipped buffer plugin registry")
@@ -57,6 +58,14 @@ func runPluginPlatformSmokeTest() -> Bool {
     guard shippedAIPlugins.count == 1,
           shippedAIPlugins[0].descriptor.capabilities == [.bufferAction] else {
         return fail("unified AI buffer plugin")
+    }
+    let streamInputPlugins = BuiltInPlugins.makeAll().filter {
+        $0.descriptor.key.rawID == BuiltInPluginID.streamInput
+    }
+    guard streamInputPlugins.count == 1,
+          streamInputPlugins[0].descriptor.capabilities == [.bufferAction],
+          streamInputPlugins[0].descriptor.canUninstall == false else {
+        return fail("built-in stream input plugin")
     }
 
     let root = fileManager.temporaryDirectory.appendingPathComponent(
@@ -135,6 +144,71 @@ func runPluginPlatformSmokeTest() -> Bool {
         guard selection.activeKey == externalKey,
               !selection.select(nonBufferBuiltInKey, among: snapshot) else {
             return fail("exclusive buffer plugin selection")
+        }
+
+        selection.reconcile(with: snapshot.filter { $0.descriptor.key != externalKey })
+        guard selection.activeKey == externalKey else {
+            return fail("temporarily missing external owner was forgotten")
+        }
+
+        let lateDefaultsName = "RimeBuffer.PluginPlatformLateSmoke.\(UUID().uuidString)"
+        guard let lateDefaults = UserDefaults(suiteName: lateDefaultsName) else {
+            return fail("late external defaults")
+        }
+        defer { lateDefaults.removePersistentDomain(forName: lateDefaultsName) }
+        lateDefaults.removePersistentDomain(forName: lateDefaultsName)
+        // The first selection implementation wrote this false sentinel when
+        // Rime launched before Marine had installed its manifest.
+        lateDefaults.set(false, forKey: "plugins.buffer.active.hasValue.v1")
+        let lateSelection = BufferPluginSelectionStore(defaults: lateDefaults)
+        let lateRoot = root.appendingPathComponent("late-plugins", isDirectory: true)
+        let lateManager = ActionPluginManager(
+            rootURL: lateRoot,
+            stateURL: lateRoot.appendingPathComponent(".state.json")
+        )
+        let lateRegistry = PluginRegistry(
+            internalPlugins: [],
+            defaults: lateDefaults,
+            externalManager: lateManager,
+            bufferPluginSelection: lateSelection
+        )
+        lateSelection.migrateDefaultIfNeeded(from: lateRegistry.allPlugins())
+        guard lateSelection.activeKey == nil else {
+            return fail("legacy empty selection changed before plugin discovery")
+        }
+        let lateDirectory = lateRoot.appendingPathComponent("external-smoke", isDirectory: true)
+        try FileManager.default.createDirectory(at: lateDirectory,
+                                                withIntermediateDirectories: true)
+        try Data(manifest.utf8).write(
+            to: lateDirectory.appendingPathComponent("manifest.json"),
+            options: .atomic
+        )
+        NotificationCenter.default.post(
+            name: .externalActionManifestSetDidChange,
+            object: nil,
+            userInfo: [ActionPluginManager.rootPathUserInfoKey: lateRoot.path]
+        )
+        guard lateSelection.activeKey == externalKey else {
+            return fail("externally discovered plugin did not receive initial ownership")
+        }
+        lateSelection.clear()
+        lateSelection.migrateDefaultIfNeeded(from: snapshot)
+        guard lateSelection.activeKey == nil else {
+            return fail("explicit no-plugin choice was overwritten")
+        }
+
+        let explicitDefaultsName = "RimeBuffer.PluginPlatformExplicitNoneSmoke.\(UUID().uuidString)"
+        guard let explicitDefaults = UserDefaults(suiteName: explicitDefaultsName) else {
+            return fail("explicit-none defaults")
+        }
+        defer { explicitDefaults.removePersistentDomain(forName: explicitDefaultsName) }
+        explicitDefaults.removePersistentDomain(forName: explicitDefaultsName)
+        explicitDefaults.set(false, forKey: "plugins.buffer.active.hasValue.v1")
+        let explicitSelection = BufferPluginSelectionStore(defaults: explicitDefaults)
+        explicitSelection.clear()
+        explicitSelection.migrateDefaultIfNeeded(from: snapshot)
+        guard explicitSelection.activeKey == nil else {
+            return fail("new explicit no-plugin choice did not block legacy repair")
         }
 
         do {

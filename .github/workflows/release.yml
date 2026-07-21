@@ -34,21 +34,33 @@ jobs:
           MODE_ID=$(/usr/libexec/PlistBuddy -c 'Print :ComponentInputModeDict:tsVisibleInputModeOrderedArrayKey:0' Info.plist)
           DECLARED_MODE_ID=$(/usr/libexec/PlistBuddy -c "Print :ComponentInputModeDict:tsInputModeListKey:${MODE_ID}:TISInputSourceID" Info.plist)
           CONNECTION=$(/usr/libexec/PlistBuddy -c 'Print :InputMethodConnectionName' Info.plist)
+          DISPLAY_NAME=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' Info.plist)
+          EXECUTABLE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' Info.plist)
+          MENU_TITLE=$(/usr/libexec/PlistBuddy -c "Print :ComponentInputModeDict:tsInputModeListKey:${MODE_ID}:tsInputModeAlternateMenuTitleKey" Info.plist)
           CHILD_REPERTOIRE=$(/usr/libexec/PlistBuddy -c "Print :ComponentInputModeDict:tsInputModeListKey:${MODE_ID}:tsInputModeCharacterRepertoireKey" Info.plist | tr -d '[:space:]')
           test "$PARENT_ID" = "$BUNDLE_ID"
           test "$PARENT_ID" != "$MODE_ID"
           test "$MODE_ID" = "$DECLARED_MODE_ID"
           test "$CONNECTION" = 'RimeBuffer_1_Connection'
+          test "$DISPLAY_NAME" = 'RIMES'
+          test "$MENU_TITLE" = 'RIMES'
+          test "$EXECUTABLE" = 'ETInput'
           test "$CHILD_REPERTOIRE" = 'Array{HansHant}'
           # Freeze the input-source identity to exact literals. The structure
           # checks above still pass if the whole trio is renamed together, but
           # macOS burns these ids into the protected TIS preferences: any drift
-          # orphans the old rows and stacks duplicate "Enter输入法" entries in
+          # orphans the old rows and stacks duplicate "RIMES" entries in
           # System Settings (this bit us across the 0.3–0.4 renames — see
           # RELEASE.md). Never change these without a migration story.
           test "$BUNDLE_ID" = 'com.isaac.inputmethod.RimeBuffer'
           test "$MODE_ID" = 'com.isaac.inputmethod.RimeBuffer.Hans'
           test "$MODE_ID" = "${BUNDLE_ID}.Hans"
+          for STRINGS in Resources/*.lproj/InfoPlist.strings; do
+            plutil -lint "$STRINGS"
+            for KEY in CFBundleDisplayName CFBundleName "$BUNDLE_ID" "$MODE_ID"; do
+              test "$(/usr/libexec/PlistBuddy -c "Print :$KEY" "$STRINGS")" = 'RIMES'
+            done
+          done
           if /usr/libexec/PlistBuddy -c 'Print :tsInputMethodCharacterRepertoireKey' Info.plist >/dev/null 2>&1; then
             echo 'Parent input method must not declare a repertoire; only the Hans child mode does.'
             exit 1
@@ -90,13 +102,17 @@ jobs:
       - name: Fetch bundled librime runtime
         run: ./scripts/fetch-rime.sh
 
+      - name: Generate RIMES brand assets
+        run: bash Logo/generate.sh
+
       - name: Assemble the app bundle
         run: |
           APP="ETInput.app"
           rm -rf "$APP"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" \
                    "$APP/Contents/Frameworks" "$APP/Contents/SharedSupport"
-          # SPM target is still "RimeBuffer"; ship the binary as ETInput.
+          # SPM target is still "RimeBuffer"; ETInput is the frozen internal
+          # compatibility filename while the user-facing product is RIMES.
           cp "$BIN_DIR/RimeBuffer" "$APP/Contents/MacOS/ETInput"
           cp Info.plist "$APP/Contents/Info.plist"
           cp -R Vendor/rime/Frameworks/* "$APP/Contents/Frameworks/"
@@ -159,8 +175,8 @@ jobs:
         id: pkg
         run: |
           VERSION="${{ steps.version.outputs.VERSION }}"
-          ./scripts/make-pkg.sh "$VERSION" "ETInput.app" "ETInput-${VERSION}.pkg"
-          PKG="ETInput-${VERSION}.pkg"
+          ./scripts/make-pkg.sh "$VERSION" "ETInput.app" "RIMES-${VERSION}.pkg"
+          PKG="RIMES-${VERSION}.pkg"
           PKG_SHA256=$(shasum -a 256 "$PKG" | awk '{print $1}')
           echo "PKG=$PKG" >> "$GITHUB_OUTPUT"
           echo "PKG_SHA256=$PKG_SHA256" >> "$GITHUB_OUTPUT"
@@ -174,21 +190,21 @@ jobs:
             ${{ steps.pkg.outputs.PKG }}
             ${{ steps.package.outputs.ZIP }}
           body: |
-            ## Enter输入法 (ETInput) v${{ steps.version.outputs.VERSION }}
+            ## RIMES v${{ steps.version.outputs.VERSION }}
 
             现代 macOS 中文输入法（IMK + librime）。**自包含**：librime 引擎与 Rime
             词库已打包在 app 内，**无需单独安装 Squirrel**，装一个就能用。通用二进制
             （Apple Silicon + Intel）。
 
             ### 安装（推荐：向导式安装器）
-            下载 **`ETInput-${{ steps.version.outputs.VERSION }}.pkg`** → 双击 → 按向导安装
+            下载 **`RIMES-${{ steps.version.outputs.VERSION }}.pkg`** → 双击 → 按向导安装
             （输入管理员密码，装到 `/Library/Input Methods`，并自动注册、启用、尝试切换）。
             未经 Apple 公证，若首次被拦：在 pkg 上**右键 → 打开**。
-            多数情况下安装完成后可直接用输入菜单或 `Ctrl-Space` 切换到「Enter输入法」；
+            多数情况下安装完成后可直接用输入菜单或 `Ctrl-Space` 切换到「RIMES」；
             若菜单未刷新，先运行 `killall TextInputMenuAgent SystemUIServer`，仍看不到再注销重登一次。
 
             ### 应用内自动更新
-            已安装并运行的 Enter输入法会自动检查最新 Release，静默下载后在状态栏提示；
+            已安装并运行的 RIMES 会自动检查最新 Release，静默下载后在状态栏提示；
             点「立即更新」即自动替换并重启。（更新走下方 `.zip`，无需手动。）
 
             ### 校验和
@@ -205,7 +221,7 @@ jobs:
         if: "!startsWith(github.ref, 'refs/tags/')"
         uses: actions/upload-artifact@v4
         with:
-          name: ETInput-${{ steps.version.outputs.VERSION }}
+          name: RIMES-${{ steps.version.outputs.VERSION }}
           path: |
             ${{ steps.pkg.outputs.PKG }}
             ${{ steps.package.outputs.ZIP }}

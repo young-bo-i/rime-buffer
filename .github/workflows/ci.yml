@@ -32,16 +32,22 @@ jobs:
           MODE_ID=$(/usr/libexec/PlistBuddy -c 'Print :ComponentInputModeDict:tsVisibleInputModeOrderedArrayKey:0' Info.plist)
           DECLARED_MODE_ID=$(/usr/libexec/PlistBuddy -c "Print :ComponentInputModeDict:tsInputModeListKey:${MODE_ID}:TISInputSourceID" Info.plist)
           CONNECTION=$(/usr/libexec/PlistBuddy -c 'Print :InputMethodConnectionName' Info.plist)
+          DISPLAY_NAME=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' Info.plist)
+          EXECUTABLE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' Info.plist)
+          MENU_TITLE=$(/usr/libexec/PlistBuddy -c "Print :ComponentInputModeDict:tsInputModeListKey:${MODE_ID}:tsInputModeAlternateMenuTitleKey" Info.plist)
           CHILD_REPERTOIRE=$(/usr/libexec/PlistBuddy -c "Print :ComponentInputModeDict:tsInputModeListKey:${MODE_ID}:tsInputModeCharacterRepertoireKey" Info.plist | tr -d '[:space:]')
           test "$PARENT_ID" = "$BUNDLE_ID"
           test "$PARENT_ID" != "$MODE_ID"
           test "$MODE_ID" = "$DECLARED_MODE_ID"
           test "$CONNECTION" = 'RimeBuffer_1_Connection'
+          test "$DISPLAY_NAME" = 'RIMES'
+          test "$MENU_TITLE" = 'RIMES'
+          test "$EXECUTABLE" = 'ETInput'
           test "$CHILD_REPERTOIRE" = 'Array{HansHant}'
           # Freeze the input-source identity to exact literals. The structure
           # checks above still pass if the whole trio is renamed together, but
           # macOS burns these ids into the protected TIS preferences: any drift
-          # orphans the old rows and stacks duplicate "Enter输入法" entries in
+          # orphans the old rows and stacks duplicate "RIMES" entries in
           # System Settings (this bit us across the 0.3–0.4 renames — see
           # RELEASE.md). Never change these without a migration story.
           test "$BUNDLE_ID" = 'com.isaac.inputmethod.RimeBuffer'
@@ -52,9 +58,21 @@ jobs:
             exit 1
           fi
           xmllint --noout scripts/pkg/distribution.xml
+          for STRINGS in Resources/*.lproj/InfoPlist.strings; do
+            plutil -lint "$STRINGS"
+            for KEY in CFBundleDisplayName CFBundleName "$BUNDLE_ID" "$MODE_ID"; do
+              test "$(/usr/libexec/PlistBuddy -c "Print :$KEY" "$STRINGS")" = 'RIMES'
+            done
+          done
+          bash -n Logo/generate.sh
           bash -n build_install.sh
+          bash -n scripts/lib/rime-user-state.sh
+          bash -n scripts/test-rime-user-state.sh
           bash -n scripts/make-pkg.sh
           bash -n scripts/pkg/scripts/postinstall
+
+      - name: Preserve durable user state across reseed
+        run: scripts/test-rime-user-state.sh
 
       # Privacy: the log must never carry user-entered/committed text. The
       # scanner follows multiline/raw strings and nested interpolation, while
@@ -93,6 +111,7 @@ jobs:
             plugin-platform-smoke
             translation-smoke
             ai-text-smoke
+            stream-input-smoke
             settings-routing-smoke
             history-heatmap-smoke
             typing-speed-smoke

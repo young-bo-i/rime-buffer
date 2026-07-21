@@ -17,6 +17,26 @@ struct TranslationLanguageOption: Equatable, Hashable {
 struct TranslationOutputBlock: Equatable {
     let id: UUID
     let text: String
+    /// Optional alternative number used by consciousness-stream input. Other
+    /// derived rails remain unnumbered through the defaults below.
+    let ordinal: Int?
+    let selected: Bool
+    /// UTF-16 offset where an inert tail retained from the previous global
+    /// request begins. The renderer dims only that tail; delivery never reads
+    /// this presentation metadata.
+    let retainedTailStart: Int?
+
+    init(id: UUID,
+         text: String,
+         ordinal: Int? = nil,
+         selected: Bool = false,
+         retainedTailStart: Int? = nil) {
+        self.id = id
+        self.text = text
+        self.ordinal = ordinal
+        self.selected = selected
+        self.retainedTailStart = retainedTailStart
+    }
 }
 
 struct TranslationRailSnapshot: Equatable {
@@ -712,6 +732,8 @@ final class AppleTranslationWorkspace {
 
     private func notifyChange() {
         NotificationCenter.default.post(name: .appleTranslationWorkspaceDidChange,
+                                        object: self)
+        NotificationCenter.default.post(name: .derivedBufferWorkspaceDidChange,
                                         object: self)
     }
 

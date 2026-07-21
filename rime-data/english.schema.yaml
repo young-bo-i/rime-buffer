@@ -6,7 +6,7 @@ schema:
   name: 英文
   version: "1.0"
   author:
-    - Enter输入法
+    - RIMES
   description: |
     独立英文输入方案：常用词候选、前缀补全、用户调频，
     并以原始输入候选兜底未收录的生词和技术字符串。

@@ -306,7 +306,11 @@ final class LocalGateway {
                 json(["jsonrpc": "2.0", "id": id, "result": [
                     "protocolVersion": chosen,
                     "capabilities": ["tools": ["listChanged": false]],
-                    "serverInfo": ["name": "Enter输入法", "title": "Enter输入法 缓冲区", "version": "1"],
+                    "serverInfo": [
+                        "name": ProductIdentity.displayName,
+                        "title": "\(ProductIdentity.displayName) 缓冲区",
+                        "version": "1",
+                    ],
                     "instructions": "把文字送进用户输入法的缓冲区收件箱，等用户确认后由用户上屏。"
                         + "只进不出：无法读取缓冲区，也不会自动上屏。",
                 ]])
@@ -375,7 +379,7 @@ final class LocalGateway {
         private static let toolList: [[String: Any]] = [
             ["name": "buffer_push",
              "title": "送入缓冲区",
-             "description": "把一段文字送进 Enter输入法 的缓冲区收件箱，等用户确认后上屏。不会自动上屏。",
+             "description": "把一段文字送进 \(ProductIdentity.displayName) 的缓冲区收件箱，等用户确认后上屏。不会自动上屏。",
              "inputSchema": ["type": "object",
                              "properties": ["text": ["type": "string", "description": "要送入的文字"],
                                             "title": ["type": "string", "description": "可选来源标题"]],

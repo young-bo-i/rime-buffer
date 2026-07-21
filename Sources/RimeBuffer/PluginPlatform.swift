@@ -3,6 +3,9 @@ import Foundation
 
 extension Notification.Name {
     static let pluginRegistryDidChange = Notification.Name("RimeBuffer.PluginRegistry.didChange")
+    static let externalActionManifestSetDidChange = Notification.Name(
+        "RimeBuffer.ExternalActionManifestSet.didChange"
+    )
     static let activeBufferPluginDidChange = Notification.Name(
         "RimeBuffer.ActiveBufferPlugin.didChange"
     )
@@ -128,6 +131,10 @@ final class BufferPluginSelectionStore {
         static let hasSelection = "plugins.buffer.active.hasValue.v1"
         static let domain = "plugins.buffer.active.domain.v1"
         static let rawID = "plugins.buffer.active.rawID.v1"
+        // The first selection build wrote hasSelection=false merely because
+        // Rime started before Marine installed its manifest. Once this marker
+        // exists, a false value is known to be an intentional v2 choice.
+        static let selectionSemanticsV2 = "plugins.buffer.active.semantics.v2"
     }
 
     private let defaults: UserDefaults
@@ -180,7 +187,8 @@ final class BufferPluginSelectionStore {
     /// Plugin remains the initial owner. Translation is never activated merely
     /// by upgrading the app, so local text is not processed unexpectedly.
     func migrateDefaultIfNeeded(from plugins: [RegisteredPlugin]) {
-        guard defaults.object(forKey: Key.hasSelection) == nil else {
+        if defaults.bool(forKey: Key.hasSelection) {
+            defaults.set(true, forKey: Key.selectionSemanticsV2)
             reconcile(with: plugins)
             return
         }
@@ -189,28 +197,47 @@ final class BufferPluginSelectionStore {
                 && $0.descriptor.source == .external
                 && $0.descriptor.capabilities.contains(.bufferAction)
         }
-        persist(external?.descriptor.key, notify: false)
+        // Keep the sentinel absent when Rime starts before an external
+        // provider such as Marine. A later managed install may then perform
+        // the same one-time migration. Repair one legacy false sentinel left
+        // by the first selection build; clear() writes the v2 marker, so a new
+        // explicit choice of “无插件” is never overridden.
+        let hasStoredSelection = defaults.object(forKey: Key.hasSelection) != nil
+        if hasStoredSelection && defaults.bool(forKey: Key.selectionSemanticsV2) {
+            return
+        }
+        guard let external else { return }
+        persist(external.descriptor.key)
     }
 
     func reconcile(with plugins: [RegisteredPlugin]) {
         guard let activeKey else { return }
-        let remainsValid = plugins.contains {
-            $0.descriptor.key == activeKey
-                && $0.isEnabled
-                && $0.descriptor.capabilities.contains(.bufferAction)
+        if let current = plugins.first(where: { $0.descriptor.key == activeKey }) {
+            if !current.isEnabled
+                || !current.descriptor.capabilities.contains(.bufferAction) {
+                persist(nil)
+            }
+            return
         }
-        if !remainsValid { persist(nil) }
+        // External manifests may temporarily disappear while another process
+        // replaces or restores their directory. Preserve the desired owner so
+        // it resumes automatically; explicit disable/uninstall paths revoke it
+        // via clearIfSelected(). Missing built-ins are not recoverable.
+        if activeKey.domain != .externalActionV1 { persist(nil) }
     }
 
     private func persist(_ key: PluginKey?, notify: Bool = true) {
         let previous = activeKey
-        guard previous != key || defaults.object(forKey: Key.hasSelection) == nil else {
+        let hasStoredSelection = defaults.object(forKey: Key.hasSelection) != nil
+        let hasV2Semantics = defaults.bool(forKey: Key.selectionSemanticsV2)
+        guard previous != key || !hasStoredSelection || !hasV2Semantics else {
             return
         }
         defaults.set(key != nil, forKey: Key.hasSelection)
         defaults.set(key?.domain.rawValue, forKey: Key.domain)
         defaults.set(key?.rawID, forKey: Key.rawID)
-        guard notify else { return }
+        defaults.set(true, forKey: Key.selectionSemanticsV2)
+        guard notify, previous != key else { return }
         NotificationCenter.default.post(name: .activeBufferPluginDidChange,
                                         object: self,
                                         userInfo: ["previous": previous as Any,
@@ -229,6 +256,7 @@ final class PluginRegistry {
     private var internalPlugins: [String: any InternalPlugin] = [:]
     private var disabledInternalIDs: Set<String>
     private var actionPluginObserver: NSObjectProtocol?
+    private var manifestSetObserver: NSObjectProtocol?
 
     init(internalPlugins plugins: [any InternalPlugin],
          defaults: UserDefaults = .standard,
@@ -267,6 +295,26 @@ final class PluginRegistry {
             guard let self,
                   notification.userInfo?[ActionPluginManager.rootPathUserInfoKey] as? String
                     == self.externalManager.rootURL.path else { return }
+            if let pluginID = notification.userInfo?[ActionPluginManager.changedPluginIDUserInfoKey]
+                as? String {
+                let key = PluginKey(domain: .externalActionV1, rawID: pluginID)
+                let remainsSelectable = self.externalManager.listInstalledPlugins().contains {
+                    $0.id == pluginID && $0.isEnabled
+                }
+                if !remainsSelectable {
+                    self.bufferPluginSelection.clearIfSelected(key)
+                }
+            }
+            self.notifyChange()
+        }
+        manifestSetObserver = NotificationCenter.default.addObserver(
+            forName: .externalActionManifestSetDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self,
+                  notification.userInfo?[ActionPluginManager.rootPathUserInfoKey] as? String
+                    == self.externalManager.rootURL.path else { return }
             self.notifyChange()
         }
     }
@@ -274,6 +322,9 @@ final class PluginRegistry {
     deinit {
         if let actionPluginObserver {
             NotificationCenter.default.removeObserver(actionPluginObserver)
+        }
+        if let manifestSetObserver {
+            NotificationCenter.default.removeObserver(manifestSetObserver)
         }
         for plugin in internalPlugins.values { plugin.stop() }
     }
@@ -430,7 +481,7 @@ final class PluginRegistry {
     }
 
     private func notifyChange() {
-        bufferPluginSelection.reconcile(with: allPlugins())
+        bufferPluginSelection.migrateDefaultIfNeeded(from: allPlugins())
         NotificationCenter.default.post(name: .pluginRegistryDidChange, object: self)
     }
 }

@@ -1,3 +1,5 @@
-# Enter输入法 Logo2
+# RIMES Brand Assets
 
-The new icon set uses a rounded ET monogram as a cue for Enter, with a small candidate-bar underline to connect the mark to Chinese input and IME composition. The primary color is a deep teal chosen for macOS light/dark contrast, with white and a mint accent kept bold enough to survive 16px rendering. Regenerate all derived assets with `bash Logo2/generate.sh`.
+The icon system uses the exact vector paths supplied for RIMES. `rimes-mark.svg` is the authoritative black master. The full macOS app icon places it on a deep-teal squircle, while the 16pt input-source and menu-bar variants preserve the same paths with optical scaling and platform-appropriate color.
+
+Regenerate and synchronize every derived SVG/PDF/ICNS asset with `bash Logo/generate.sh` from the repository root.

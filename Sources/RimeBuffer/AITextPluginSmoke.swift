@@ -823,6 +823,9 @@ private enum AITextPluginSmoke {
               blocks[1].index == 1 else { return false }
         guard let fenced = try? AITextResultDecoder.decodeFinalText("```json\n\(structured)\n```"),
               fenced == blocks else { return false }
+        guard let uppercaseFenced = try? AITextResultDecoder.decodeFinalText(
+            "```JSON\n\(structured)\n```"
+        ), uppercaseFenced == blocks else { return false }
         guard let fallback = try? AITextResultDecoder.decodeFinalText("甲\n\n乙"),
               fallback.map(\.text) == ["甲\n\n", "乙"] else { return false }
         let fineSource = "第一句，第二句。第三句\n第四句；第五句！"
@@ -873,6 +876,44 @@ private enum AITextPluginSmoke {
             "{\"blocks\":[{\"text\":\"第一块\"},{\"text\":\"第二"
         )
         guard twoPartial.map(\.text) == ["第一块", "第二"] else { return false }
+
+        let alternatives = """
+        {"blocks":[{"text":"修复一个问题。不要拆分。","title":"ignored"},{"text":"修复仪表问题。","title":null},{"text":"修复一格问题。","title":null}]}
+        """
+        guard let guesses = try? AITextResultDecoder
+            .decodeAlternativeGuesses(alternatives),
+              guesses.map(\.index) == [0, 1, 2],
+              guesses.map(\.text) == [
+                "修复一个问题。不要拆分。",
+                "修复仪表问题。",
+                "修复一格问题。",
+              ],
+              guesses.allSatisfy({ $0.title == nil }),
+              (try? AITextResultDecoder.decodeAlternativeGuesses(
+                """
+                {"blocks":[{"text":"一","title":null},{"text":"二","title":null},{"text":"三","title":null},{"text":"四","title":null}]}
+                """
+              )) == nil,
+              (try? AITextResultDecoder.decodeAlternativeGuesses("plain text")) == nil else {
+            return false
+        }
+        guard let uppercaseFencedGuesses = try? AITextResultDecoder
+            .decodeAlternativeGuesses("```JSON\n\(alternatives)\n```"),
+              uppercaseFencedGuesses == guesses else { return false }
+        let alternativePartial = AITextProviderStreamingOutput.blocks(
+            from: "{\"blocks\":[{\"text\":\"第一句，第二",
+            outputContract: .alternativeGuesses
+        )
+        guard alternativePartial.count == 1,
+              alternativePartial.first?.text == "第一句，第二" else { return false }
+        let uppercaseFencedPartial = AITextProviderStreamingOutput.blocks(
+            from: "```JSON\n{\"blocks\":[{\"text\":\"大写围栏也能流式",
+            outputContract: .alternativeGuesses
+        )
+        guard uppercaseFencedPartial.count == 1,
+              uppercaseFencedPartial.first?.text == "大写围栏也能流式" else {
+            return false
+        }
         return (try? AITextResultDecoder.decodeFinalText("   ")) == nil
     }
 
@@ -1003,6 +1044,58 @@ private enum AITextPluginSmoke {
         (try? AITextOpenAIResponseDecoder.streamUpdate(from: finishedPayload))?.finished == true else {
             return false
         }
+
+        // Feed a complete Chinese alternative stream one byte at a time. This
+        // deterministically cuts through UTF-8 scalars, JSON payloads, CRLF
+        // frame boundaries, and the protocol terminator without a real API.
+        let alternativeDeltas = [
+            "{\"blocks\":[{\"text\":\"我想修",
+            "复这个分词问题。\",\"title\":null},{\"text\":\"另一",
+            "种理解。\",\"title\":null}]}",
+        ]
+        var alternativeWire = Data()
+        for delta in alternativeDeltas {
+            guard let data = try? JSONSerialization.data(withJSONObject: [
+                "choices": [["delta": ["content": delta]]],
+            ]), let payload = String(data: data, encoding: .utf8) else {
+                return false
+            }
+            alternativeWire.append(Data("data: \(payload)\r\n\r\n".utf8))
+        }
+        alternativeWire.append(Data("data: [DONE]\r\n\r\n".utf8))
+        guard alternativeWire.range(of: Data("我".utf8)) != nil else { return false }
+
+        var bytewiseSSE = AITextSSEDecoder()
+        var bytewisePayloads: [String] = []
+        for byte in alternativeWire {
+            guard let decoded = try? bytewiseSSE.append(Data([byte])) else {
+                return false
+            }
+            bytewisePayloads.append(contentsOf: decoded)
+        }
+        guard bytewisePayloads.count == alternativeDeltas.count + 1,
+              bytewisePayloads.last == "[DONE]" else { return false }
+
+        var cumulativeAlternative = ""
+        var alternativeSnapshots: [[AITextProviderBlock]] = []
+        for payload in bytewisePayloads.dropLast() {
+            guard let delta = try? AITextOpenAIResponseDecoder.streamDelta(
+                from: payload
+            ) else { return false }
+            cumulativeAlternative += delta
+            alternativeSnapshots.append(AITextProviderStreamingOutput.blocks(
+                from: cumulativeAlternative,
+                outputContract: .alternativeGuesses
+            ))
+        }
+        guard alternativeSnapshots.count == 3,
+              alternativeSnapshots[0].map(\.text) == ["我想修"],
+              alternativeSnapshots[1].map(\.text)
+                == ["我想修复这个分词问题。", "另一"],
+              alternativeSnapshots[2].map(\.text)
+                == ["我想修复这个分词问题。", "另一种理解。"] else {
+            return false
+        }
         return true
     }
 
@@ -1051,6 +1144,34 @@ private enum AITextPluginSmoke {
         } catch {
             return false
         }
+        func makeVersionExecutable(name: String, versionOutput: String) -> URL? {
+            let executable = locatorRoot.appendingPathComponent(name)
+            let script = """
+            #!/bin/sh
+            if [ "$1" = "--version" ]; then
+              printf '%s\\n' '\(versionOutput)'
+              exit 0
+            fi
+            exit 1
+            """
+            do {
+                try Data(script.utf8).write(to: executable, options: .atomic)
+                guard chmod(executable.path, S_IRWXU) == 0 else { return nil }
+                return executable
+            } catch {
+                return nil
+            }
+        }
+        guard let oldCodexExecutable = makeVersionExecutable(
+            name: "codex-0.144.1",
+            versionOutput: "codex-cli 0.144.1"
+        ),
+        let streamCodexExecutable = makeVersionExecutable(
+            name: "codex-0.145.0-alpha.18",
+            versionOutput: "codex-cli 0.145.0-alpha.18"
+        ) else {
+            return false
+        }
         var compatibilitySawCanonicalURL = false
         let canonicalPinnedExecutable = AITextCLIExecutableLocator.compatibleExecutable(
             for: .codexCLI,
@@ -1084,9 +1205,73 @@ private enum AITextPluginSmoke {
               (codexCandidates.firstIndex(
                 of: AITextCLIExecutableLocator.bundledChatGPTCodexPath
               ) ?? Int.max)
-                < (codexCandidates.firstIndex(of: "/opt/homebrew/bin/codex") ?? Int.max) else {
+                < (codexCandidates.firstIndex(of: "/opt/homebrew/bin/codex") ?? Int.max),
+              AITextCodexCompatibility.accepts(
+                versionOutput: "codex-cli 0.144.1\n"
+              ),
+              AITextCodexCompatibility.accepts(
+                versionOutput: "codex-cli 0.145.0-alpha.18"
+              ),
+              !AITextCodexCompatibility.accepts(
+                versionOutput: "codex-cli 0.144.1",
+                inferenceProfile: .streamInput
+              ),
+              AITextCodexCompatibility.accepts(
+                versionOutput: "codex-cli 0.145.0-alpha.18\n",
+                inferenceProfile: .streamInput
+              ),
+              AITextCodexCompatibility.allowedVersionOutput(for: nil)
+                == AITextCodexCompatibility.supportedVersionOutput,
+              AITextCodexCompatibility.allowedVersionOutput(for: .streamInput)
+                == AITextCodexCompatibility.streamInputSupportedVersionOutput else {
             return false
         }
+
+        let ordinaryOldCodex = CodexCLITextProvider(
+            environment: ["HOME": "/tmp"],
+            homeStore: AITextCodexHomeStore(
+                rootDirectory: locatorRoot.appendingPathComponent("ordinary-old-home")
+            ),
+            executableResolver: { oldCodexExecutable }
+        )
+        guard waitUntil(timeout: 2, {
+            if case let .unavailable(message) = ordinaryOldCodex.availability {
+                return message.contains("尚未完成")
+            }
+            return false
+        }) else { return false }
+
+        let streamOldCodex = CodexCLITextProvider(
+            environment: ["HOME": "/tmp"],
+            homeStore: AITextCodexHomeStore(
+                rootDirectory: locatorRoot.appendingPathComponent("stream-old-home")
+            ),
+            inferenceProfile: .streamInput,
+            executableResolver: { oldCodexExecutable }
+        )
+        guard waitUntil(timeout: 2, {
+            if case let .unavailable(message) = streamOldCodex.availability {
+                return message.contains("意识流输入")
+                    && message.contains("codex-cli 0.145.0-alpha.18")
+            }
+            return false
+        }) else { return false }
+
+        let streamCurrentCodex = CodexCLITextProvider(
+            environment: ["HOME": "/tmp"],
+            homeStore: AITextCodexHomeStore(
+                rootDirectory: locatorRoot.appendingPathComponent("stream-current-home")
+            ),
+            inferenceProfile: .streamInput,
+            executableResolver: { streamCodexExecutable }
+        )
+        guard waitUntil(timeout: 2, {
+            if case let .unavailable(message) = streamCurrentCodex.availability {
+                return message.contains("尚未完成")
+            }
+            return false
+        }) else { return false }
+
         guard AITextFoundationCLIStreamingSmoke.run() else {
             print("AI text CLI smoke failed: process streaming")
             return false
@@ -1189,6 +1374,28 @@ private enum AITextPluginSmoke {
         )
         guard case .failure(.unavailable)? = unsupportedResult else { return false }
 
+        let unsupportedStreamCodex = CodexCLITextProvider(
+            environment: ["HOME": "/tmp"],
+            inferenceProfile: .streamInput,
+            executableResolver: { fakeExecutable },
+            compatibilityResolver: { _ in false }
+        )
+        guard waitUntil(timeout: 2, {
+            if case let .unavailable(message) = unsupportedStreamCodex.availability {
+                return message.contains("意识流输入")
+                    && message.contains("codex-cli 0.145.0-alpha.18")
+            }
+            return false
+        }) else { return false }
+        var unsupportedStreamResult: Result<[AITextProviderBlock], AITextProviderError>?
+        _ = unsupportedStreamCodex.generate(
+            AITextProviderRequest(requestID: UUID(), sourceText: "must-not-send-stream"),
+            onEvent: { _ in },
+            completion: { unsupportedStreamResult = $0 }
+        )
+        guard case let .failure(.unavailable(message))? = unsupportedStreamResult,
+              message.contains("codex-cli 0.145.0-alpha.18") else { return false }
+
         let authenticationGate = DispatchSemaphore(value: 0)
         let nonblockingClaude = ClaudeCodeCLITextProvider(
             environment: ["HOME": "/tmp"],
@@ -1281,6 +1488,8 @@ private enum AITextPluginSmoke {
               AITextCodexCompatibility.supportedVersionOutput.contains(
                 "codex-cli 0.145.0-alpha.18"
               ),
+              AITextCodexCompatibility.streamInputSupportedVersionOutput
+                == ["codex-cli 0.145.0-alpha.18"],
               AITextClaudeCompatibility.supportedVersionOutput.contains(
                 "2.1.211 (Claude Code)"
               ),
@@ -1346,12 +1555,24 @@ private enum AITextPluginSmoke {
             .appendingPathComponent("RimeBuffer-AI-Smoke-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let store = OpenAICompatibleConfigurationStore(rootDirectory: root)
+        var configurationChangeCount = 0
+        let observer = NotificationCenter.default.addObserver(
+            forName: .openAICompatibleConfigurationDidChange,
+            object: store,
+            queue: nil
+        ) { _ in
+            configurationChangeCount += 1
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
         let configuration = OpenAICompatibleConfiguration(baseURL: "https://example.com/v1/",
                                                            model: "example-model",
                                                            apiKey: "secret-value")
         do {
             try store.save(configuration)
-            guard try store.load() == configuration else { return false }
+            let reloadedStore = OpenAICompatibleConfigurationStore(rootDirectory: root)
+            guard try store.load() == configuration,
+                  try reloadedStore.load() == configuration,
+                  configurationChangeCount == 1 else { return false }
         } catch {
             return false
         }
@@ -1370,6 +1591,9 @@ private enum AITextPluginSmoke {
             from: "http://127.0.0.1:8080/v1"
         )) != nil,
         (try? OpenAICompatibleEndpoint.chatCompletionsURL(
+            from: "https://apidoc.cometapi.com/v1"
+        )) == nil,
+        (try? OpenAICompatibleEndpoint.chatCompletionsURL(
             from: "https://user:password@example.com/v1"
         )) == nil else { return false }
 
@@ -1383,7 +1607,11 @@ private enum AITextPluginSmoke {
         let body = request.httpBody,
         let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
         object["model"] as? String == "example-model",
-        object["stream"] as? Bool == true else { return false }
+        object["stream"] as? Bool == true,
+        object["temperature"] == nil,
+        object["thinking"] == nil,
+        object["response_format"] == nil,
+        object["max_tokens"] == nil else { return false }
 
         guard let preparedRequest = try? AITextOpenAIRequestBuilder.makeRequest(
             configuration: configuration,
@@ -1398,8 +1626,56 @@ private enum AITextPluginSmoke {
             return false
         }
 
+        guard let alternativesRequest = try? AITextOpenAIRequestBuilder.makeRequest(
+            configuration: configuration,
+            sourceText: "continuous-full-pinyin",
+            preparedPrompt: "prepared-stream-prompt",
+            outputContract: .alternativeGuesses
+        ),
+        let alternativesBody = alternativesRequest.httpBody,
+        !String(decoding: alternativesBody, as: UTF8.self).contains("secret-value"),
+        let alternativesObject = try? JSONSerialization.jsonObject(
+            with: alternativesBody
+        ) as? [String: Any],
+        alternativesObject["model"] as? String == "example-model",
+        alternativesObject["temperature"] as? Double == 0.2,
+        let thinking = alternativesObject["thinking"] as? [String: Any],
+        thinking["type"] as? String == "disabled",
+        let responseFormat = alternativesObject["response_format"] as? [String: Any],
+        responseFormat["type"] as? String == "json_object",
+        alternativesObject["max_tokens"] as? Int == 1_024,
+        alternativesObject["reasoning_effort"] == nil,
+        let alternativesMessages = alternativesObject["messages"] as? [[String: Any]],
+        let alternativesSystem = alternativesMessages.first?["content"] as? String,
+        alternativesSystem.contains("1 to 3 complete"),
+        alternativesSystem.contains("mutually exclusive"),
+        alternativesMessages.last?["content"] as? String == "prepared-stream-prompt" else {
+            return false
+        }
+
+        do {
+            let legacy = OpenAICompatibleConfiguration(
+                baseURL: "https://apidoc.cometapi.com/v1/",
+                model: "deepseek-v4-flash",
+                apiKey: "legacy-test-only"
+            )
+            let legacyData = try JSONEncoder().encode(legacy)
+            try legacyData.write(to: store.configurationURL, options: .atomic)
+            guard chmod(store.configurationURL.path, S_IRUSR | S_IWUSR) == 0,
+                  let migrated = try store.load(),
+                  migrated.baseURL == "https://api.cometapi.com/v1",
+                  migrated.model == legacy.model,
+                  migrated.apiKey == legacy.apiKey,
+                  configurationChangeCount == 2,
+                  try OpenAICompatibleConfigurationStore(rootDirectory: root).load()
+                    == migrated else { return false }
+        } catch {
+            return false
+        }
+
         do {
             try store.delete()
+            guard configurationChangeCount == 3 else { return false }
             let target = root.appendingPathComponent("outside")
             try Data("{}".utf8).write(to: target)
             try FileManager.default.createSymbolicLink(at: store.configurationURL,
@@ -1497,6 +1773,54 @@ private enum AITextPluginSmoke {
               streamed.events.contains(where: {
                   if case .blockSnapshot = $0 { return true }
                   return false
+              }) else { return false }
+
+        guard let alternativesFirst = payload(
+            "{\"blocks\":[{\"text\":\"完整第一句。仍是同一个猜测。\",\"title\":null},{\"text\":\"另一"
+        ),
+        let alternativesSecond = payload("种理解。\",\"title\":null}]}") else {
+            return false
+        }
+        AITextSmokeURLProtocol.install { protocolInstance in
+            guard let response = HTTPURLResponse(
+                url: protocolInstance.request.url!,
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "text/event-stream"]
+            ) else { return }
+            protocolInstance.client?.urlProtocol(protocolInstance,
+                                                 didReceive: response,
+                                                 cacheStoragePolicy: .notAllowed)
+            let frames = "data: \(alternativesFirst)\n\ndata: \(alternativesSecond)\n\ndata: [DONE]\n\n"
+            protocolInstance.client?.urlProtocol(protocolInstance,
+                                                 didLoad: Data(frames.utf8))
+            protocolInstance.client?.urlProtocolDidFinishLoading(protocolInstance)
+        }
+        let alternativesRecorder = AITextOpenAISmokeRecorder()
+        _ = provider.generate(
+            AITextProviderRequest(
+                requestID: UUID(),
+                sourceText: "complete stream source",
+                preparedPrompt: "complete stream prompt",
+                outputContract: .alternativeGuesses
+            ),
+            onEvent: { alternativesRecorder.record($0) },
+            completion: { alternativesRecorder.record($0) }
+        )
+        guard runLoopUntil({ !alternativesRecorder.snapshot().results.isEmpty }) else {
+            return false
+        }
+        let alternativeStream = alternativesRecorder.snapshot()
+        guard alternativeStream.results.count == 1,
+              case let .success(alternativeBlocks) = alternativeStream.results[0],
+              alternativeBlocks.map(\.text) == [
+                "完整第一句。仍是同一个猜测。",
+                "另一种理解。",
+              ],
+              alternativeStream.events.contains(where: {
+                guard case let .blockSnapshot(block) = $0 else { return false }
+                return block.index == 0
+                    && block.text.contains("完整第一句。仍是同一个猜测。")
               }) else { return false }
 
         AITextSmokeURLProtocol.install { protocolInstance in

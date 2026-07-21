@@ -165,7 +165,7 @@ final class StatusMenu {
         }
 
         let alert = NSAlert()
-        alert.messageText = "重新安装 Enter输入法？"
+        alert.messageText = "重新安装 \(ProductIdentity.displayName)？"
         alert.informativeText = "将从 \(script.deletingLastPathComponent().path) 运行 build_install.sh。构建完成后当前输入法进程会被重启。"
         alert.addButton(withTitle: "重新安装")
         alert.addButton(withTitle: "取消")

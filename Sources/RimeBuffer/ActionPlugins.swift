@@ -1551,6 +1551,7 @@ final class ActionPluginHost {
     private var managementObserver: NSObjectProtocol?
     private var bufferObserver: NSObjectProtocol?
     private var plugins: [String: InstalledActionPlugin] = [:]
+    private var installedManifestSnapshot: [String: InstalledActionPlugin] = [:]
     private var statuses: [ActionPluginKey: ObservedStatus] = [:]
     private var failures: [ActionPluginKey: String] = [:]
     private var statusRequests: [ActionPluginKey: StatusRequest] = [:]
@@ -2655,11 +2656,33 @@ final class ActionPluginHost {
     private func reloadManifests(force: Bool) {
         guard force else { return }
         lastManifestReload = ProcessInfo.processInfo.systemUptime
+        let installed = Dictionary(
+            ActionPluginManifestLoader.load(from: rootURL)
+                .map { ($0.manifest.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
         let loaded = Dictionary(
             pluginLoader(rootURL)
                 .map { ($0.manifest.id, $0) },
             uniquingKeysWith: { first, _ in first }
         )
+
+        if installed != installedManifestSnapshot {
+            installedManifestSnapshot = installed
+            // Marine owns its manifest and may atomically install/restore it
+            // without going through ActionPluginManager. Observe the complete
+            // installed set (including disabled plugins), then notify on the
+            // next main-loop turn to avoid reentering this reload transaction.
+            let changedRoot = rootURL.standardizedFileURL.path
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(
+                    name: .externalActionManifestSetDidChange,
+                    object: nil,
+                    userInfo: [ActionPluginManager.rootPathUserInfoKey: changedRoot]
+                )
+            }
+        }
+
         guard loaded != plugins else { return }
         hostGeneration &+= 1
         let previousPlugins = plugins

@@ -11,6 +11,14 @@ import Foundation
 enum IMELog {
     private static let url = URL(fileURLWithPath: NSHomeDirectory())
         .appendingPathComponent("rimebuffer.log")
+    /// One process-wide writer keeps overlapping provider/controller queues
+    /// from racing through independent seek-to-end operations. Ordinary writes
+    /// are asynchronous so diagnostics never delay an IMK key callback or a
+    /// streaming model delta.
+    private static let writerQueue = DispatchQueue(
+        label: "RimeBuffer.IMELog.writer",
+        qos: .utility
+    )
 
     /// Create the log 0600 (owner-only), and tighten an existing world-readable
     /// file in place. Runs once, lazily and thread-safely.
@@ -31,18 +39,28 @@ enum IMELog {
     static func redact(_ text: String) -> String { "⟨\(text.count)⟩" }
 
     static func write(_ message: String) {
-        _ = prepared
         let line = "\(Date().timeIntervalSince1970) \(message)\n"
         guard let data = line.data(using: .utf8) else { return }
-        if let handle = try? FileHandle(forWritingTo: url) {
-            handle.seekToEndOfFile(); handle.write(data); try? handle.close()
-        } else {
-            try? data.write(to: url)
+        writerQueue.async {
+            _ = prepared
+            if let handle = try? FileHandle(forWritingTo: url) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                try? handle.close()
+            } else {
+                try? data.write(to: url)
+            }
         }
     }
 
     static func reset(_ header: String) {
-        _ = prepared
-        try? "\(Date().timeIntervalSince1970) \(header)\n".data(using: .utf8)?.write(to: url)
+        // Reset runs once during launch. Make it synchronous so every later
+        // asynchronous write is ordered strictly after the new header.
+        writerQueue.sync {
+            _ = prepared
+            try? "\(Date().timeIntervalSince1970) \(header)\n"
+                .data(using: .utf8)?
+                .write(to: url)
+        }
     }
 }

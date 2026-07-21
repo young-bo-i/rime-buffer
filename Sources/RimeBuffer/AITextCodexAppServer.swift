@@ -1,6 +1,69 @@
 import Darwin
 import Foundation
 
+/// Optional request-level model policy. Keeping this on the operation rather
+/// than in the shared Codex home prevents one latency-sensitive plugin from
+/// changing the user's ordinary AI connector defaults.
+struct AITextCodexInferenceProfile: Equatable {
+    let model: String
+    let effort: String
+    let summary: String
+    let allowProviderModelFallback: Bool
+    let rejectModelReroute: Bool
+
+    static let streamInput = AITextCodexInferenceProfile(
+        model: "gpt-5.6-luna",
+        effort: "low",
+        summary: "none",
+        allowProviderModelFallback: false,
+        rejectModelReroute: true
+    )
+}
+
+/// Pure request construction keeps the optional inference policy auditable and
+/// lets smoke tests prove that the ordinary connector's wire shape is unchanged.
+private enum AITextCodexAppServerRequestShape {
+    static func threadStartParameters(
+        currentDirectoryURL: URL,
+        inferenceProfile: AITextCodexInferenceProfile?
+    ) -> [String: Any] {
+        var parameters: [String: Any] = [
+            "cwd": currentDirectoryURL.path,
+            "approvalPolicy": "never",
+            "ephemeral": true,
+            "personality": "none",
+        ]
+        if let inferenceProfile {
+            parameters["model"] = inferenceProfile.model
+            parameters["allowProviderModelFallback"] =
+                inferenceProfile.allowProviderModelFallback
+            parameters["config"] = [
+                "model_reasoning_effort": inferenceProfile.effort,
+            ]
+        }
+        return parameters
+    }
+
+    static func turnStartParameters(
+        threadID: String,
+        prompt: String,
+        outputSchema: [String: Any],
+        inferenceProfile: AITextCodexInferenceProfile?
+    ) -> [String: Any] {
+        var parameters: [String: Any] = [
+            "threadId": threadID,
+            "input": [["type": "text", "text": prompt]],
+            "outputSchema": outputSchema,
+            "summary": inferenceProfile?.summary ?? "concise",
+        ]
+        if let inferenceProfile {
+            parameters["model"] = inferenceProfile.model
+            parameters["effort"] = inferenceProfile.effort
+        }
+        return parameters
+    }
+}
+
 /// One-shot Codex app-server session used by the Codex subscription connector.
 /// The process is still the locally authenticated Codex CLI; app-server is used
 /// because `codex exec --json` deliberately emits completed messages rather
@@ -19,6 +82,7 @@ final class AITextCodexAppServerOperation: AITextCancellable {
     private let currentDirectoryURL: URL
     private let prompt: String
     private let outputSchema: [String: Any]
+    private let inferenceProfile: AITextCodexInferenceProfile?
     private let timeout: TimeInterval
     private let maximumOutputBytes: Int
     private let onEvent: (AITextProviderEvent) -> Void
@@ -35,7 +99,7 @@ final class AITextCodexAppServerOperation: AITextCancellable {
     private var process: Process?
     private var standardInput: FileHandle?
     private var timeoutWorkItem: DispatchWorkItem?
-    private var protocolState = AITextCodexAppServerProtocolState()
+    private var protocolState: AITextCodexAppServerProtocolState
     private var lineBuffer = Data()
     private var receivedOutputBytes = 0
     private var activeThreadID: String?
@@ -49,6 +113,7 @@ final class AITextCodexAppServerOperation: AITextCancellable {
          currentDirectoryURL: URL,
          prompt: String,
          outputSchema: [String: Any],
+         inferenceProfile: AITextCodexInferenceProfile? = nil,
          timeout: TimeInterval,
          maximumOutputBytes: Int,
          onEvent: @escaping (AITextProviderEvent) -> Void,
@@ -60,6 +125,12 @@ final class AITextCodexAppServerOperation: AITextCancellable {
         self.currentDirectoryURL = currentDirectoryURL
         self.prompt = prompt
         self.outputSchema = outputSchema
+        self.inferenceProfile = inferenceProfile
+        let rejectsReroute = inferenceProfile?.rejectModelReroute ?? false
+        protocolState = AITextCodexAppServerProtocolState(
+            requiredModel: rejectsReroute ? inferenceProfile?.model : nil,
+            rejectModelReroute: rejectsReroute
+        )
         self.timeout = timeout
         self.maximumOutputBytes = maximumOutputBytes
         self.onEvent = onEvent
@@ -192,7 +263,7 @@ final class AITextCodexAppServerOperation: AITextCancellable {
             "params": [
                 "clientInfo": [
                     "name": "rimebuffer",
-                    "title": "RimeBuffer",
+                    "title": ProductIdentity.displayName,
                     "version": "1",
                 ],
             ],
@@ -221,15 +292,14 @@ final class AITextCodexAppServerOperation: AITextCancellable {
         // The process-level `rimebuffer` permission profile is authoritative.
         // Do not send the legacy sandbox shorthand here: doing so would replace
         // the profile that limits reads to this private per-request directory.
+        let parameters = AITextCodexAppServerRequestShape.threadStartParameters(
+            currentDirectoryURL: currentDirectoryURL,
+            inferenceProfile: inferenceProfile
+        )
         guard send([
             "method": "thread/start",
             "id": AITextCodexAppServerProtocolState.threadStartRequestID,
-            "params": [
-                "cwd": currentDirectoryURL.path,
-                "approvalPolicy": "never",
-                "ephemeral": true,
-                "personality": "none",
-            ],
+            "params": parameters,
         ]) else {
             finish(.failure(.failed))
             return
@@ -237,15 +307,16 @@ final class AITextCodexAppServerOperation: AITextCancellable {
     }
 
     private func sendTurnStart(threadID: String) {
+        let parameters = AITextCodexAppServerRequestShape.turnStartParameters(
+            threadID: threadID,
+            prompt: prompt,
+            outputSchema: outputSchema,
+            inferenceProfile: inferenceProfile
+        )
         guard send([
             "method": "turn/start",
             "id": AITextCodexAppServerProtocolState.turnStartRequestID,
-            "params": [
-                "threadId": threadID,
-                "input": [["type": "text", "text": prompt]],
-                "outputSchema": outputSchema,
-                "summary": "concise",
-            ],
+            "params": parameters,
         ]) else {
             finish(.failure(.failed))
             return
@@ -453,6 +524,13 @@ struct AITextCodexAppServerProtocolState {
     private var fallbackFinalText: String?
     private var pendingFatalError = false
     private var emittedComposing = false
+    private let requiredModel: String?
+    private let rejectModelReroute: Bool
+
+    init(requiredModel: String? = nil, rejectModelReroute: Bool = false) {
+        self.requiredModel = requiredModel
+        self.rejectModelReroute = rejectModelReroute
+    }
 
     fileprivate mutating func consume(_ object: [String: Any])
         -> [AITextCodexAppServerProtocolAction] {
@@ -477,6 +555,13 @@ struct AITextCodexAppServerProtocolState {
                       let thread = result["thread"] as? [String: Any],
                       let identifier = thread["id"] as? String,
                       !identifier.isEmpty else { return [.failed] }
+                if let requiredModel {
+                    // ThreadStartResponse.model is the authoritative model
+                    // chosen by the provider. Validate it before returning the
+                    // action that sends the user's prompt.
+                    guard let actualModel = result["model"] as? String,
+                          actualModel == requiredModel else { return [.failed] }
+                }
                 threadID = identifier
                 return [
                     .activity(.connecting, "Codex 已连接"),
@@ -529,6 +614,7 @@ struct AITextCodexAppServerProtocolState {
         case "item/completed":
             return itemCompleted(params)
         case "model/rerouted":
+            if rejectModelReroute { return [.failed] }
             return [.activity(.retrying, "模型正在重新路由")]
         case "warning":
             if let message = params["message"] as? String,
@@ -665,6 +751,10 @@ struct AITextCodexAppServerProtocolState {
 
 enum AITextCodexAppServerProtocolSmoke {
     static func run() -> Bool {
+        guard requestShapesAreCorrect(), strictModelLockIsEnforced() else {
+            return false
+        }
+
         var state = AITextCodexAppServerProtocolState()
         guard containsMCPIsolationCheck(state.consume([
             "id": AITextCodexAppServerProtocolState.initializeRequestID,
@@ -764,10 +854,133 @@ enum AITextCodexAppServerProtocolSmoke {
         }
     }
 
+    private static func requestShapesAreCorrect() -> Bool {
+        let workspaceURL = URL(fileURLWithPath: "/tmp/rimes-codex-smoke",
+                               isDirectory: true)
+        let schema: [String: Any] = ["type": "object"]
+
+        let ordinaryThread = AITextCodexAppServerRequestShape.threadStartParameters(
+            currentDirectoryURL: workspaceURL,
+            inferenceProfile: nil
+        )
+        guard ordinaryThread.count == 4,
+              ordinaryThread["cwd"] as? String == workspaceURL.path,
+              ordinaryThread["approvalPolicy"] as? String == "never",
+              ordinaryThread["ephemeral"] as? Bool == true,
+              ordinaryThread["personality"] as? String == "none",
+              ordinaryThread["model"] == nil,
+              ordinaryThread["allowProviderModelFallback"] == nil,
+              ordinaryThread["config"] == nil else { return false }
+
+        let ordinaryTurn = AITextCodexAppServerRequestShape.turnStartParameters(
+            threadID: "ordinary-thread",
+            prompt: "ordinary-prompt",
+            outputSchema: schema,
+            inferenceProfile: nil
+        )
+        guard ordinaryTurn.count == 4,
+              ordinaryTurn["threadId"] as? String == "ordinary-thread",
+              ordinaryTurn["summary"] as? String == "concise",
+              ordinaryTurn["model"] == nil,
+              ordinaryTurn["effort"] == nil else { return false }
+
+        let locked = AITextCodexInferenceProfile.streamInput
+        guard locked.model == "gpt-5.6-luna",
+              locked.effort == "low",
+              locked.summary == "none",
+              !locked.allowProviderModelFallback,
+              locked.rejectModelReroute else { return false }
+
+        let lockedThread = AITextCodexAppServerRequestShape.threadStartParameters(
+            currentDirectoryURL: workspaceURL,
+            inferenceProfile: locked
+        )
+        guard lockedThread["model"] as? String == "gpt-5.6-luna",
+              lockedThread["allowProviderModelFallback"] as? Bool == false,
+              let config = lockedThread["config"] as? [String: Any],
+              config["model_reasoning_effort"] as? String == "low" else {
+            return false
+        }
+
+        let lockedTurn = AITextCodexAppServerRequestShape.turnStartParameters(
+            threadID: "locked-thread",
+            prompt: "locked-prompt",
+            outputSchema: schema,
+            inferenceProfile: locked
+        )
+        return lockedTurn["model"] as? String == "gpt-5.6-luna"
+            && lockedTurn["effort"] as? String == "low"
+            && lockedTurn["summary"] as? String == "none"
+    }
+
+    private static func strictModelLockIsEnforced() -> Bool {
+        let model = AITextCodexInferenceProfile.streamInput.model
+
+        var missingModel = AITextCodexAppServerProtocolState(
+            requiredModel: model,
+            rejectModelReroute: true
+        )
+        let missingActions = missingModel.consume([
+            "id": AITextCodexAppServerProtocolState.threadStartRequestID,
+            "result": ["thread": ["id": "must-not-start"]],
+        ])
+        guard containsFailure(missingActions), missingModel.threadID == nil else {
+            return false
+        }
+
+        var mismatchedModel = AITextCodexAppServerProtocolState(
+            requiredModel: model,
+            rejectModelReroute: true
+        )
+        let mismatchActions = mismatchedModel.consume([
+            "id": AITextCodexAppServerProtocolState.threadStartRequestID,
+            "result": [
+                "model": "gpt-5.6-luna-fallback",
+                "thread": ["id": "must-not-start"],
+            ],
+        ])
+        guard containsFailure(mismatchActions), mismatchedModel.threadID == nil else {
+            return false
+        }
+
+        var exactModel = AITextCodexAppServerProtocolState(
+            requiredModel: model,
+            rejectModelReroute: true
+        )
+        let exactActions = exactModel.consume([
+            "id": AITextCodexAppServerProtocolState.threadStartRequestID,
+            "result": [
+                "model": model,
+                "thread": ["id": "locked-thread"],
+            ],
+        ])
+        guard exactModel.threadID == "locked-thread",
+              containsTurnStart(exactActions, id: "locked-thread") else { return false }
+
+        let rerouted = exactModel.consume([
+            "method": "model/rerouted",
+            "params": ["fromModel": model, "toModel": "fallback"],
+        ])
+        guard containsFailure(rerouted) else { return false }
+
+        var ordinary = AITextCodexAppServerProtocolState()
+        let ordinaryReroute = ordinary.consume([
+            "method": "model/rerouted",
+            "params": ["fromModel": "default", "toModel": "fallback"],
+        ])
+        return containsActivity(ordinaryReroute, kind: .retrying)
+    }
+
     private static func containsSendThreadStart(
         _ actions: [AITextCodexAppServerProtocolAction]
     ) -> Bool {
         actions.contains { if case .sendThreadStart = $0 { return true }; return false }
+    }
+
+    private static func containsFailure(
+        _ actions: [AITextCodexAppServerProtocolAction]
+    ) -> Bool {
+        actions.contains { if case .failed = $0 { return true }; return false }
     }
 
     private static func containsMCPIsolationCheck(

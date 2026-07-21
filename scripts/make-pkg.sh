@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# 打包「Enter输入法」为向导式 .pkg 安装器（装到 /Library/Input Methods 并自动注册）。
+# 打包「RIMES」为向导式 .pkg 安装器（装到 /Library/Input Methods 并自动注册）。
 #
 #   ./scripts/make-pkg.sh <version> <path-to-ETInput.app> [output.pkg]
 #
@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 
 VERSION="${1:?用法: make-pkg.sh <version> <ETInput.app> [out.pkg]}"
 APP="${2:?缺少 ETInput.app 路径}"
-OUT="${3:-ETInput-${VERSION}.pkg}"
+OUT="${3:-RIMES-${VERSION}.pkg}"
 IDENT="com.isaac.inputmethod.RimeBuffer"
 
 [ -d "$APP" ] || { echo "!! 找不到 $APP"; exit 1; }
@@ -20,7 +20,7 @@ IDENT="com.isaac.inputmethod.RimeBuffer"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-# 组件包：把 ETInput.app 装到 /Library/Input Methods，带 postinstall 注册脚本。
+# 组件包：把内部兼容路径 ETInput.app 装到 /Library/Input Methods，带 postinstall 注册脚本。
 mkdir -p "$TMP/root"
 cp -R "$APP" "$TMP/root/ETInput.app"
 chmod +x scripts/pkg/scripts/postinstall

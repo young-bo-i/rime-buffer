@@ -6,6 +6,7 @@ enum BuiltInPluginID {
     static let typingSpeed = "builtin.typing-speed"
     static let flyChordLearning = "builtin.fly-chord-learning"
     static let appleTranslation = "builtin.apple-translation"
+    static let streamInput = "builtin.stream-input"
     static let aiText = AITextBuiltInPluginID.aiText
     // Provider-specific IDs are retained for preference/source compatibility.
     static let codexCLI = AITextBuiltInPluginID.codexCLI
@@ -20,6 +21,7 @@ enum BuiltInPlugins {
             TypingSpeedInternalPlugin(),
             FlyChordLearningInternalPlugin(),
             AppleTranslationInternalPlugin(),
+            StreamInputInternalPlugin(),
             AITextInternalPlugin(),
         ]
     }
@@ -213,6 +215,32 @@ private final class AITextInternalPlugin: InternalPlugin {
             descriptor.key,
             among: [RegisteredPlugin(descriptor: descriptor, isEnabled: true)]
         )
+    }
+}
+
+private final class StreamInputInternalPlugin: InternalPlugin {
+    let descriptor = PluginDescriptor(
+        key: StreamInputWorkspace.pluginKey,
+        wireID: nil,
+        name: "意识流输入",
+        version: "1.0",
+        summary: "连续输入不分词的全拼，由已配置的低延迟 OpenAI 兼容模型实时给出 1–3 个完整猜测。",
+        source: .builtIn,
+        capabilities: [.bufferAction],
+        settings: nil,
+        canUninstall: false
+    )
+
+    func start() {
+        StreamInputWorkspace.shared.start()
+    }
+
+    func stop() {
+        StreamInputWorkspace.shared.stop()
+    }
+
+    func makeSettingsViewController(subpageID: String) -> NSViewController? {
+        nil
     }
 }
 

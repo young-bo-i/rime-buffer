@@ -1,10 +1,14 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
-  <title id="title">Enter输入法 app icon</title>
-  <desc id="desc">A teal macOS squircle containing a rounded ET monogram and a small input candidate bar.</desc>
+  <title id="title">RIMES app icon</title>
+  <desc id="desc">The supplied RIMES mark in white on a deep teal macOS squircle.</desc>
   <defs>
     <linearGradient id="badge" x1="512" y1="64" x2="512" y2="960" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#0A8D84"/>
-      <stop offset="1" stop-color="#046D76"/>
+      <stop offset="0" stop-color="#087E91"/>
+      <stop offset="1" stop-color="#075969"/>
+    </linearGradient>
+    <linearGradient id="shine" x1="180" y1="110" x2="824" y2="820" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity=".15"/>
+      <stop offset=".62" stop-color="#FFFFFF" stop-opacity="0"/>
     </linearGradient>
     <clipPath id="squircle">
       <rect x="64" y="64" width="896" height="896" rx="220"/>
@@ -13,15 +17,16 @@
 
   <g clip-path="url(#squircle)">
     <rect x="64" y="64" width="896" height="896" fill="url(#badge)"/>
-    <path d="M64 64h896v332c-112 48-239 72-381 72-216 0-389-54-515-162V64Z" fill="#FFFFFF" opacity=".12"/>
-    <path d="M64 720c154 88 328 132 522 132 138 0 262-21 374-64v172H64V720Z" fill="#002F35" opacity=".14"/>
+    <path d="M64 64h896v390C817 502 671 526 522 526 326 526 173 478 64 382Z" fill="url(#shine)"/>
+    <path d="M64 754c159 83 331 124 516 124 143 0 270-24 380-72v154H64Z" fill="#003844" opacity=".18"/>
   </g>
+  <rect x="70" y="70" width="884" height="884" rx="214" fill="none" stroke="#FFFFFF" stroke-width="10" opacity=".15"/>
 
-  <rect x="70" y="70" width="884" height="884" rx="214" fill="none" stroke="#FFFFFF" stroke-width="10" opacity=".18"/>
-
-  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M318 296H560M318 512H504M318 728H560M318 296V728" stroke="#F8FFFC" stroke-width="86"/>
-    <path d="M574 296H738M656 296V728" stroke="#F8FFFC" stroke-width="86"/>
-    <path d="M308 822H716" stroke="#B9FFF2" stroke-width="58"/>
+  <g transform="translate(214 202) scale(3.4)" fill="#F8FFFC">
+    <path d="M22.4434 108.584L5.77931 135.369H39.2882L30.786 126.531H22.7559L29.5652 115.586L22.4434 108.584Z"/>
+    <path fill-rule="evenodd" clip-rule="evenodd" d="M60.3352 47.6793H5.77931L29.185 85.3004L44.5352 91.5243L22.7559 56.5175H56.4594L60.3352 47.6793Z"/>
+    <path d="M174.218 47.6793H119.662L123.588 56.5175H157.241L135.462 91.5243L157.241 126.531H113.682L89.9984 164.599L68.5738 130.163L59.9927 134.091L89.6562 181.771L119.662 135.369H174.218L146.94 91.5243L174.218 47.6793Z"/>
+    <path fill-rule="evenodd" clip-rule="evenodd" d="M89.9984 18.4493L74.4752 43.4004L60.3352 47.6793L89.9986 0L119.662 47.6793L105.522 43.4004L89.9984 18.4493Z"/>
+    <path fill-rule="evenodd" clip-rule="evenodd" d="M148.262 61.8498H122.922L108.973 56.0149L98.2484 59.3491L90.8019 69.1295L94.6919 57.8487L90.8019 35.1204L81.4106 56.0149L81.8551 71.6857L77.0761 65.6841C73.2528 73.8196 63.3687 83.7815 58.9046 87.7455C51.876 86.1464 45.5004 78.7586 41.9555 74.6508C41.2627 73.848 40.6781 73.1705 40.2178 72.686L45.1635 87.7455L49.0131 92.6913L44.1229 94.803C24.7844 89.5571 6.64992 66.4251 0 55.5148C5.09771 83.2999 21.691 104.046 35.176 114.697L32.0085 120.699L43.0114 133.48L57.1819 121.477L53.7921 128.868L57.7932 130.813L90.8019 116.587L98.2484 100.249L99.193 87.7455L105.639 105.528L83.1888 141.371L90.8019 153.985L110.974 121.477H146.984L128.812 93.0247L148.262 61.8498ZM59.7937 97.5259L68.6293 100.916L78.6876 84.0223L59.7937 97.5259Z"/>
   </g>
 </svg>

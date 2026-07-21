@@ -12,6 +12,13 @@ extension Notification.Name {
     static let aiTextConnectorAvailabilityDidChange = Notification.Name(
         "RimeBuffer.AITextConnector.availabilityDidChange"
     )
+    /// Posted only after the private OpenAI-compatible configuration has been
+    /// atomically replaced or removed. The notification deliberately carries
+    /// no configuration object or userInfo so an API key can never leak via an
+    /// observer, diagnostic description, or notification log.
+    static let openAICompatibleConfigurationDidChange = Notification.Name(
+        "RimeBuffer.OpenAICompatibleConfiguration.didChange"
+    )
 }
 
 /// The workbench exposes one AI action. The provider-specific IDs remain stable
@@ -102,17 +109,29 @@ enum AITextProviderError: Error, Equatable, LocalizedError {
     var errorDescription: String? { userFacingMessage }
 }
 
+enum AITextProviderOutputContract: Equatable {
+    /// Ordinary AI actions return small semantic units that can be staged and
+    /// delivered independently.
+    case semanticBlocks
+    /// Consciousness-stream input returns one to three complete, mutually
+    /// exclusive readings of the same full raw-pinyin snapshot.
+    case alternativeGuesses
+}
+
 struct AITextProviderRequest: Equatable {
     let requestID: UUID
     let sourceText: String
     let preparedPrompt: String?
+    let outputContract: AITextProviderOutputContract
 
     init(requestID: UUID,
          sourceText: String,
-         preparedPrompt: String? = nil) {
+         preparedPrompt: String? = nil,
+         outputContract: AITextProviderOutputContract = .semanticBlocks) {
         self.requestID = requestID
         self.sourceText = sourceText
         self.preparedPrompt = preparedPrompt
+        self.outputContract = outputContract
     }
 }
 
@@ -265,6 +284,84 @@ enum AITextResultDecoder {
             throw AITextProviderError.invalidResult
         }
         return try validate(progressiveBlocks(from: candidate))
+    }
+
+    /// Decodes the consciousness-stream contract without applying semantic
+    /// segmentation. Every block is a complete alternative for the same full
+    /// source snapshot; concatenating them would change their meaning.
+    static func decodeAlternativeGuesses(
+        _ raw: String,
+        maximumCount: Int = 3
+    ) throws -> [AITextProviderBlock] {
+        guard raw.utf8.count <= AITextRuntimeLimits.maximumWireBytes else {
+            throw AITextProviderError.resultTooLarge
+        }
+        let candidate = stripJSONFence(raw)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !candidate.isEmpty,
+              let data = candidate.data(using: .utf8),
+              let envelope = try? JSONDecoder().decode(Envelope.self, from: data) else {
+            throw AITextProviderError.invalidResult
+        }
+        let blocks = envelope.blocks.enumerated().map { index, block in
+            AITextProviderBlock(index: index, text: block.text, title: block.title)
+        }
+        return try validateAlternativeGuesses(blocks, maximumCount: maximumCount)
+    }
+
+    /// Normalizes alternatives into probability order (0...n-1), removes
+    /// exact duplicates, and strips titles. The model is allowed to return one
+    /// answer when intent is clear; additional answers are for real ambiguity.
+    static func validateAlternativeGuesses(
+        _ blocks: [AITextProviderBlock],
+        maximumCount: Int = 3
+    ) throws -> [AITextProviderBlock] {
+        guard maximumCount > 0,
+              !blocks.isEmpty,
+              blocks.count <= maximumCount else {
+            throw AITextProviderError.invalidResult
+        }
+        var seenIndices = Set<Int>()
+        var seenTexts = Set<String>()
+        var normalized: [AITextProviderBlock] = []
+        for block in blocks.sorted(by: { $0.index < $1.index }) {
+            guard block.index >= 0,
+                  block.index < maximumCount,
+                  seenIndices.insert(block.index).inserted else {
+                throw AITextProviderError.invalidResult
+            }
+            let text = block.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { throw AITextProviderError.invalidResult }
+            guard text.utf8.count <= AITextRuntimeLimits.maximumBlockBytes else {
+                throw AITextProviderError.resultTooLarge
+            }
+            guard seenTexts.insert(text).inserted else { continue }
+            normalized.append(AITextProviderBlock(index: normalized.count,
+                                                  text: text,
+                                                  title: nil))
+        }
+        guard !normalized.isEmpty else { throw AITextProviderError.invalidResult }
+        return normalized
+    }
+
+    /// Streaming snapshots are incomplete by definition, but their original
+    /// alternative index must remain stable so the workbench can update a chip
+    /// in place while more JSON arrives.
+    static func validateAlternativeSnapshot(
+        _ block: AITextProviderBlock,
+        maximumCount: Int = 3
+    ) throws -> AITextProviderBlock {
+        guard maximumCount > 0,
+              block.index >= 0,
+              block.index < maximumCount else {
+            throw AITextProviderError.invalidResult
+        }
+        let text = block.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { throw AITextProviderError.invalidResult }
+        guard text.utf8.count <= AITextRuntimeLimits.maximumBlockBytes else {
+            throw AITextProviderError.resultTooLarge
+        }
+        return AITextProviderBlock(index: block.index, text: text, title: nil)
     }
 
     /// Plain-text fallback uses the same fine, prefix-stable boundaries as
@@ -583,6 +680,20 @@ struct OpenAICompatibleConfiguration: Codable, Equatable, CustomStringConvertibl
         "OpenAICompatibleConfiguration(baseURL: \(baseURL), model: \(model), apiKey: <redacted>)"
     }
 
+    /// Early settings builds accepted CometAPI's documentation host as a Base
+    /// URL. Migrate that one exact legacy value to the provider's documented
+    /// API host while leaving the model and key untouched.
+    var migratingKnownProviderBaseURL: OpenAICompatibleConfiguration? {
+        let legacy = baseURL
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard legacy == "https://apidoc.cometapi.com/v1" else { return nil }
+        var migrated = self
+        migrated.baseURL = "https://api.cometapi.com/v1"
+        return migrated
+    }
+
     func validated() throws -> OpenAICompatibleConfiguration {
         let trimmedBaseURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -620,6 +731,11 @@ enum OpenAICompatibleEndpoint {
               components.query == nil,
               components.fragment == nil else {
             throw AITextProviderError.invalidConfiguration("API Base URL 不能包含凭据、查询参数或片段")
+        }
+        if host == "apidoc.cometapi.com" {
+            throw AITextProviderError.invalidConfiguration(
+                "CometAPI 请填写 https://api.cometapi.com/v1，不要填写文档站地址"
+            )
         }
         guard scheme == "https" || (scheme == "http" && isExactLoopback(host)) else {
             throw AITextProviderError.invalidConfiguration("远程 API 必须使用 HTTPS")
@@ -741,6 +857,12 @@ final class OpenAICompatibleConfigurationStore {
             }
         }
         let decoded = try JSONDecoder().decode(OpenAICompatibleConfiguration.self, from: data)
+        if let migrated = decoded.migratingKnownProviderBaseURL {
+            // Reuse the atomic mode-0600 writer so the migration cannot create
+            // a second secret copy or leave a partially rewritten key file.
+            try save(migrated)
+            return try migrated.validated()
+        }
         return try decoded.validated()
     }
 
@@ -787,6 +909,10 @@ final class OpenAICompatibleConfigurationStore {
             throw OpenAICompatibleConfigurationStoreError.unreadable
         }
         shouldUnlink = false
+        NotificationCenter.default.post(
+            name: .openAICompatibleConfigurationDidChange,
+            object: self
+        )
     }
 
     func delete() throws {
@@ -801,6 +927,10 @@ final class OpenAICompatibleConfigurationStore {
         guard unlink(configurationURL.path) == 0 else {
             throw OpenAICompatibleConfigurationStoreError.unreadable
         }
+        NotificationCenter.default.post(
+            name: .openAICompatibleConfigurationDidChange,
+            object: self
+        )
     }
 
     private func ensurePrivateDirectory(_ url: URL) throws {
@@ -1345,8 +1475,34 @@ enum AITextCodexCompatibility {
         "codex-cli 0.145.0-alpha.18",
     ]
 
+    /// The stream-input request shape depends on request-level model locking
+    /// that has only been captured against this exact app-server build. Keep
+    /// this narrower than the ordinary connector allowlist until another
+    /// Codex build has passed the same protocol fixture.
+    static let streamInputSupportedVersionOutput: Set<String> = [
+        "codex-cli 0.145.0-alpha.18",
+    ]
+
+    static func allowedVersionOutput(
+        for inferenceProfile: AITextCodexInferenceProfile?
+    ) -> Set<String> {
+        inferenceProfile == .streamInput
+            ? streamInputSupportedVersionOutput
+            : supportedVersionOutput
+    }
+
+    static func accepts(
+        versionOutput: String,
+        inferenceProfile: AITextCodexInferenceProfile? = nil
+    ) -> Bool {
+        allowedVersionOutput(for: inferenceProfile).contains(
+            versionOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+    }
+
     static func isSupported(executableURL: URL,
-                            environment: [String: String]) -> Bool {
+                            environment: [String: String],
+                            inferenceProfile: AITextCodexInferenceProfile? = nil) -> Bool {
         let runner = AITextFoundationCLIProcessRunner()
         let semaphore = DispatchSemaphore(value: 0)
         var processResult: AITextCLIProcessResult?
@@ -1378,9 +1534,8 @@ enum AITextCodexCompatibility {
               let output = String(data: processResult.standardOutput, encoding: .utf8) else {
             return false
         }
-        return supportedVersionOutput.contains(
-            output.trimmingCharacters(in: .whitespacesAndNewlines)
-        )
+        return accepts(versionOutput: output,
+                       inferenceProfile: inferenceProfile)
     }
 }
 
@@ -1777,10 +1932,28 @@ struct AITextClaudeJSONStreamParser {
 }
 
 enum AITextProviderStreamingOutput {
-    static func blocks(from snapshot: String) -> [AITextProviderBlock] {
+    static func blocks(
+        from snapshot: String,
+        outputContract: AITextProviderOutputContract = .semanticBlocks
+    ) -> [AITextProviderBlock] {
         let trimmed = snapshot.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
-        if trimmed.hasPrefix("{") || trimmed.hasPrefix("```json") {
+        let startsStructuredJSON = trimmed.hasPrefix("{")
+            || String(trimmed.prefix(7)).lowercased() == "```json"
+
+        if outputContract == .alternativeGuesses {
+            if let complete = try? AITextResultDecoder.decodeAlternativeGuesses(trimmed) {
+                return complete
+            }
+            guard startsStructuredJSON else { return [] }
+            return AITextPartialJSONBlocks.decode(trimmed)
+                .prefix(3)
+                .compactMap {
+                    try? AITextResultDecoder.validateAlternativeSnapshot($0)
+                }
+        }
+
+        if startsStructuredJSON {
             if let complete = try? AITextResultDecoder.decodeFinalText(trimmed) {
                 return complete
             }
@@ -1797,9 +1970,10 @@ enum AITextProviderStreamingOutput {
     }
 
     static func emit(_ snapshots: [String],
+                     outputContract: AITextProviderOutputContract = .semanticBlocks,
                      callback: (AITextProviderEvent) -> Void) {
         for snapshot in snapshots {
-            for block in blocks(from: snapshot) {
+            for block in blocks(from: snapshot, outputContract: outputContract) {
                 callback(.blockSnapshot(block))
             }
         }
@@ -2009,6 +2183,7 @@ final class CodexCLITextProvider: AITextProvider {
     let kind: AITextProviderKind = .codexCLI
     private let environment: [String: String]
     private let homeStore: AITextCodexHomeStore
+    private let inferenceProfile: AITextCodexInferenceProfile?
     private let executableResolver: () -> URL?
     private let compatibilityResolver: (URL) -> Bool
     private let probeTTL: TimeInterval
@@ -2022,15 +2197,18 @@ final class CodexCLITextProvider: AITextProvider {
 
     init(environment: [String: String] = ProcessInfo.processInfo.environment,
          homeStore: AITextCodexHomeStore? = nil,
+         inferenceProfile: AITextCodexInferenceProfile? = nil,
          executableResolver: (() -> URL?)? = nil,
          compatibilityResolver: ((URL) -> Bool)? = nil,
          probeTTL: TimeInterval = 60) {
         let resolvedCompatibility = compatibilityResolver ?? { executableURL in
             AITextCodexCompatibility.isSupported(executableURL: executableURL,
-                                                 environment: environment)
+                                                 environment: environment,
+                                                 inferenceProfile: inferenceProfile)
         }
         self.environment = environment
         self.homeStore = homeStore ?? AITextCodexHomeStore(environment: environment)
+        self.inferenceProfile = inferenceProfile
         self.executableResolver = executableResolver ?? {
             AITextCLIExecutableLocator.compatibleExecutable(
                 for: .codexCLI,
@@ -2056,7 +2234,7 @@ final class CodexCLITextProvider: AITextProvider {
             return .unavailable("正在检查 Codex CLI 兼容性…")
         }
         guard homeStore.hasChatGPTCredential else {
-            return .unavailable("Codex 尚未完成 RimeBuffer 专用的 ChatGPT 登录")
+            return .unavailable("Codex 尚未完成 \(ProductIdentity.displayName) 专用的 ChatGPT 登录")
         }
         return .ready
     }
@@ -2078,13 +2256,13 @@ final class CodexCLITextProvider: AITextProvider {
             guard let self else { return }
             let result: ProbeResult
             guard let executableURL = self.executableResolver() else {
-                result = .unavailable("未找到已通过安全兼容性验证的 Codex CLI")
+                result = .unavailable(self.missingCompatibleExecutableMessage)
                 self.publishProbe(result, generation: generation)
                 return
             }
             guard let before = AITextVerifiedCLIExecutable.capture(executableURL),
                   self.compatibilityResolver(before.url) else {
-                result = .unavailable("Codex CLI 版本尚未通过安全兼容性验证")
+                result = .unavailable(self.unsupportedVersionMessage)
                 self.publishProbe(result, generation: generation)
                 return
             }
@@ -2104,6 +2282,20 @@ final class CodexCLITextProvider: AITextProvider {
             result = .ready(verified)
             self.publishProbe(result, generation: generation)
         }
+    }
+
+    private var missingCompatibleExecutableMessage: String {
+        guard inferenceProfile == .streamInput else {
+            return "未找到已通过安全兼容性验证的 Codex CLI"
+        }
+        return "未找到可用于意识流输入的 Codex CLI；需要已验证的 codex-cli 0.145.0-alpha.18"
+    }
+
+    private var unsupportedVersionMessage: String {
+        guard inferenceProfile == .streamInput else {
+            return "Codex CLI 版本尚未通过安全兼容性验证"
+        }
+        return "当前 Codex CLI 不支持意识流输入；需要已验证的 codex-cli 0.145.0-alpha.18"
     }
 
     private func publishProbe(_ result: ProbeResult, generation: UInt64) {
@@ -2181,7 +2373,7 @@ final class CodexCLITextProvider: AITextProvider {
             return relay
         }
         guard homeStore.hasChatGPTCredential else {
-            completion(.failure(.unavailable("Codex 尚未完成 RimeBuffer 专用的 ChatGPT 登录")))
+            completion(.failure(.unavailable("Codex 尚未完成 \(ProductIdentity.displayName) 专用的 ChatGPT 登录")))
             return relay
         }
         let prompt = request.preparedPrompt ?? AITextPrompt.request(for: request.sourceText)
@@ -2220,6 +2412,7 @@ final class CodexCLITextProvider: AITextProvider {
             currentDirectoryURL: workspaceURL,
             prompt: prompt,
             outputSchema: AITextResultDecoder.schemaObject,
+            inferenceProfile: inferenceProfile,
             timeout: AITextRuntimeLimits.defaultTimeout,
             maximumOutputBytes: AITextRuntimeLimits.maximumWireBytes,
             onEvent: onEvent,
@@ -2514,7 +2707,9 @@ final class ClaudeCodeCLITextProvider: AITextProvider {
 enum AITextOpenAIRequestBuilder {
     static func makeRequest(configuration: OpenAICompatibleConfiguration,
                             sourceText: String,
-                            preparedPrompt: String? = nil) throws -> URLRequest {
+                            preparedPrompt: String? = nil,
+                            outputContract: AITextProviderOutputContract = .semanticBlocks)
+        throws -> URLRequest {
         let configuration = try configuration.validated()
         guard sourceText.utf8.count <= AITextRuntimeLimits.maximumSourceBytes else {
             throw AITextProviderError.resultTooLarge
@@ -2534,17 +2729,33 @@ enum AITextOpenAIRequestBuilder {
             request.setValue("Bearer \(configuration.apiKey)",
                              forHTTPHeaderField: "Authorization")
         }
-        let body: [String: Any] = [
+        let systemPrompt: String
+        switch outputContract {
+        case .semanticBlocks:
+            systemPrompt = "Return only JSON in this shape: {\"blocks\":[{\"text\":\"...\",\"title\":null}]}. Make blocks as fine-grained as practical: one short clause, sentence, list item, or step per block. Keep code, URLs, numbers, and quotations intact. Never use tools."
+        case .alternativeGuesses:
+            systemPrompt = "Answer directly in non-thinking mode. Return only JSON in this shape: {\"blocks\":[{\"text\":\"...\",\"title\":null}]}. Return 1 to 3 complete, mutually exclusive guesses for the entire input, ordered most likely first. Use one guess when intent is clear; use 2 or 3 only for meaningful ambiguity. Each block must stand alone as the full intended text, never one segment of a longer answer. Alternatives must reflect materially different readings, not stylistic paraphrases. Titles must be null. Never use tools."
+        }
+        var body: [String: Any] = [
             "model": configuration.model,
             "stream": true,
             "messages": [
                 [
                     "role": "system",
-                    "content": "Return only JSON in this shape: {\"blocks\":[{\"text\":\"...\",\"title\":null}]}. Make blocks as fine-grained as practical: one short clause, sentence, list item, or step per block. Keep code, URLs, numbers, and quotations intact. Never use tools.",
+                    "content": systemPrompt,
                 ],
                 ["role": "user", "content": userContent],
             ],
         ]
+        if outputContract == .alternativeGuesses {
+            // Consciousness-stream input prioritizes first-token latency and
+            // deterministic JSON. Keep these provider-specific controls off
+            // the ordinary AI-generation request path.
+            body["temperature"] = 0.2
+            body["thinking"] = ["type": "disabled"]
+            body["response_format"] = ["type": "json_object"]
+            body["max_tokens"] = 1_024
+        }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         guard (request.httpBody?.count ?? 0) <= AITextRuntimeLimits.maximumWireBytes else {
             throw AITextProviderError.resultTooLarge
@@ -2714,6 +2925,8 @@ private final class AITextOpenAIStreamOperation: NSObject,
                                                    URLSessionDataDelegate,
                                                    URLSessionTaskDelegate {
     private let request: URLRequest
+    private let diagnosticRequestID: UUID
+    private let outputContract: AITextProviderOutputContract
     private let sessionConfiguration: URLSessionConfiguration
     private let onEvent: (AITextProviderEvent) -> Void
     private let completion: (Result<[AITextProviderBlock], AITextProviderError>) -> Void
@@ -2727,6 +2940,11 @@ private final class AITextOpenAIStreamOperation: NSObject,
     private var responseMode: ResponseMode?
     private var cumulativeText = ""
     private var sse = AITextSSEDecoder()
+    private var startedAt: TimeInterval?
+    private var loggedFirstTransportBytes = false
+    private var loggedFirstReasoning = false
+    private var loggedFirstContent = false
+    private var loggedFirstSnapshot = false
 
     private enum Lifecycle {
         case idle
@@ -2739,10 +2957,14 @@ private final class AITextOpenAIStreamOperation: NSObject,
     }
 
     init(request: URLRequest,
+         diagnosticRequestID: UUID,
+         outputContract: AITextProviderOutputContract,
          sessionConfiguration: URLSessionConfiguration,
          onEvent: @escaping (AITextProviderEvent) -> Void,
          completion: @escaping (Result<[AITextProviderBlock], AITextProviderError>) -> Void) {
         self.request = request
+        self.diagnosticRequestID = diagnosticRequestID
+        self.outputContract = outputContract
         self.sessionConfiguration = sessionConfiguration
         self.onEvent = onEvent
         self.completion = completion
@@ -2752,6 +2974,8 @@ private final class AITextOpenAIStreamOperation: NSObject,
         stateQueue.async { [self] in
             guard lifecycle == .idle else { return }
             lifecycle = .active
+            startedAt = ProcessInfo.processInfo.systemUptime
+            diagnostic("started requestBytes=\(request.httpBody?.count ?? 0)")
             emit(.activity(AITextProviderActivity(
                 kind: .launching,
                 message: "正在连接 Open API"
@@ -2794,6 +3018,10 @@ private final class AITextOpenAIStreamOperation: NSObject,
             }
             guard let response = response as? HTTPURLResponse,
                   (200..<300).contains(response.statusCode) else {
+                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+                diagnostic(
+                    "headers status=\(statusCode) accepted=0 elapsedMs=\(elapsedMilliseconds)"
+                )
                 completionHandler(.cancel)
                 settle(.failure(.failed))
                 return
@@ -2801,6 +3029,9 @@ private final class AITextOpenAIStreamOperation: NSObject,
             let contentType = (response.value(forHTTPHeaderField: "Content-Type") ?? "")
                 .lowercased()
             guard contentType.contains("text/event-stream") else {
+                diagnostic(
+                    "headers status=\(response.statusCode) sse=0 elapsedMs=\(elapsedMilliseconds)"
+                )
                 completionHandler(.cancel)
                 settle(.failure(.invalidConfiguration(
                     "当前 Open API 服务未提供流式响应"
@@ -2808,6 +3039,9 @@ private final class AITextOpenAIStreamOperation: NSObject,
                 return
             }
             responseMode = .eventStream
+            diagnostic(
+                "headers status=\(response.statusCode) sse=1 elapsedMs=\(elapsedMilliseconds)"
+            )
             emit(.activity(AITextProviderActivity(
                 kind: .connecting,
                 message: "Open API 已建立流式连接"
@@ -2821,6 +3055,12 @@ private final class AITextOpenAIStreamOperation: NSObject,
                     didReceive data: Data) {
         stateQueue.async { [self] in
             guard lifecycle == .active else { return }
+            if !loggedFirstTransportBytes {
+                loggedFirstTransportBytes = true
+                diagnostic(
+                    "first-bytes chunkBytes=\(data.count) elapsedMs=\(elapsedMilliseconds)"
+                )
+            }
             emit(.activity(AITextProviderActivity(
                 kind: .connecting,
                 message: "Open API 正在传输"
@@ -2849,9 +3089,17 @@ private final class AITextOpenAIStreamOperation: NSObject,
                     didCompleteWithError error: Error?) {
         stateQueue.async { [self] in
             guard lifecycle == .active else { return }
-            if let error = error as? URLError, error.code == .cancelled {
-                settle(.failure(.cancelled))
-                return
+            if let error = error as? URLError {
+                switch error.code {
+                case .cancelled:
+                    settle(.failure(.cancelled))
+                    return
+                case .timedOut:
+                    settle(.failure(.timedOut))
+                    return
+                default:
+                    break
+                }
             }
             guard error == nil else {
                 settle(.failure(.failed))
@@ -2868,7 +3116,7 @@ private final class AITextOpenAIStreamOperation: NSObject,
                     throw AITextProviderError.invalidResult
                 }
                 guard lifecycle == .active else { return }
-                settle(.success(try AITextResultDecoder.decodeFinalText(cumulativeText)))
+                settle(.success(try decodeFinalResult()))
             } catch let error as AITextProviderError {
                 settle(.failure(error))
             } catch {
@@ -2886,11 +3134,15 @@ private final class AITextOpenAIStreamOperation: NSObject,
                 message: "正在校验 Open API 的回复"
             )))
             guard lifecycle == .active else { return }
-            settle(.success(try AITextResultDecoder.decodeFinalText(cumulativeText)))
+            settle(.success(try decodeFinalResult()))
             return
         }
         let update = try AITextOpenAIResponseDecoder.streamUpdate(from: payload)
         if update.hasReasoningActivity {
+            if !loggedFirstReasoning {
+                loggedFirstReasoning = true
+                diagnostic("first-reasoning elapsedMs=\(elapsedMilliseconds)")
+            }
             emit(.activity(AITextProviderActivity(
                 kind: .reasoning,
                 message: "模型正在思考"
@@ -2905,6 +3157,12 @@ private final class AITextOpenAIStreamOperation: NSObject,
             guard lifecycle == .active else { return }
         }
         guard let delta = update.contentDelta, !delta.isEmpty else { return }
+        if !loggedFirstContent {
+            loggedFirstContent = true
+            diagnostic(
+                "first-content deltaBytes=\(delta.utf8.count) elapsedMs=\(elapsedMilliseconds)"
+            )
+        }
         guard cumulativeText.utf8.count + delta.utf8.count <= AITextRuntimeLimits.maximumWireBytes else {
             throw AITextProviderError.resultTooLarge
         }
@@ -2914,9 +3172,28 @@ private final class AITextOpenAIStreamOperation: NSObject,
         )))
         guard lifecycle == .active else { return }
         cumulativeText += delta
-        for block in AITextProviderStreamingOutput.blocks(from: cumulativeText) {
+        let blocks = AITextProviderStreamingOutput.blocks(
+            from: cumulativeText,
+            outputContract: outputContract
+        )
+        if !blocks.isEmpty, !loggedFirstSnapshot {
+            loggedFirstSnapshot = true
+            diagnostic(
+                "first-snapshot blockCount=\(blocks.count) elapsedMs=\(elapsedMilliseconds)"
+            )
+        }
+        for block in blocks {
             emit(.blockSnapshot(block))
             guard lifecycle == .active else { return }
+        }
+    }
+
+    private func decodeFinalResult() throws -> [AITextProviderBlock] {
+        switch outputContract {
+        case .semanticBlocks:
+            return try AITextResultDecoder.decodeFinalText(cumulativeText)
+        case .alternativeGuesses:
+            return try AITextResultDecoder.decodeAlternativeGuesses(cumulativeText)
         }
     }
 
@@ -2929,6 +3206,24 @@ private final class AITextOpenAIStreamOperation: NSObject,
     private func settle(_ result: Result<[AITextProviderBlock], AITextProviderError>) {
         dispatchPrecondition(condition: .onQueue(stateQueue))
         guard lifecycle == .active else { return }
+        let outcome: String
+        switch result {
+        case let .success(blocks):
+            outcome = "success blocks=\(blocks.count)"
+        case let .failure(error):
+            switch error {
+            case .unavailable: outcome = "unavailable"
+            case .invalidConfiguration: outcome = "invalid-configuration"
+            case .invalidResult: outcome = "invalid-result"
+            case .resultTooLarge: outcome = "result-too-large"
+            case .timedOut: outcome = "timed-out"
+            case .cancelled: outcome = "cancelled"
+            case .failed: outcome = "failed"
+            }
+        }
+        diagnostic(
+            "settled outcome=\(outcome) transportBytes=\(sse.totalBytes) contentBytes=\(cumulativeText.utf8.count) elapsedMs=\(elapsedMilliseconds)"
+        )
         lifecycle = .settled
         let activeTask = task
         let activeSession = session
@@ -2940,6 +3235,18 @@ private final class AITextOpenAIStreamOperation: NSObject,
         activeTask?.cancel()
         activeSession?.invalidateAndCancel()
         completion(result)
+    }
+
+    private var elapsedMilliseconds: Int {
+        guard let startedAt else { return 0 }
+        return Int(max(0, ProcessInfo.processInfo.systemUptime - startedAt) * 1_000)
+    }
+
+    private func diagnostic(_ event: String) {
+        guard outputContract == .alternativeGuesses else { return }
+        IMELog.write(
+            "stream openapi request=\(diagnosticRequestID.uuidString) \(event)"
+        )
     }
 }
 
@@ -2997,10 +3304,13 @@ final class OpenAICompatibleTextProvider: AITextProvider {
             let urlRequest = try AITextOpenAIRequestBuilder.makeRequest(
                 configuration: configuration,
                 sourceText: request.sourceText,
-                preparedPrompt: request.preparedPrompt
+                preparedPrompt: request.preparedPrompt,
+                outputContract: request.outputContract
             )
             let operation = AITextOpenAIStreamOperation(
                 request: urlRequest,
+                diagnosticRequestID: request.requestID,
+                outputContract: request.outputContract,
                 sessionConfiguration: sessionConfigurationFactory(),
                 onEvent: onEvent,
                 completion: completion
@@ -3247,6 +3557,14 @@ final class AITextPluginWorkspace: BufferDeliveryContentSource {
                 queue: .main
             ) { [weak self] _ in
                 self?.availabilityDidChange()
+            })
+            observers.append(NotificationCenter.default.addObserver(
+                forName: .openAICompatibleConfigurationDidChange,
+                object: OpenAICompatibleConfigurationStore.shared,
+                queue: .main
+            ) { [weak self] _ in
+                guard self?.kind == .openAICompatible else { return }
+                self?.configurationDidChange()
             })
         }
         selectionDidChange()
@@ -3559,6 +3877,8 @@ final class AITextPluginWorkspace: BufferDeliveryContentSource {
 
     private func notifyChange() {
         NotificationCenter.default.post(name: .aiTextPluginWorkspaceDidChange,
+                                        object: self)
+        NotificationCenter.default.post(name: .derivedBufferWorkspaceDidChange,
                                         object: self)
     }
 

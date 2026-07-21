@@ -125,11 +125,59 @@ enum BufferMainControlRow: Equatable {
 }
 
 enum BufferWorkbenchCursorKind: Equatable {
+    case arrow
     case pointingHand
 
     var cursor: NSCursor {
         switch self {
+        case .arrow: return .arrow
         case .pointingHand: return .pointingHand
+        }
+    }
+}
+
+enum BufferWorkbenchPointerState: Equatable {
+    case idle
+    case hovered
+    case pressed
+    case disabled
+}
+
+/// Pure pointer-state policy shared by buttons, popups, the drag handle, and
+/// `buffer-window-smoke`. The workbench is nonactivating, so AppKit does not
+/// reliably synthesize these states for borderless controls on its own.
+enum BufferWorkbenchPointerRules {
+    static func state(enabled: Bool, hovered: Bool,
+                      pressed: Bool) -> BufferWorkbenchPointerState {
+        if !enabled { return .disabled }
+        if pressed { return .pressed }
+        if hovered { return .hovered }
+        return .idle
+    }
+
+    static func cursor(enabled: Bool) -> BufferWorkbenchCursorKind {
+        enabled ? .pointingHand : .arrow
+    }
+
+    static func backgroundColor(for state: BufferWorkbenchPointerState) -> NSColor {
+        switch state {
+        case .idle, .disabled:
+            return .clear
+        case .hovered:
+            return RimeUI.accentBlue.withAlphaComponent(RimeUI.isNight ? 0.20 : 0.13)
+        case .pressed:
+            return RimeUI.accentBlue.withAlphaComponent(RimeUI.isNight ? 0.34 : 0.23)
+        }
+    }
+
+    static func borderColor(for state: BufferWorkbenchPointerState) -> NSColor {
+        switch state {
+        case .idle, .disabled:
+            return .clear
+        case .hovered:
+            return RimeUI.accentBlue.withAlphaComponent(0.48)
+        case .pressed:
+            return RimeUI.accentBlue.withAlphaComponent(0.78)
         }
     }
 }
@@ -140,6 +188,7 @@ enum BufferWorkbenchMetrics {
     static let shelfSpacing: CGFloat = 4
     static let mainHorizontalInset: CGFloat = 5
     static let shelfHorizontalInset: CGFloat = 6
+    static let shelfStatusWidth: CGFloat = 88
     static let translationVerticalInset: CGFloat = 5
     static let translationRailSpacing: CGFloat = 4
 
@@ -170,6 +219,52 @@ enum BufferWorkbenchMetrics {
     }
 }
 
+/// Pins the status and plugin controls to the leading edge while one dedicated
+/// spacer absorbs every width change. Without that spacer, AppKit alternates
+/// between stretching the empty plugin row and stretching the status label,
+/// which makes the plugin menu jump between the left and right sides.
+enum BufferWorkbenchShelfLayout {
+    static let flexiblePriority = NSLayoutConstraint.Priority(rawValue: 1)
+    static let statusWidthPriority = NSLayoutConstraint.Priority(rawValue: 749)
+
+    static func configure(_ shelf: NSStackView,
+                          status: NSView,
+                          pluginActions: NSView,
+                          flexibleSpace: NSView,
+                          refresh: NSView,
+                          close: NSView) {
+        shelf.orientation = .horizontal
+        shelf.alignment = .centerY
+        shelf.distribution = .fill
+        shelf.spacing = BufferWorkbenchMetrics.shelfSpacing
+        shelf.detachesHiddenViews = false
+        shelf.userInterfaceLayoutDirection = .leftToRight
+        shelf.edgeInsets = NSEdgeInsets(
+            top: 4,
+            left: BufferWorkbenchMetrics.shelfHorizontalInset,
+            bottom: 4,
+            right: BufferWorkbenchMetrics.shelfHorizontalInset
+        )
+
+        status.translatesAutoresizingMaskIntoConstraints = false
+        let statusWidth = status.widthAnchor.constraint(
+            equalToConstant: BufferWorkbenchMetrics.shelfStatusWidth
+        )
+        // Tiny screens may be narrower than the ordinary 520pt minimum, so
+        // this stable column yields before the required translation controls.
+        statusWidth.priority = statusWidthPriority
+        statusWidth.isActive = true
+
+        flexibleSpace.setContentHuggingPriority(flexiblePriority, for: .horizontal)
+        flexibleSpace.setContentCompressionResistancePriority(flexiblePriority,
+                                                              for: .horizontal)
+
+        [status, pluginActions, flexibleSpace, refresh, close].forEach {
+            shelf.addArrangedSubview($0)
+        }
+    }
+}
+
 /// Shared by the live stack construction and the pure layout smoke test.
 enum BufferWorkbenchLayout {
     static let mainBar: [BufferWorkbenchControl] = [
@@ -179,6 +274,10 @@ enum BufferWorkbenchLayout {
         .status, .pluginActions, .refresh, .close,
     ]
     static let dragControls: Set<BufferWorkbenchControl> = [.dragHandle]
+    static let hoverControls: Set<BufferWorkbenchControl> = [
+        .dragHandle, .disclosure, .send, .pluginActions, .refresh, .close,
+    ]
+    static let passiveControls: Set<BufferWorkbenchControl> = [.bufferRail, .status]
     static let dragCursor = BufferWorkbenchCursorKind.pointingHand
     static let windowBackgroundDraggable = false
 }
@@ -249,19 +348,181 @@ private final class BufferPanel: NSPanel {
 }
 
 private final class BufferDragHandleView: NSImageView {
+    private var pointerTrackingArea: NSTrackingArea?
+    private var pointerHovered = false
+    private var pointerPressed = false
+    private var previewPointerState: BufferWorkbenchPointerState?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        configurePointerFeedback()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configurePointerFeedback()
+    }
+
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func mouseDown(with event: NSEvent) {
+        pointerPressed = true
+        refreshInteractionAppearance()
+        defer {
+            pointerPressed = false
+            refreshInteractionAppearance()
+        }
         window?.performDrag(with: event)
     }
 
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let pointerTrackingArea { removeTrackingArea(pointerTrackingArea) }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        pointerTrackingArea = area
+    }
+
     override func resetCursorRects() {
+        super.resetCursorRects()
         addCursorRect(bounds, cursor: BufferWorkbenchLayout.dragCursor.cursor)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        pointerHovered = true
+        refreshInteractionAppearance()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        pointerHovered = false
+        refreshInteractionAppearance()
+    }
+
+    func refreshInteractionAppearance() {
+        let state = previewPointerState ?? BufferWorkbenchPointerRules.state(
+            enabled: true,
+            hovered: pointerHovered,
+            pressed: pointerPressed
+        )
+        wantsLayer = true
+        layer?.cornerRadius = 6
+        layer?.backgroundColor = BufferWorkbenchPointerRules.backgroundColor(for: state).cgColor
+        layer?.borderColor = BufferWorkbenchPointerRules.borderColor(for: state).cgColor
+        layer?.borderWidth = (state == .idle || state == .disabled)
+            ? 0
+            : 1 / max(window?.backingScaleFactor ?? 2, 1)
+    }
+
+    func setPreviewPointerState(_ state: BufferWorkbenchPointerState?) {
+        previewPointerState = state
+        refreshInteractionAppearance()
+    }
+
+    private func configurePointerFeedback() {
+        wantsLayer = true
+        layer?.masksToBounds = true
+        refreshInteractionAppearance()
     }
 }
 
 private final class FirstMousePopUpButton: NSPopUpButton {
+    private var pointerTrackingArea: NSTrackingArea?
+    private var pointerHovered = false
+    private var pointerPressed = false
+    private var previewPointerState: BufferWorkbenchPointerState?
+
+    override var isEnabled: Bool {
+        didSet {
+            guard oldValue != isEnabled else { return }
+            if !isEnabled { pointerPressed = false }
+            refreshInteractionAppearance()
+        }
+    }
+
+    override init(frame buttonFrame: NSRect, pullsDown flag: Bool) {
+        super.init(frame: buttonFrame, pullsDown: flag)
+        configurePointerFeedback()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configurePointerFeedback()
+    }
+
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let pointerTrackingArea { removeTrackingArea(pointerTrackingArea) }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        pointerTrackingArea = area
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: BufferWorkbenchPointerRules.cursor(
+            enabled: isEnabled
+        ).cursor)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        pointerHovered = true
+        refreshInteractionAppearance()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        pointerHovered = false
+        refreshInteractionAppearance()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard isEnabled else { return }
+        pointerPressed = true
+        refreshInteractionAppearance()
+        defer {
+            pointerPressed = false
+            refreshInteractionAppearance()
+        }
+        super.mouseDown(with: event)
+    }
+
+    func refreshInteractionAppearance() {
+        let state = previewPointerState ?? BufferWorkbenchPointerRules.state(
+            enabled: isEnabled,
+            hovered: pointerHovered,
+            pressed: pointerPressed
+        )
+        wantsLayer = true
+        layer?.cornerRadius = 5
+        layer?.backgroundColor = BufferWorkbenchPointerRules.backgroundColor(for: state).cgColor
+        layer?.borderColor = BufferWorkbenchPointerRules.borderColor(for: state).cgColor
+        layer?.borderWidth = (state == .idle || state == .disabled)
+            ? 0
+            : 1 / max(window?.backingScaleFactor ?? 2, 1)
+        window?.invalidateCursorRects(for: self)
+    }
+
+    func setPreviewPointerState(_ state: BufferWorkbenchPointerState?) {
+        previewPointerState = state
+        refreshInteractionAppearance()
+    }
+
+    private func configurePointerFeedback() {
+        wantsLayer = true
+        layer?.masksToBounds = true
+        refreshInteractionAppearance()
+    }
 }
 
 /// `NSMenuItem.representedObject` cannot distinguish a missing value from an
@@ -396,11 +657,12 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
     private let dragHandle = BufferDragHandleView()
     private let statusLabel = NSTextField(labelWithString: "")
     private let pluginActionsControl = NSStackView()
-    private let pluginSelector = FirstMousePopUpButton()
+    private let shelfFlexibleSpace = NSView()
+    private let pluginSelector = FirstMousePopUpButton(frame: .zero, pullsDown: false)
     private let pluginLoadingIndicator = NSProgressIndicator()
     private let pluginButtonRow = NSStackView()
-    private let translationSourcePopup = FirstMousePopUpButton()
-    private let translationTargetPopup = FirstMousePopUpButton()
+    private let translationSourcePopup = FirstMousePopUpButton(frame: .zero, pullsDown: false)
+    private let translationTargetPopup = FirstMousePopUpButton(frame: .zero, pullsDown: false)
     private let translationSwapButton = FirstMouseButton(title: "", target: nil, action: nil)
     private let aiGenerateButton = FirstMouseButton(title: "生成", target: nil, action: nil)
     private let disclosureButton = FirstMouseButton(title: "", target: nil, action: nil)
@@ -468,7 +730,7 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
     private override init() {
         let expanded = UserDefaults.standard.bool(forKey: Key.controlsExpanded)
         let initialLayoutMode: BufferWorkbenchLayoutMode =
-            (AppleTranslationWorkspace.shared.isSelected || AITextWorkspaceRouter.isSelected)
+            DerivedBufferWorkspaceRouter.selectedWorkspace != nil
                 ? .translation
                 : .standard
         panel = BufferPanel(contentRect: NSRect(x: 0, y: 0, width: 760,
@@ -534,6 +796,7 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
     /// plugin state before a different application can become the target.
     func discardForPrivacyTransition() {
         ActionPluginHost.shared.cancelActiveInvocationForWorkbench()
+        DerivedBufferWorkspaceRouter.selectedWorkspace?.workbenchWillPause()
         BufferModel.shared.discardForPrivacy()
     }
 
@@ -546,7 +809,7 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
             target.controller?.resolveCompositionForWorkbenchTransition(target: target)
         }
         ActionPluginHost.shared.cancelActiveInvocationForWorkbench()
-        AITextWorkspaceRouter.reset()
+        DerivedBufferWorkspaceRouter.selectedWorkspace?.workbenchWillPause()
         BufferModel.shared.pauseCapturePreservingContent()
         hideWithoutPausing()
     }
@@ -582,11 +845,12 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
     func renderForPreview(to path: String,
                           expanded: Bool = false,
                           scale: CGFloat = 2,
-                          translationSnapshot: TranslationRailSnapshot? = nil) -> Bool {
+                          translationSnapshot: TranslationRailSnapshot? = nil,
+                          hoveredControl: BufferWorkbenchControl? = nil) -> Bool {
         controlsExpanded = expanded
         applyExpandedPresentation()
         let previewMode: BufferWorkbenchLayoutMode = translationSnapshot == nil
-            ? ((AppleTranslationWorkspace.shared.isSelected || AITextWorkspaceRouter.isSelected)
+            ? (DerivedBufferWorkspaceRouter.selectedWorkspace != nil
                 ? .translation
                 : .standard)
             : .translation
@@ -604,6 +868,7 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         } else {
             refresh()
         }
+        applyPreviewPointerState(hoveredControl)
         guard let contentView = panel.contentView else { return false }
         contentView.layoutSubtreeIfNeeded()
         let bounds = contentView.bounds
@@ -633,31 +898,29 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
             DispatchQueue.main.async { [weak self] in self?.refresh() }
             return
         }
-        let availability = BufferDeliveryCoordinator.shared.availability()
         let secureInputEnabled = IsSecureEventInputEnabled()
-        pluginSelector.isEnabled = !secureInputEnabled
-        AppleTranslationWorkspace.shared.setProtected(
-            secureInputEnabled || sessionProtectionActive
-        )
-        AITextWorkspaceRouter.setProtected(
-            secureInputEnabled || sessionProtectionActive
-        )
-        let translationSelected = AppleTranslationWorkspace.shared.isSelected
-        let aiTextSelected = AITextWorkspaceRouter.isSelected
-        let derivedWorkspaceSelected = translationSelected || aiTextSelected
+        let contentProtected = secureInputEnabled || sessionProtectionActive
+        pluginSelector.isEnabled = !contentProtected
+        // Protect every stable derived singleton before resolving presentation
+        // state. A secure refresh must not ask any source for a text snapshot.
+        DerivedBufferWorkspaceRouter.setProtectedOnAll(contentProtected)
+        let derivedWorkspace = DerivedBufferWorkspaceRouter.selectedWorkspace
+        let derivedWorkspaceSelected = derivedWorkspace != nil
+        let availability: BufferDeliveryCoordinator.Availability = contentProtected
+            ? .blocked(.secureInput)
+            : BufferDeliveryCoordinator.shared.availability()
         syncLayoutMode(derivedWorkspaceSelected ? .translation : .standard)
-        let pluginFailure = derivedWorkspaceSelected
+        let pluginFailure = contentProtected || derivedWorkspaceSelected
             ? nil
             : ActionPluginHost.shared.workbenchFailureMessage
-        let canGenerateWithoutFocus = !derivedWorkspaceSelected
+        let canGenerateWithoutFocus = !contentProtected
+            && !derivedWorkspaceSelected
             && ActionPluginHost.shared.presentations.contains {
                 !$0.requiresFocus && $0.canInvoke
             }
         lastSecureInputState = secureInputEnabled
-        if !secureInputEnabled, translationSelected {
-            statusLabel.stringValue = AppleTranslationWorkspace.shared.statusText
-        } else if !secureInputEnabled, let aiStatus = AITextWorkspaceRouter.statusText {
-            statusLabel.stringValue = aiStatus
+        if !contentProtected, let derivedWorkspace {
+            statusLabel.stringValue = derivedWorkspace.statusText
         } else {
             statusLabel.stringValue = BufferWorkbenchStatusText.text(
                 for: availability,
@@ -666,24 +929,24 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
                 canGenerateWithoutFocus: canGenerateWithoutFocus
             )
         }
-        statusLabel.toolTip = !secureInputEnabled && derivedWorkspaceSelected
+        statusLabel.toolTip = !contentProtected && derivedWorkspaceSelected
             ? statusLabel.stringValue
             : BufferWorkbenchStatusText.help(
                 for: availability,
                 secureInput: secureInputEnabled,
                 pluginFailure: pluginFailure,
                 canGenerateWithoutFocus: canGenerateWithoutFocus
-            )
+        )
         statusLabel.textColor = RimeUI.textSecondary
 
-        _ = bufferRail.refresh(shielded: secureInputEnabled)
-        assert(!secureInputEnabled || bufferRail.isHidden,
+        _ = bufferRail.refresh(shielded: contentProtected)
+        assert(!contentProtected || bufferRail.isHidden,
                "secure input must leave the text-bearing rail hidden")
         sendButton.isEnabled = availability.canSend
-            && !secureInputEnabled
+            && !contentProtected
         sendButton.toolTip = availability.canSend ? "发送全部缓冲块" : availability.label
         refreshButton.isEnabled = BufferPluginSelectionStore.shared.activeKey != nil
-            && !secureInputEnabled
+            && !contentProtected
         refreshButton.toolTip = refreshButton.isEnabled
             ? "刷新或重置当前插件（保留缓冲正文）"
             : "当前没有可刷新的缓冲插件"
@@ -907,21 +1170,14 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         pluginActionsControl.setContentCompressionResistancePriority(.defaultHigh,
                                                                      for: .horizontal)
 
-        utilityShelf.orientation = .horizontal
-        utilityShelf.alignment = .centerY
-        utilityShelf.distribution = .fill
-        utilityShelf.spacing = BufferWorkbenchMetrics.shelfSpacing
-        utilityShelf.detachesHiddenViews = false
-        utilityShelf.userInterfaceLayoutDirection = .leftToRight
-        utilityShelf.edgeInsets = NSEdgeInsets(
-            top: 4,
-            left: BufferWorkbenchMetrics.shelfHorizontalInset,
-            bottom: 4,
-            right: BufferWorkbenchMetrics.shelfHorizontalInset
+        BufferWorkbenchShelfLayout.configure(
+            utilityShelf,
+            status: statusLabel,
+            pluginActions: pluginActionsControl,
+            flexibleSpace: shelfFlexibleSpace,
+            refresh: refreshButton,
+            close: closeButton
         )
-        BufferWorkbenchLayout.expandedShelf.forEach { control in
-            utilityShelf.addArrangedSubview(view(for: control))
-        }
 
         shelfDivider.wantsLayer = true
         shelfDivider.layer?.backgroundColor = RimeUI.borderStrong.withAlphaComponent(0.55).cgColor
@@ -1010,48 +1266,79 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         visual.strokeColor = RimeUI.borderStrong
         shelfDivider.layer?.backgroundColor = RimeUI.borderStrong.withAlphaComponent(0.55).cgColor
         dragHandle.contentTintColor = RimeUI.textSecondary
+        dragHandle.refreshInteractionAppearance()
         pluginActionsControl.layer?.backgroundColor = RimeUI.surface2.cgColor
         pluginActionsControl.layer?.borderColor = RimeUI.border.cgColor
         pluginActionsControl.layer?.borderWidth = 1 / max(panel.backingScaleFactor, 1)
         [refreshButton, closeButton, sendButton, disclosureButton].forEach {
             $0.contentTintColor = RimeUI.textSecondary
+            $0.refreshInteractionAppearance()
         }
         translationSwapButton.contentTintColor = RimeUI.textSecondary
+        translationSwapButton.refreshInteractionAppearance()
         aiGenerateButton.contentTintColor = aiGenerateButton.isEnabled
             ? RimeUI.accentBlue
             : RimeUI.textSecondary
+        aiGenerateButton.refreshInteractionAppearance()
         pluginActionButtons.values.forEach {
             $0.contentTintColor = $0.isEnabled ? RimeUI.accentBlue : RimeUI.textSecondary
+            $0.refreshInteractionAppearance()
+        }
+        pluginSelector.refreshInteractionAppearance()
+        translationSourcePopup.refreshInteractionAppearance()
+        translationTargetPopup.refreshInteractionAppearance()
+    }
+
+    private func applyPreviewPointerState(_ hoveredControl: BufferWorkbenchControl?) {
+        dragHandle.setPreviewPointerState(nil)
+        [disclosureButton, sendButton, refreshButton, closeButton].forEach {
+            $0.setPreviewPointerState(nil)
+        }
+        pluginSelector.setPreviewPointerState(nil)
+        translationSourcePopup.setPreviewPointerState(nil)
+        translationTargetPopup.setPreviewPointerState(nil)
+        aiGenerateButton.setPreviewPointerState(nil)
+        translationSwapButton.setPreviewPointerState(nil)
+        pluginActionButtons.values.forEach { $0.setPreviewPointerState(nil) }
+
+        switch hoveredControl {
+        case .dragHandle:
+            dragHandle.setPreviewPointerState(.hovered)
+        case .disclosure:
+            disclosureButton.setPreviewPointerState(.hovered)
+        case .send:
+            sendButton.setPreviewPointerState(.hovered)
+        case .pluginActions:
+            pluginSelector.setPreviewPointerState(.hovered)
+        case .refresh:
+            refreshButton.setPreviewPointerState(.hovered)
+        case .close:
+            closeButton.setPreviewPointerState(.hovered)
+        case .bufferRail, .status, .none:
+            break
         }
     }
 
     private func refreshPluginActions() {
-        if AppleTranslationWorkspace.shared.isSelected {
-            refreshTranslationControls()
+        guard !lastSecureInputState, !sessionProtectionActive else {
+            resetDerivedControlRendering()
+            pluginLoadingIndicator.isHidden = true
+            pluginLoadingIndicator.stopAnimation(nil)
+            pluginSelector.toolTip = "安全输入已开启，插件控制已隐藏"
             return
         }
-        if AITextWorkspaceRouter.isSelected {
-            refreshAITextControls()
+        if let workspace = DerivedBufferWorkspaceRouter.selectedWorkspace {
+            if let controls = workspace as? any DerivedLanguagePairControls {
+                refreshLanguageControls(workspace: workspace, controls: controls)
+            } else if let controls = workspace as? any DerivedManualGenerationControls {
+                refreshManualGenerationControls(workspace: workspace, controls: controls)
+            } else {
+                refreshDerivedWorkspaceWithoutControls(workspace)
+            }
             return
         }
-        if renderingTranslationControls {
-            renderingTranslationControls = false
-            renderedTranslationLanguages.removeAll()
-            pluginButtonRow.arrangedSubviews.forEach {
-                pluginButtonRow.removeArrangedSubview($0)
-                $0.removeFromSuperview()
-            }
-            renderedPluginKeys.removeAll()
-            pluginActionButtons.removeAll()
-        }
-        if renderingAIControls {
-            renderingAIControls = false
-            pluginButtonRow.arrangedSubviews.forEach {
-                pluginButtonRow.removeArrangedSubview($0)
-                $0.removeFromSuperview()
-            }
-            renderedPluginKeys.removeAll()
-            pluginActionButtons.removeAll()
+        if renderingTranslationControls || renderingAIControls {
+            resetDerivedControlRendering()
         }
         let presentations = ActionPluginHost.shared.presentations
         let waitingForFirstContent = presentations.contains(where: \.waitingForFirstContent)
@@ -1118,10 +1405,18 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         }
     }
 
-    private func refreshTranslationControls() {
-        let workspace = AppleTranslationWorkspace.shared
-        pluginSelector.toolTip = "当前插件：苹果本地翻译"
-        let loading = workspace.phase == .waiting || workspace.phase == .translating
+    private func refreshLanguageControls(workspace: any DerivedBufferWorkspace,
+                                         controls: any DerivedLanguagePairControls) {
+        pluginSelector.toolTip = "当前插件：\(workspace.workbenchDisplayName)"
+        let loading: Bool
+        if lastSecureInputState || sessionProtectionActive {
+            loading = false
+        } else {
+            switch workspace.railSnapshot.phase {
+            case .waiting, .translating: loading = true
+            default: loading = false
+            }
+        }
         pluginLoadingIndicator.isHidden = !loading
         loading ? pluginLoadingIndicator.startAnimation(nil)
                 : pluginLoadingIndicator.stopAnimation(nil)
@@ -1140,11 +1435,11 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
             pluginButtonRow.addArrangedSubview(translationTargetPopup)
         }
 
-        if renderedTranslationLanguages != workspace.languageOptions {
-            renderedTranslationLanguages = workspace.languageOptions
+        if renderedTranslationLanguages != controls.languageOptions {
+            renderedTranslationLanguages = controls.languageOptions
             translationSourcePopup.removeAllItems()
             translationTargetPopup.removeAllItems()
-            for option in workspace.languageOptions {
+            for option in controls.languageOptions {
                 translationSourcePopup.addItem(withTitle: option.title)
                 translationSourcePopup.lastItem?.representedObject = option.identifier
                 translationTargetPopup.addItem(withTitle: option.title)
@@ -1152,16 +1447,21 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
             }
         }
         selectPopup(translationSourcePopup,
-                    representedValue: workspace.sourceLanguageID)
+                    representedValue: controls.sourceLanguageID)
         selectPopup(translationTargetPopup,
-                    representedValue: workspace.targetLanguageID)
-        translationSwapButton.isEnabled = workspace.canSwapLanguages
+                    representedValue: controls.targetLanguageID)
+        let controlsEnabled = !lastSecureInputState && !sessionProtectionActive
+        translationSourcePopup.isEnabled = controlsEnabled
+        translationTargetPopup.isEnabled = controlsEnabled
+        translationSwapButton.isEnabled = controlsEnabled && controls.canSwapLanguages
     }
 
-    private func refreshAITextControls() {
-        guard let workspace = AITextWorkspaceRouter.selectedWorkspace else { return }
-        pluginSelector.toolTip = "当前插件：\(workspace.kind.displayName)"
-        let loading = workspace.phase == .running
+    private func refreshManualGenerationControls(
+        workspace: any DerivedBufferWorkspace,
+        controls: any DerivedManualGenerationControls
+    ) {
+        pluginSelector.toolTip = "当前插件：\(workspace.workbenchDisplayName)"
+        let loading = controls.isGenerating
         // The target rail owns the animated first-content indicator. Keep the
         // shelf compact and avoid showing the same spinner twice.
         pluginLoadingIndicator.isHidden = true
@@ -1184,10 +1484,35 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
                                                pointSize: 10,
                                                weight: .semibold)
         aiGenerateButton.image?.isTemplate = true
-        aiGenerateButton.isEnabled = workspace.canGenerate && !IsSecureEventInputEnabled()
+        aiGenerateButton.isEnabled = !lastSecureInputState
+            && !sessionProtectionActive
+            && controls.canGenerate
         aiGenerateButton.toolTip = aiGenerateButton.isEnabled
-            ? "用 \(workspace.kind.displayName) 处理当前全部缓冲内容"
-            : workspace.statusText
+            ? "用 \(controls.generationProviderName) 处理当前全部缓冲内容"
+            : ((lastSecureInputState || sessionProtectionActive)
+                ? "安全输入已开启，生成已暂停"
+                : workspace.statusText)
+    }
+
+    private func refreshDerivedWorkspaceWithoutControls(
+        _ workspace: any DerivedBufferWorkspace
+    ) {
+        resetDerivedControlRendering()
+        pluginSelector.toolTip = "当前插件：\(workspace.workbenchDisplayName)"
+        pluginLoadingIndicator.isHidden = true
+        pluginLoadingIndicator.stopAnimation(nil)
+    }
+
+    private func resetDerivedControlRendering() {
+        renderingTranslationControls = false
+        renderingAIControls = false
+        renderedTranslationLanguages.removeAll()
+        renderedPluginKeys.removeAll()
+        pluginActionButtons.removeAll()
+        pluginButtonRow.arrangedSubviews.forEach {
+            pluginButtonRow.removeArrangedSubview($0)
+            $0.removeFromSuperview()
+        }
     }
 
     private func selectPopup(_ popup: NSPopUpButton, representedValue: String) {
@@ -1261,14 +1586,7 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
             self?.refresh()
         })
         observers.append(center.addObserver(
-            forName: .appleTranslationWorkspaceDidChange,
-            object: AppleTranslationWorkspace.shared,
-            queue: .main
-        ) { [weak self] _ in
-            self?.refresh()
-        })
-        observers.append(center.addObserver(
-            forName: .aiTextPluginWorkspaceDidChange,
+            forName: .derivedBufferWorkspaceDidChange,
             object: nil,
             queue: .main
         ) { [weak self] _ in
@@ -1346,15 +1664,23 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
             self?.restoreAfterSessionProtection()
         })
         secureInputPollTimer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
-            guard let self,
-                  self.panel.isVisible else { return }
-            let current = IsSecureEventInputEnabled()
-            guard current != self.lastSecureInputState else { return }
-            self.lastSecureInputState = current
-            if current {
+            guard let self else { return }
+            let secureInputEnabled = IsSecureEventInputEnabled()
+            // Keep derived plaintext protected even while the workbench is
+            // hidden. Session lifecycle flags remain authoritative: this poll
+            // may synchronize secure-input protection, but it must never undo
+            // lock/sleep/session-resign protection while any flag is active.
+            DerivedBufferWorkspaceRouter.setProtectedOnAll(
+                secureInputEnabled || self.sessionProtectionActive
+            )
+            guard secureInputEnabled != self.lastSecureInputState else { return }
+            self.lastSecureInputState = secureInputEnabled
+            if secureInputEnabled {
                 ActionPluginHost.shared.cancelActiveInvocationForWorkbench()
             }
-            self.refresh()
+            if self.panel.isVisible {
+                self.refresh()
+            }
             RimeBufferController.refreshActiveUI()
         }
         if let secureInputPollTimer {
@@ -1363,9 +1689,10 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         pluginStatusPollTimer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self,
                   self.isVisible,
-                  !self.hiddenForSession,
-                  !AppleTranslationWorkspace.shared.isSelected,
-                  !AITextWorkspaceRouter.isSelected else { return }
+                  !self.hiddenForSession else { return }
+            // refreshStatuses only contacts the selected external provider,
+            // but its five-second manifest scan must keep running while a
+            // built-in owns the workbench so a late Marine install is found.
             ActionPluginHost.shared.refreshStatuses()
         }
         if let pluginStatusPollTimer {
@@ -1375,8 +1702,7 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
 
     private func protectForSession(reason: String) {
         ActionPluginHost.shared.cancelActiveInvocationForWorkbench()
-        AppleTranslationWorkspace.shared.setProtected(true)
-        AITextWorkspaceRouter.setProtected(true)
+        DerivedBufferWorkspaceRouter.setProtectedOnAll(true)
         if let lease = InputFocusCoordinator.shared.invalidateAll(reason: reason) {
             lease.controller?.finalizeProtectedSession(lease, reason: reason)
             candidateWindow.hide(owner: lease.token)
@@ -1390,8 +1716,9 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
     }
 
     private func restoreAfterSessionProtection() {
-        AppleTranslationWorkspace.shared.setProtected(sessionProtectionActive)
-        AITextWorkspaceRouter.setProtected(sessionProtectionActive)
+        DerivedBufferWorkspaceRouter.setProtectedOnAll(
+            sessionProtectionActive || IsSecureEventInputEnabled()
+        )
         guard hiddenForSession,
               !sessionProtectionActive,
               UserDefaults.standard.bool(forKey: Key.visible) else { return }
@@ -1564,17 +1891,14 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
     @objc private func refreshPluginTapped() {
         guard BufferPluginSelectionStore.shared.activeKey != nil,
               !IsSecureEventInputEnabled() else { return }
-        if AppleTranslationWorkspace.shared.isSelected {
-            AppleTranslationWorkspace.shared.resetAndRefresh()
-        } else if AITextWorkspaceRouter.isSelected {
-            _ = AITextWorkspaceRouter.resetAndRefresh()
+        if let workspace = DerivedBufferWorkspaceRouter.selectedWorkspace {
+            _ = workspace.requestRefresh()
         } else {
             ActionPluginHost.shared.cancelActiveInvocationForWorkbench()
             ActionPluginHost.shared.refreshStatuses(force: true)
         }
-        let kind = AppleTranslationWorkspace.shared.isSelected
-            ? "translation"
-            : (AITextWorkspaceRouter.isSelected ? "ai-text" : "action")
+        let kind = DerivedBufferWorkspaceRouter.selectedWorkspace?
+            .deliveryWorkspaceID ?? "action"
         IMELog.write("buffer plugin refresh requested kind=\(kind)")
         refresh()
         RimeBufferController.refreshActiveUI()
@@ -1586,28 +1910,36 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
     }
 
     @objc private func aiGenerateTapped() {
-        guard !IsSecureEventInputEnabled() else { return }
-        if !AITextWorkspaceRouter.generate() { NSSound.beep() }
+        guard !IsSecureEventInputEnabled(),
+              let controls = DerivedBufferWorkspaceRouter.selectedWorkspace
+                as? any DerivedManualGenerationControls else { return }
+        if !controls.generate() { NSSound.beep() }
         refresh()
         RimeBufferController.refreshActiveUI()
     }
 
     @objc private func translationSourceChanged() {
-        guard let value = translationSourcePopup.selectedItem?.representedObject as? String else {
+        guard let controls = DerivedBufferWorkspaceRouter.selectedWorkspace
+                as? any DerivedLanguagePairControls,
+              let value = translationSourcePopup.selectedItem?.representedObject as? String else {
             return
         }
-        AppleTranslationWorkspace.shared.setSourceLanguage(value)
+        controls.setSourceLanguage(value)
     }
 
     @objc private func translationTargetChanged() {
-        guard let value = translationTargetPopup.selectedItem?.representedObject as? String else {
+        guard let controls = DerivedBufferWorkspaceRouter.selectedWorkspace
+                as? any DerivedLanguagePairControls,
+              let value = translationTargetPopup.selectedItem?.representedObject as? String else {
             return
         }
-        AppleTranslationWorkspace.shared.setTargetLanguage(value)
+        controls.setTargetLanguage(value)
     }
 
     @objc private func translationSwapTapped() {
-        if !AppleTranslationWorkspace.shared.swapLanguages() { NSSound.beep() }
+        guard let controls = DerivedBufferWorkspaceRouter.selectedWorkspace
+                as? any DerivedLanguagePairControls else { return }
+        if !controls.swapLanguages() { NSSound.beep() }
     }
 
 }

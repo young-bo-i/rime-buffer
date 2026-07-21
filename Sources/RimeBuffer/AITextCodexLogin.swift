@@ -320,7 +320,7 @@ final class AITextCodexLoginOperation: AITextCancellable {
             "params": [
                 "clientInfo": [
                     "name": "rimebuffer",
-                    "title": "RimeBuffer",
+                    "title": ProductIdentity.displayName,
                     "version": "1",
                 ],
             ],

@@ -16,6 +16,30 @@ require iconutil
 require swift
 require python3
 
+# `rimes-mark.svg` is the exact user-supplied master. Derived artwork may add
+# backgrounds and transforms, but its final five path geometries must never
+# drift from the master mark.
+python3 - <<'PY'
+import xml.etree.ElementTree as ET
+
+def path_data(filename):
+    root = ET.parse(filename).getroot()
+    return [
+        element.attrib["d"]
+        for element in root.iter()
+        if element.tag.rsplit("}", 1)[-1] == "path" and "d" in element.attrib
+    ]
+
+master = path_data("rimes-mark.svg")
+if len(master) != 5:
+    raise SystemExit(f"rimes-mark.svg must contain exactly five paths, got {len(master)}")
+
+for derived in ("app-icon.svg", "inputsource.svg", "menubar.svg"):
+    paths = path_data(derived)
+    if paths[-len(master):] != master:
+        raise SystemExit(f"{derived} no longer contains the exact RIMES master paths")
+PY
+
 tmpdir="$(mktemp -d "$ROOT/.generate-tmp.XXXXXX")"
 trap 'rm -rf "$tmpdir"' EXIT
 
@@ -231,11 +255,20 @@ render_png menubar.svg 36 menubar-template.png
 # Colored brand icon: System Settings row (tsInputMethodIconFileKey).
 render_pdf inputsource.pdf 16 inputsource.svg
 
-# Monochrome ET glyph for the system input menu / menu bar (tsInputMode*Icon
+# Monochrome RIMES glyph for the system input menu / menu bar (tsInputMode*Icon
 # keys): page 1 black for light menus, page 2 white for the selected/dark
 # state — mirrors Sogou's two-page menubarpinyin.pdf.
 sed 's/#000000/#FFFFFF/g' menubar.svg > "$tmpdir/menubar-white.svg"
 render_pdf menuicon.pdf 16 menubar.svg "$tmpdir/menubar-white.svg"
+
+# Keep the bundle-facing copies in sync. The production input-menu PDF stays
+# single-page: that is the compatibility contract already exercised by IMK,
+# WeChat, and TextInputUIMacHelper. `menuicon.pdf` remains a two-page design
+# reference, while AppKit tints the one-page template in the actual bundle.
+resources_dir="$ROOT/../Resources"
+cp inputsource.pdf "$resources_dir/etinput.pdf"
+render_pdf "$resources_dir/etinput-menu.pdf" 16 menubar.svg
+cp menubar-template.png "$resources_dir/menubar-template.png"
 
 for spec in \
   "AppIcon.iconset/icon_16x16.png:16" \
@@ -258,6 +291,9 @@ done
 assert_nonempty AppIcon.icns
 assert_nonempty inputsource.pdf
 assert_nonempty menuicon.pdf
+assert_nonempty "$resources_dir/etinput.pdf"
+assert_nonempty "$resources_dir/etinput-menu.pdf"
+assert_nonempty "$resources_dir/menubar-template.png"
 
 python3 - menubar-template.png <<'PY'
 import struct
@@ -349,5 +385,5 @@ if opaque_pixels == 0 or transparent_pixels == 0:
     raise SystemExit(f"{path} must contain both visible black pixels and transparency")
 PY
 
-echo "Generated Logo2 assets:"
+echo "Generated RIMES assets:"
 find . -maxdepth 2 -path './.generate-tmp.*' -prune -o -type f -print | sort | sed 's#^\./##'

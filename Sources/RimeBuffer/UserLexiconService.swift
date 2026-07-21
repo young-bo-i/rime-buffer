@@ -19,7 +19,7 @@ enum UserLexiconKind: String, CaseIterable, Codable, Sendable {
     }
 
     var suggestedFileName: String {
-        "ETInput-\(rawValue)-learning.tsv"
+        "\(ProductIdentity.displayName)-\(rawValue)-learning.tsv"
     }
 }
 

@@ -39,10 +39,7 @@ extension BufferModel: BufferDeliveryContentSource {
 
 enum BufferDeliveryContentRouter {
     static func current(sourceModel: BufferModel = .shared) -> any BufferDeliveryContentSource {
-        if AppleTranslationWorkspace.shared.isSelected {
-            return AppleTranslationWorkspace.shared
-        }
-        if let workspace = AITextWorkspaceRouter.selectedWorkspace {
+        if let workspace = DerivedBufferWorkspaceRouter.selectedWorkspace {
             return workspace
         }
         return sourceModel

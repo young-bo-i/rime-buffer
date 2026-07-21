@@ -125,6 +125,7 @@ final class RimeBufferController: IMKInputController {
     private var bufferEnterCallbackOwnership = BufferEnterCallbackOwnership()
     private var bufferEnterClient: IMKTextInput?
     private var bufferEnterOwner: FocusToken?
+    private var bufferEnterUsesStreamInput = false
     private var bufferEnterHardwareKeyCode: CGKeyCode = 36
     private var bufferEnterStartedAt: CFAbsoluteTime = 0
     private var bufferEnterPollTimer: Timer?
@@ -168,6 +169,97 @@ final class RimeBufferController: IMKInputController {
               lease.controller === self,
               ObjectIdentifier(client as AnyObject) == lease.clientIdentity else { return false }
         return !isOwnClient(client)
+    }
+
+    /// Consciousness-stream capture is intentionally stricter than ordinary
+    /// buffer commands: persistent capture must be enabled, the exact external
+    /// client must still own the lease, and only 全拼 · 串击 is supported.
+    private var streamInputModeSelected: Bool {
+        BufferModel.shared.enabled
+            && BufferPluginSelectionStore.shared.isSelected(
+                StreamInputWorkspace.pluginKey
+            )
+            && InputConfigurationStore.shared.configuration
+                == StreamInputCaptureRules.requiredConfiguration
+    }
+
+    private func streamInputLease(client: IMKTextInput) -> FocusLease? {
+        guard streamInputModeSelected,
+              !IsSecureEventInputEnabled(),
+              let focusToken,
+              let lease = InputFocusCoordinator.shared.liveTarget(
+                expected: focusToken,
+                forceOverlayVisibilityRefresh: true
+              ),
+              lease.controller === self,
+              lease.clientIdentity == ObjectIdentifier(client as AnyObject) else {
+            return nil
+        }
+        return lease
+    }
+
+    private func streamInputDisposition(keycode: Int32?,
+                                        mask: Int32,
+                                        exactExternalFocus: Bool)
+        -> StreamInputCaptureRules.Disposition {
+        StreamInputCaptureRules.disposition(
+            keycode: keycode,
+            mask: mask,
+            bufferEnabled: BufferModel.shared.enabled,
+            pluginSelected: BufferPluginSelectionStore.shared.isSelected(
+                StreamInputWorkspace.pluginKey
+            ),
+            configuration: InputConfigurationStore.shared.configuration,
+            secureInput: IsSecureEventInputEnabled(),
+            exactExternalFocus: exactExternalFocus
+        )
+    }
+
+    /// Stream raw input and librime composition are mutually exclusive. The
+    /// plugin-selection callback normally settles the old composition, but a
+    /// delayed IMK callback can race that transition. Recheck and settle it on
+    /// the exact event lease, then prove both local and librime state are idle
+    /// before this same physical printable key is allowed into the raw rail.
+    private func prepareForStreamInputCapture(client: IMKTextInput,
+                                              lease: FocusLease) -> Bool {
+        guard streamInputLease(client: client) === lease else { return false }
+
+        var pending = chord.hasPending
+            || composition.composing
+            || !candidateWindow.rawInputForCommit.isEmpty
+        if session != 0 {
+            guard rimeEngine.isHealthy else { return false }
+            let context = rimeEngine.getContext(session: session)
+            pending = pending
+                || context.active
+                || !context.input.isEmpty
+                || !context.preedit.isEmpty
+        }
+
+        if pending {
+            // A local pending marker without a healthy session cannot be
+            // committed faithfully. Consume the new stream key instead of
+            // clearing or mixing that unresolved state into the raw rail.
+            guard session != 0, rimeEngine.isHealthy else { return false }
+            resolveComposition(
+                client: client,
+                owner: lease.token,
+                externalTarget: lease.isExternalTarget
+            )
+        }
+
+        guard streamInputLease(client: client) === lease,
+              !chord.hasPending,
+              !composition.composing,
+              candidateWindow.rawInputForCommit.isEmpty else { return false }
+        if session != 0 {
+            guard rimeEngine.isHealthy else { return false }
+            let context = rimeEngine.getContext(session: session)
+            guard !context.active,
+                  context.input.isEmpty,
+                  context.preedit.isEmpty else { return false }
+        }
+        return true
     }
 
     private var ownsActiveExternalBufferLease: Bool {
@@ -972,6 +1064,20 @@ final class RimeBufferController: IMKInputController {
                 lastModifiers = rejectedModifiers
             }
             IMELog.write("handle: stale event rejected bundle=\(bundleId(of: client))")
+            if event.type == .keyDown || event.type == .keyUp {
+                switch streamInputDisposition(
+                    keycode: keysym(for: event),
+                    mask: RimeKey.modifierMask(from: event.modifierFlags),
+                    exactExternalFocus: false
+                ) {
+                case .passThrough:
+                    break
+                case .capture, .consumeOwned, .consumeUntrusted:
+                    StreamInputWorkspace.shared.authorityRejected()
+                    IMELog.write("stream printable consumed after stale event")
+                    return true
+                }
+            }
             let isPlainReturn = isUnmodifiedBufferReturn(event)
             if isPlainReturn, bufferEnterGestureActive {
                 lastBufferEnterKeyHandledAt = CFAbsoluteTimeGetCurrent()
@@ -984,6 +1090,9 @@ final class RimeBufferController: IMKInputController {
             }
             if isUnmodifiedBufferControlEvent(event),
                bufferControlDisposition(client: client) != .passThrough {
+                if streamInputModeSelected {
+                    StreamInputWorkspace.shared.authorityRejected()
+                }
                 if isPlainReturn, event.type == .keyDown {
                     suppressUntrustedBufferEnter(hardwareKeyCode: event.keyCode)
                 }
@@ -1060,9 +1169,28 @@ final class RimeBufferController: IMKInputController {
 
     private func handleKeyUp(_ event: NSEvent, client: IMKTextInput) -> Bool {
         guard let keycode = keysym(for: event) else { return false }
-        guard keycode == RimeKey.return,
-              event.modifierFlags.intersection([.command, .control, .option]).isEmpty else {
-            return false
+        if keycode != RimeKey.return
+            || !event.modifierFlags
+                .intersection([.command, .control, .option]).isEmpty {
+            let streamLease = streamInputLease(client: client)
+            switch streamInputDisposition(
+                keycode: keycode,
+                mask: RimeKey.modifierMask(from: event.modifierFlags),
+                exactExternalFocus: streamLease != nil
+            ) {
+            case .passThrough:
+                return false
+            case .capture, .consumeOwned:
+                return true
+            case .consumeUntrusted:
+                StreamInputWorkspace.shared.authorityRejected()
+                return true
+            }
+        }
+        if streamInputModeSelected,
+           bufferControlDisposition(client: client) != .passThrough,
+           streamInputLease(client: client) == nil {
+            StreamInputWorkspace.shared.authorityRejected()
         }
         if bufferEnterActionActive,
            bufferEnterCallbackOwnership.suppressesKeyUp,
@@ -1113,6 +1241,53 @@ final class RimeBufferController: IMKInputController {
 
         let routedKeycode = keysym(for: event)
         let routedMask = RimeKey.modifierMask(from: event.modifierFlags)
+        let streamLease = streamInputLease(client: client)
+        switch streamInputDisposition(
+            keycode: routedKeycode,
+            mask: routedMask,
+            exactExternalFocus: streamLease != nil
+        ) {
+        case .passThrough:
+            break
+        case .consumeUntrusted:
+            StreamInputWorkspace.shared.authorityRejected()
+            IMELog.write("stream printable consumed without exact authority")
+            return true
+        case let .capture(letter):
+            guard let streamLease,
+                  prepareForStreamInputCapture(
+                    client: client,
+                    lease: streamLease
+                  ),
+                  StreamInputWorkspace.shared.capture(
+                    letter: letter,
+                    focusToken: streamLease.token
+                  ),
+                  self.streamInputLease(client: client) === streamLease else {
+                StreamInputWorkspace.shared.authorityRejected()
+                IMELog.write("stream letter consumed after authority changed")
+                return true
+            }
+            updateUI(client: client)
+            return true
+        case .consumeOwned:
+            guard let streamLease,
+                  prepareForStreamInputCapture(
+                    client: client,
+                    lease: streamLease
+                  ),
+                  StreamInputWorkspace.shared.consumeIgnoredKey(
+                    keycode: routedKeycode,
+                    focusToken: streamLease.token
+                  ),
+                  self.streamInputLease(client: client) === streamLease else {
+                StreamInputWorkspace.shared.authorityRejected()
+                IMELog.write("stream separator consumed after authority changed")
+                return true
+            }
+            updateUI(client: client)
+            return true
+        }
         let controlMask = RimeKey.controlMask | RimeKey.altMask | RimeKey.superMask
         if routedMask & controlMask == 0,
            routedKeycode == RimeKey.return || routedKeycode == RimeKey.backspace {
@@ -1120,6 +1295,9 @@ final class RimeBufferController: IMKInputController {
             case .passThrough:
                 break
             case .consumeOnly:
+                if streamInputModeSelected {
+                    StreamInputWorkspace.shared.authorityRejected()
+                }
                 IMELog.write("buffer \(routedKeycode == RimeKey.return ? "enter" : "backspace") consumed without action; focus not trusted")
                 if routedKeycode == RimeKey.return {
                     suppressUntrustedBufferEnter(hardwareKeyCode: event.keyCode)
@@ -1227,11 +1405,42 @@ final class RimeBufferController: IMKInputController {
         }
 
         guard shouldUseBufferCommands(client: client) else {
+            if streamInputModeSelected {
+                StreamInputWorkspace.shared.authorityRejected()
+            }
             IMELog.write("buffer enter key consumed without action after focus changed")
             suppressUntrustedBufferEnter(hardwareKeyCode: hardwareKeyCode)
             return true
         }
         lastBufferEnterKeyHandledAt = now
+        if streamInputModeSelected {
+            guard let lease = streamInputLease(client: client) else {
+                StreamInputWorkspace.shared.authorityRejected()
+                suppressUntrustedBufferEnter(hardwareKeyCode: hardwareKeyCode)
+                IMELog.write("stream return consumed without exact authority")
+                return true
+            }
+            let settled = StreamInputWorkspace.shared.settleForReturn(
+                focusToken: lease.token
+            )
+            guard streamInputLease(client: client) === lease else {
+                StreamInputWorkspace.shared.authorityRejected()
+                suppressUntrustedBufferEnter(hardwareKeyCode: hardwareKeyCode)
+                IMELog.write("stream return consumed after authority changed")
+                return true
+            }
+            if settled {
+                suppressBufferEnterAfterComposition(
+                    client: client,
+                    hardwareKeyCode: hardwareKeyCode
+                )
+                updateUI(client: client)
+                return true
+            }
+            beginBufferEnterGesture(client: client,
+                                    hardwareKeyCode: hardwareKeyCode)
+            return true
+        }
         if settlePendingBufferCompositionIfNeeded(client: client,
                                                   source: "keyDown") {
             suppressBufferEnterAfterComposition(client: client,
@@ -1249,6 +1458,9 @@ final class RimeBufferController: IMKInputController {
             return false
         }
         guard shouldUseBufferCommands(client: client) else {
+            if streamInputModeSelected {
+                StreamInputWorkspace.shared.authorityRejected()
+            }
             IMELog.write("buffer backspace key consumed without action after focus changed")
             return true
         }
@@ -1332,6 +1544,9 @@ final class RimeBufferController: IMKInputController {
             let backspaceMustStayConsumed = isDeleteBackwardSelector(selector)
                 && bufferControlDisposition(client: sender as? IMKTextInput) != .passThrough
             if newlineMustStayConsumed || backspaceMustStayConsumed {
+                if streamInputModeSelected {
+                    StreamInputWorkspace.shared.authorityRejected()
+                }
                 IMELog.write("buffer control command consumed without action after client mismatch selector=\(NSStringFromSelector(selector))")
                 return true
             }
@@ -1354,6 +1569,10 @@ final class RimeBufferController: IMKInputController {
                 IMELog.write("buffer enter fresh command passed through selector=\(NSStringFromSelector(selector))")
                 return false
             case .consumeOnly, .executeBufferAction:
+                if streamInputModeSelected,
+                   callbackClient.flatMap({ streamInputLease(client: $0) }) == nil {
+                    StreamInputWorkspace.shared.authorityRejected()
+                }
                 // `handle(_:client:)` is the sole Return action path. IMK's
                 // informal protocol requires choosing one event strategy; this
                 // defensive callback only prevents a duplicate AppKit command
@@ -1400,10 +1619,20 @@ final class RimeBufferController: IMKInputController {
         case .passThrough:
             return false
         case .consumeOnly:
+            if streamInputModeSelected {
+                StreamInputWorkspace.shared.authorityRejected()
+            }
             IMELog.write("buffer backspace command consumed without action selector=\(NSStringFromSelector(selector))")
             return true
         case .executeBufferAction:
             break
+        }
+
+        if streamInputModeSelected,
+           callbackClient.flatMap({ streamInputLease(client: $0) }) == nil {
+            StreamInputWorkspace.shared.authorityRejected()
+            IMELog.write("stream backspace command consumed after authority changed")
+            return true
         }
 
         let now = CFAbsoluteTimeGetCurrent()
@@ -1505,6 +1734,7 @@ final class RimeBufferController: IMKInputController {
         bufferEnterSuppressUntilPhysicalUp = false
         bufferEnterClient = nil
         bufferEnterOwner = nil
+        bufferEnterUsesStreamInput = false
         bufferEnterPollTimer?.invalidate()
         bufferEnterPollTimer = nil
         BufferWindowController.shared.setEnterHoldProgress(nil)
@@ -1518,6 +1748,7 @@ final class RimeBufferController: IMKInputController {
         bufferEnterCallbackOwnership.claimPress()
         bufferEnterClient = client
         bufferEnterOwner = lease.token
+        bufferEnterUsesStreamInput = streamInputModeSelected
         bufferEnterHardwareKeyCode = CGKeyCode(hardwareKeyCode)
         bufferEnterStartedAt = CFAbsoluteTimeGetCurrent()
         BufferWindowController.shared.setEnterHoldProgress(0)
@@ -1535,6 +1766,7 @@ final class RimeBufferController: IMKInputController {
         bufferEnterCallbackOwnership.claimPress()
         bufferEnterClient = client
         bufferEnterOwner = lease?.token
+        bufferEnterUsesStreamInput = streamInputModeSelected
         bufferEnterHardwareKeyCode = CGKeyCode(hardwareKeyCode)
         bufferEnterStartedAt = CFAbsoluteTimeGetCurrent()
         BufferWindowController.shared.setEnterHoldProgress(nil)
@@ -1801,6 +2033,17 @@ final class RimeBufferController: IMKInputController {
                                         client: IMKTextInput?,
                                         expectedOwner: FocusToken?,
                                         source: String) -> Bool {
+        if bufferEnterUsesStreamInput {
+            guard streamInputModeSelected,
+                  let resolvedClient = client,
+                  let expectedOwner,
+                  let lease = streamInputLease(client: resolvedClient),
+                  lease.token == expectedOwner else {
+                StreamInputWorkspace.shared.authorityRejected()
+                IMELog.write("stream return \(source) consumed without delivery; authority changed")
+                return true
+            }
+        }
         guard let resolvedClient = client,
               currentCallbackClient(resolvedClient) != nil,
               shouldUseBufferCommands(client: resolvedClient),
@@ -1808,12 +2051,16 @@ final class RimeBufferController: IMKInputController {
               focusToken == expectedOwner,
               InputFocusCoordinator.shared.isCurrent(expectedOwner,
                                                      controller: self) else {
+            if bufferEnterUsesStreamInput {
+                StreamInputWorkspace.shared.authorityRejected()
+            }
             IMELog.write("buffer enter \(source) consumed without delivery; focus changed")
             return true
         }
 
-        if settlePendingBufferCompositionIfNeeded(client: resolvedClient,
-                                                  source: source) {
+        if !bufferEnterUsesStreamInput,
+           settlePendingBufferCompositionIfNeeded(client: resolvedClient,
+                                                   source: source) {
             return true
         }
 
@@ -1835,6 +2082,20 @@ final class RimeBufferController: IMKInputController {
     }
 
     private func performBufferBackspace(client: IMKTextInput, source: String) -> Bool {
+        if streamInputModeSelected {
+            guard let lease = streamInputLease(client: client),
+                  StreamInputWorkspace.shared.deleteBackward(
+                    focusToken: lease.token
+                  ),
+                  streamInputLease(client: client) === lease else {
+                StreamInputWorkspace.shared.authorityRejected()
+                IMELog.write("stream input backspace consumed without authority source=\(source)")
+                return true
+            }
+            IMELog.write("stream input backspace consumed source=\(source)")
+            updateUI(client: client)
+            return true
+        }
         if !BufferModel.shared.enabled {
             if chord.hasPending || composition.composing {
                 IMELog.write("buffer backspace \(source) consumed; transient mode left host composition untouched")
@@ -1887,7 +2148,7 @@ final class RimeBufferController: IMKInputController {
     }
 
     private var usesContinuousDerivedSourceRail: Bool {
-        AppleTranslationWorkspace.shared.isSelected || AITextWorkspaceRouter.isSelected
+        DerivedBufferWorkspaceRouter.selectedWorkspace != nil
     }
 
     private func shiftedDirectText(for event: NSEvent) -> String? {
