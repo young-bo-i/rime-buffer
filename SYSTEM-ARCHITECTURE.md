@@ -317,7 +317,7 @@ Delivery.insert(_ text, into: client)
 ```
 
 - 每个一级页的子页固定显示在右侧顶部；route/subpage 使用稳定字符串身份，不依赖 sidebar 行号。启停内置扩展后目录会重建；若当前扩展被停用，安全回退到「插件 ▸ 内置扩展」。
-- 输入法页明确分开三层：输入编码、键入模式和词库。运行时只暴露经过验证的 Rime 组合方案，不允许三层任意交叉，以免生成不可部署配置。`my_combo` 的产品名是「飞耀互击」；同一 schema 由完整的 `InputConfiguration.keyingMode` 区分“只结算当前批的并击”与“可跨批配对左右半区的互击”，两者都保留单侧批次，不能从 schema ID 反推。无映射批由 `echo_translator` 给出低优先级原码候选；`,`/`.` 只在 chord alphabet 中充当双角色键，单键结算继续落到 punctuator。词库页通过 librime `levers` API 维护真实的 `rime_ice` / `english` 用户学习库，导入是合并，导出是可移植 TSV，不复制 live LevelDB。
+- 输入法页明确分开三层：输入编码、键入模式和词库。运行时只暴露经过验证的 Rime 组合方案，不允许三层任意交叉，以免生成不可部署配置。`my_combo` 的产品名是「飞耀互击」；同一 schema 由完整的 `InputConfiguration.keyingMode` 区分“只结算当前批的并击”与“可跨批配对左右半区的互击”，两者都保留多键单侧批次，不能从 schema ID 反推。单个物理字母保持英文原码且不自动添加分词符；互击只在至少一侧为多键和弦时跨批配对。`my_combo` 仅覆盖物理和弦映射，候选拼写、中文/英文翻译及过滤链继承 `rime_ice`，因此多音节组字仍能选择前缀单字并正常翻页。无映射批保留可由 Return 提交的原码；`,`/`.` 只在 chord alphabet 中充当双角色键，单键结算继续落到 punctuator。词库页通过 librime `levers` API 维护真实的 `rime_ice` / `english` 用户学习库，导入是合并，导出是可移植 TSV，不复制 live LevelDB。
 - 缓冲区、连接器和外部插件管理仍接真实运行时；“AI 模型”子页用单选控件在 Codex CLI、Claude Code CLI 与 OpenAI 兼容 API 三个模型源间切换，展示两个 CLI 的可用性与授权/远程服务隐私说明，并管理 OpenAI 兼容 API 的 Base URL、model 与 API key。该连接器选择独立于缓冲插件 owner。尚未实现的 SSE/SSH 不显示成可操作假功能。当前没有按来源编辑信任等级或重新生成 token 的 UI。
 
 ### 5.3 统一插件平台

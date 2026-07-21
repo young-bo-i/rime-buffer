@@ -81,10 +81,11 @@ enum FlyChordLayout {
 /// Product-level settlement policy layered over the same FlyYao key map.
 ///
 /// - `sameBatchOnly` is 并击: every key inside the current timer batch resolves
-///   together, including useful left-only/right-only mappings. Separate batches
-///   are never recombined.
+///   together. Multi-key left-only/right-only mappings are useful chords, while
+///   a one-key batch remains literal. Separate batches are never recombined.
 /// - `independentHalves` is 互击: it has the same per-batch settlement, plus a
-///   settled left-only initial may pair with the next right-only final.
+///   settled left-only initial may pair with the next right-only final when at
+///   least one of those halves is a real multi-key chord.
 enum FlyChordSettlementPolicy: Equatable {
     case sameBatchOnly
     case independentHalves
@@ -100,12 +101,13 @@ enum FlyChordRoutingRules {
     }
 }
 
-/// Every settled FlyYao batch is one syllable.  Rime's speller otherwise has
-/// no way to distinguish two physical strokes whose canonical spellings also
-/// form a valid single syllable (`ni` + `an` -> `nian`).  Insert the configured
-/// apostrophe delimiters on the occupied sides of the raw-input cursor.  At
-/// the end this is only a leading delimiter; editing in the middle also needs
-/// a trailing delimiter so the inserted syllable cannot merge with its suffix.
+/// Every settled multi-key FlyYao batch is one syllable. Rime's speller
+/// otherwise has no way to distinguish two physical strokes whose canonical
+/// spellings also form a valid single syllable (`ni` + `an` -> `nian`). A
+/// one-key batch is deliberately literal: it may be part of an English word,
+/// so it must neither gain an apostrophe nor be forced into a half-key mapping.
+/// The structural plan is still retained for a one-key left batch because a
+/// later multi-key right complement may turn both batches into one real chord.
 struct FlyChordBoundaryPlan: Equatable {
     let before: Bool
     let after: Bool
@@ -113,6 +115,10 @@ struct FlyChordBoundaryPlan: Equatable {
 
 enum FlyChordBoundaryRules {
     static let delimiterKeycode: Int32 = 0x27
+
+    static func shouldInsert(forKeyCount count: Int) -> Bool {
+        count > 1
+    }
 
     static func plan(for context: RimeContextModel) -> FlyChordBoundaryPlan {
         let bytes = Array(context.input.utf8)
@@ -202,11 +208,13 @@ struct FlyChordMutualPairingState {
     }
 
     mutating func takeComplement(before shape: FlyChordBatchShape,
+                                 currentKeyCount: Int,
                                  policy: FlyChordSettlementPolicy,
                                  currentContext: RimeContextModel) -> SettledLeft? {
         guard policy == .independentHalves,
               shape == .rightOnly,
               let pending = settledLeft,
+              pending.keys.count > 1 || currentKeyCount > 1,
               pending.settledInput == currentContext.input,
               pending.settledCursorPos == currentContext.cursorPos,
               pending.settledSelStart == currentContext.selStart,

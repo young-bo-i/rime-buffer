@@ -2221,7 +2221,11 @@ final class RimeBufferController: IMKInputController {
         var boundaryPlan = FlyChordBoundaryRules.plan(for: contextBefore)
 
         func replaySettledLeft(_ left: FlyChordMutualPairingState.SettledLeft) -> Bool {
-            if left.boundaryPlan.before,
+            let insertsBoundary = FlyChordBoundaryRules.shouldInsert(
+                forKeyCount: left.keys.count
+            )
+            if insertsBoundary,
+               left.boundaryPlan.before,
                !rimeEngine.processKey(FlyChordBoundaryRules.delimiterKeycode,
                                       mask: 0,
                                       session: session) {
@@ -2243,7 +2247,8 @@ final class RimeBufferController: IMKInputController {
             ) {
                 released += 1
             }
-            let trailingBoundaryAccepted = !left.boundaryPlan.after
+            let trailingBoundaryAccepted = !insertsBoundary
+                || !left.boundaryPlan.after
                 || rimeEngine.processKey(FlyChordBoundaryRules.delimiterKeycode,
                                          mask: 0,
                                          session: session)
@@ -2254,6 +2259,7 @@ final class RimeBufferController: IMKInputController {
 
         if let previousLeft = mutualPairingState.takeComplement(
             before: shape,
+            currentKeyCount: keys.count,
             policy: policy,
             currentContext: contextBefore
         ) {
@@ -2298,7 +2304,11 @@ final class RimeBufferController: IMKInputController {
             }
         }
 
-        let leadingBoundaryAccepted = !boundaryPlan.before
+        let insertsBoundary = FlyChordBoundaryRules.shouldInsert(
+            forKeyCount: engineKeys.count
+        )
+        let leadingBoundaryAccepted = !insertsBoundary
+            || !boundaryPlan.before
             || rimeEngine.processKey(FlyChordBoundaryRules.delimiterKeycode,
                                      mask: 0,
                                      session: session)
@@ -2319,7 +2329,8 @@ final class RimeBufferController: IMKInputController {
                 handledCount += 1
             }
         }
-        let trailingBoundaryAccepted = !boundaryPlan.after
+        let trailingBoundaryAccepted = !insertsBoundary
+            || !boundaryPlan.after
             || rimeEngine.processKey(FlyChordBoundaryRules.delimiterKeycode,
                                      mask: 0,
                                      session: session)

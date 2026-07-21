@@ -746,6 +746,7 @@ func runEngineSmokeTest() -> Bool {
             var boundaryPlan = FlyChordBoundaryRules.plan(for: contextBefore)
             if let previousLeft = pairing.takeComplement(
                 before: shape,
+                currentKeyCount: keys.count,
                 policy: policy,
                 currentContext: contextBefore
             ) {
@@ -760,7 +761,11 @@ func runEngineSmokeTest() -> Bool {
                 engineKeys = previousLeft.keys + keys
                 boundaryPlan = previousLeft.boundaryPlan
             }
-            if boundaryPlan.before,
+            let insertsBoundary = FlyChordBoundaryRules.shouldInsert(
+                forKeyCount: engineKeys.count
+            )
+            if insertsBoundary,
+               boundaryPlan.before,
                !engine.processKey(FlyChordBoundaryRules.delimiterKeycode,
                                   session: session) {
                 allPressesHandled = false
@@ -777,7 +782,8 @@ func runEngineSmokeTest() -> Bool {
                     allPressesHandled = false
                 }
             }
-            if boundaryPlan.after,
+            if insertsBoundary,
+               boundaryPlan.after,
                !engine.processKey(FlyChordBoundaryRules.delimiterKeycode,
                                   session: session) {
                 allPressesHandled = false
@@ -794,17 +800,40 @@ func runEngineSmokeTest() -> Bool {
         return (engine.getContext(session: session), allPressesHandled)
     }
 
+    func collectCandidatePages(maxPages: Int = 128)
+        -> (contexts: [RimeContextModel], texts: [String], pagingWorked: Bool) {
+        var contexts = [engine.getContext(session: session)]
+        var texts = contexts[0].candidates.map(\.text)
+        var pagingWorked = true
+        while let current = contexts.last,
+              !current.isLastPage,
+              contexts.count < maxPages {
+            guard engine.processKey(0x3d, session: session) else {
+                pagingWorked = false
+                break
+            }
+            let next = engine.getContext(session: session)
+            guard next.pageNo > current.pageNo else {
+                pagingWorked = false
+                break
+            }
+            contexts.append(next)
+            texts.append(contentsOf: next.candidates.map(\.text))
+        }
+        return (contexts, texts, pagingWorked)
+    }
+
     // 并击 settles every current timer batch, including a useful one-sided
     // initial/final. It differs from 互击 only by refusing to recombine two
     // already-settled batches into one syllable.
     let sameBatchOneSided = typeFlyChordStrokes(["dv"], policy: .sameBatchOnly)
-    let sameBatchCombined = typeFlyChordStrokes(["dvi"], policy: .sameBatchOnly)
-    let sameBatchSplit = typeFlyChordStrokes(["dv", "i"], policy: .sameBatchOnly)
-    let mutualSplit = typeFlyChordStrokes(["dv", "i"], policy: .independentHalves)
+    let sameBatchCombined = typeFlyChordStrokes(["qkm"], policy: .sameBatchOnly)
+    let sameBatchSplit = typeFlyChordStrokes(["q", "km"], policy: .sameBatchOnly)
+    let mutualSplit = typeFlyChordStrokes(["q", "km"], policy: .independentHalves)
     guard sameBatchOneSided.allPressesHandled,
           !sameBatchOneSided.context.input.isEmpty,
           !sameBatchOneSided.context.candidates.isEmpty,
-          sameBatchCombined.context.candidates.map(\.text).contains("你"),
+          sameBatchCombined.context.candidates.map(\.text).contains("穷"),
           sameBatchSplit.allPressesHandled,
           !sameBatchSplit.context.candidates.isEmpty,
           sameBatchSplit.context.input != sameBatchCombined.context.input,
@@ -820,16 +849,19 @@ func runEngineSmokeTest() -> Bool {
         return false
     }
 
-    // A genuinely unmapped chord must still expose its transformed raw code as
-    // a low-priority echo candidate instead of making the candidate panel empty.
+    // A genuinely unmapped chord must keep its transformed raw code available
+    // for Return-to-commit even when abbreviation candidates occupy every page.
     let unmappedChord = typeFlyChordStrokes(["qs"], policy: .sameBatchOnly)
+    let unmappedRaw = unmappedChord.context.input
+    let unmappedReturnHandled = engine.processKey(RimeKey.return, session: session)
+    let unmappedCommit = engine.takeCommit(session: session)
     guard unmappedChord.allPressesHandled,
-          !unmappedChord.context.input.isEmpty,
-          unmappedChord.context.candidates.map(\.text)
-            .contains(unmappedChord.context.input) else {
-        print("FAILED: FlyYao unmapped chord echo fallback",
-              unmappedChord.context.input,
-              unmappedChord.context.candidates.map(\.text))
+          !unmappedRaw.isEmpty,
+          unmappedReturnHandled,
+          unmappedCommit == unmappedRaw else {
+        print("FAILED: FlyYao unmapped chord raw commit",
+              unmappedRaw, unmappedReturnHandled,
+              unmappedCommit ?? "<nil>")
         return false
     }
 
@@ -866,8 +898,6 @@ func runEngineSmokeTest() -> Bool {
 
     let flyYaoCases: [(name: String, combined: [String], split: [String], expected: String)] = [
         ("compound initial", ["dvi"], ["dv", "i"], "你"),
-        ("exact alias segmentation", ["fo"], ["f", "o"], "佛"),
-        ("contextual ing/uai", ["gy"], ["g", "y"], "怪"),
         ("contextual ong/iong", ["qkm"], ["q", "km"], "穷"),
         ("compound final", ["efuo"], ["ef", "uo"], "双"),
         ("literal period", ["qm."], ["q", "m."], "却"),
@@ -877,7 +907,6 @@ func runEngineSmokeTest() -> Bool {
         ("multi-syllable boundary", ["qkm", "dvi"], ["q", "km", "dv", "i"], "穷你"),
     ]
     let forbiddenAlternateSegmentation: [String: Set<String>] = [
-        "exact alias segmentation": ["服", "夫", "父"],
         "zero initial": ["欧", "偶", "呕"],
         "closed alias lve": ["路", "露", "卤鹅"],
     ]
@@ -903,6 +932,25 @@ func runEngineSmokeTest() -> Bool {
         }
     }
 
+    // Two keys pressed in one timing batch remain a real chord even when each
+    // physical half contains only one key. The same keys pressed separately
+    // are intentionally literal so ordinary Latin typing stays possible.
+    let simultaneousSingletonChords: [(stroke: String, expected: String)] = [
+        ("fo", "佛"),
+        ("gy", "怪"),
+    ]
+    for test in simultaneousSingletonChords {
+        let combined = typeFlyChordStrokes([test.stroke])
+        guard combined.allPressesHandled,
+              combined.context.candidates.map(\.text).contains(test.expected) else {
+            print("FAILED: FlyYao simultaneous singleton chord",
+                  test.stroke, test.expected,
+                  combined.context.input,
+                  combined.context.candidates.map(\.text))
+            return false
+        }
+    }
+
     let explicitTwoSyllables = typeFlyChordStrokes(["fu", "xvo"])
     guard explicitTwoSyllables.allPressesHandled,
           explicitTwoSyllables.context.preedit == "fu'o",
@@ -914,27 +962,58 @@ func runEngineSmokeTest() -> Bool {
         return false
     }
 
-    let ambiguousSyllableBoundaries: [(
-        combined: [String], split: [String], expected: String
-    )] = [
-        (["dvi", "an"], ["dv", "i", "a", "n"], "ni'an"),
-        (["ah", "ah"], ["a", "h", "a", "h"], "ang'ang"),
+    // `ni'hao` must expose both the full phrase and partial single-character
+    // choices, with a real next page that Rime can navigate to.
+    let candidatePagingProbe = typeFlyChordStrokes(["dvi", "xck"])
+    let candidatePages = collectCandidatePages()
+    guard candidatePagingProbe.allPressesHandled,
+          candidatePagingProbe.context.input == "ni'hao",
+          candidatePagingProbe.context.candidates.map(\.text).contains("你好"),
+          !candidatePagingProbe.context.isLastPage,
+          candidatePages.pagingWorked,
+          candidatePages.contexts.count > 1,
+          candidatePages.contexts[1].pageNo > candidatePages.contexts[0].pageNo,
+          candidatePages.texts.contains("你") else {
+        print("FAILED: FlyYao partial candidate paging",
+              candidatePagingProbe.context.input,
+              candidatePages.contexts.map(\.pageNo),
+              candidatePages.texts.prefix(30))
+        return false
+    }
+
+    // In both product modes, separately pressed physical singleton keys are
+    // literal Latin input. They must never acquire automatic syllable marks or
+    // be recombined into a Chinese chord behind the user's back.
+    for policy in [FlyChordSettlementPolicy.sameBatchOnly, .independentHalves] {
+        let singletonEnglish = typeFlyChordStrokes(
+            ["c", "o", "d", "e", "x"],
+            policy: policy
+        )
+        guard singletonEnglish.allPressesHandled,
+              singletonEnglish.context.input == "codex",
+              singletonEnglish.context.preedit == "codex",
+              !singletonEnglish.context.input.contains("'") else {
+            print("FAILED: FlyYao singleton Latin passthrough",
+                  policy,
+                  singletonEnglish.context.input,
+                  singletonEnglish.context.preedit,
+                  singletonEnglish.context.candidates.map(\.text))
+            return false
+        }
+    }
+
+    let ambiguousSyllableBoundaries: [(combined: [String], expected: String)] = [
+        (["dvi", "an"], "ni'an"),
+        (["ah", "ah"], "ang'ang"),
     ]
     for test in ambiguousSyllableBoundaries {
         let combined = typeFlyChordStrokes(test.combined)
-        let split = typeFlyChordStrokes(test.split)
         guard combined.allPressesHandled,
-              split.allPressesHandled,
               combined.context.input == test.expected,
-              split.context.input == test.expected,
-              combined.context.preedit == test.expected,
-              split.context.preedit == test.expected,
-              combined.context.candidates.map(\.text)
-                == split.context.candidates.map(\.text) else {
+              combined.context.preedit == test.expected else {
             print("FAILED: FlyYao explicit syllable boundary",
-                  test.combined, test.split, test.expected,
-                  combined.context.input, split.context.input,
-                  combined.context.preedit, split.context.preedit)
+                  test.combined, test.expected,
+                  combined.context.input, combined.context.preedit)
             return false
         }
     }
@@ -980,6 +1059,7 @@ func runEngineSmokeTest() -> Bool {
             print("FAILED: FlyYao exhaustive mapping set is incomplete", crossMappings.count)
             return false
         }
+        var pairableSplitCount = 0
         for mapping in crossMappings {
             let left = String(mapping.chord.filter { character in
                 let scalar = String(character).unicodeScalars.first!
@@ -990,11 +1070,21 @@ func runEngineSmokeTest() -> Bool {
                 return FlyChordLayout.half(for: Int32(scalar.value)) == .right
             })
             let combined = typeFlyChordStrokes([mapping.chord])
+            guard combined.allPressesHandled else {
+                print("FAILED: FlyYao exhaustive combined chord",
+                      mapping.chord, mapping.output)
+                return false
+            }
+
+            // Two separately timed singleton halves are deliberately Latin.
+            // Cross-batch equivalence applies only when at least one half is a
+            // true multi-key half chord.
+            guard left.count > 1 || right.count > 1 else { continue }
+            pairableSplitCount += 1
             let split = typeFlyChordStrokes([left, right])
             let combinedTexts = combined.context.candidates.map(\.text)
             let splitTexts = split.context.candidates.map(\.text)
-            guard combined.allPressesHandled,
-                  split.allPressesHandled,
+            guard split.allPressesHandled,
                   combined.context.input == split.context.input,
                   combined.context.preedit == split.context.preedit,
                   combinedTexts == splitTexts else {
@@ -1006,16 +1096,22 @@ func runEngineSmokeTest() -> Bool {
                 return false
             }
         }
-        print("FlyYao exhaustive combined/split mappings:", crossMappings.count)
+        guard pairableSplitCount > 250 else {
+            print("FAILED: FlyYao pairable split coverage is incomplete",
+                  pairableSplitCount)
+            return false
+        }
+        print("FlyYao exhaustive combined mappings:", crossMappings.count,
+              "pairable split mappings:", pairableSplitCount)
     } catch {
         print("FAILED: FlyYao exhaustive schema parse", error)
         return false
     }
 
-    let splitBeforeBackspace = typeFlyChordStrokes(["f", "o"])
+    let splitBeforeBackspace = typeFlyChordStrokes(["q", "km"])
     let splitBackspaceHandled = engine.processKey(RimeKey.backspace, session: session)
     let splitAfterBackspace = engine.getContext(session: session)
-    let combinedBeforeBackspace = typeFlyChordStrokes(["fo"])
+    let combinedBeforeBackspace = typeFlyChordStrokes(["qkm"])
     let combinedBackspaceHandled = engine.processKey(RimeKey.backspace, session: session)
     let combinedAfterBackspace = engine.getContext(session: session)
     guard splitBeforeBackspace.context.input == combinedBeforeBackspace.context.input,
@@ -1130,6 +1226,16 @@ func runSchemaListStoreSmokeTest() -> Bool {
     settledLeftContext.cursorPos = 1
     settledLeftContext.selStart = 1
     settledLeftContext.selEnd = 1
+    let expectedComplement = FlyChordMutualPairingState.SettledLeft(
+        keys: [leftQ],
+        baseInput: "",
+        settledInput: "q",
+        settledCursorPos: 1,
+        settledSelStart: 1,
+        settledSelEnd: 1,
+        boundaryPlan: .init(before: false, after: false),
+        insertedScalarCount: 1
+    )
     pairingBoundary.recordSettledLeft(
         keys: [leftQ],
         baseInput: "",
@@ -1138,8 +1244,23 @@ func runSchemaListStoreSmokeTest() -> Bool {
         policy: .independentHalves,
         shape: .leftOnly
     )
-    let immediateComplement = pairingBoundary.takeComplement(
+    let singletonComplement = pairingBoundary.takeComplement(
         before: .rightOnly,
+        currentKeyCount: 1,
+        policy: .independentHalves,
+        currentContext: settledLeftContext
+    )
+    pairingBoundary.recordSettledLeft(
+        keys: [leftQ],
+        baseInput: "",
+        settledContext: settledLeftContext,
+        boundaryPlan: .init(before: false, after: false),
+        policy: .independentHalves,
+        shape: .leftOnly
+    )
+    let multiKeyComplement = pairingBoundary.takeComplement(
+        before: .rightOnly,
+        currentKeyCount: 2,
         policy: .independentHalves,
         currentContext: settledLeftContext
     )
@@ -1154,6 +1275,7 @@ func runSchemaListStoreSmokeTest() -> Bool {
     pairingBoundary.reset() // models apostrophe/edit/candidate/focus boundary
     let complementAfterBoundary = pairingBoundary.takeComplement(
         before: .rightOnly,
+        currentKeyCount: 2,
         policy: .independentHalves,
         currentContext: settledLeftContext
     )
@@ -1172,18 +1294,9 @@ func runSchemaListStoreSmokeTest() -> Bool {
     movedCursorContext.selEnd = 0
     let complementAfterCursorMove = pairingAfterCursorMove.takeComplement(
         before: .rightOnly,
+        currentKeyCount: 2,
         policy: .independentHalves,
         currentContext: movedCursorContext
-    )
-    let expectedComplement = FlyChordMutualPairingState.SettledLeft(
-        keys: [leftQ],
-        baseInput: "",
-        settledInput: "q",
-        settledCursorPos: 1,
-        settledSelStart: 1,
-        settledSelEnd: 1,
-        boundaryPlan: .init(before: false, after: false),
-        insertedScalarCount: 1
     )
     var sameBatchPairing = FlyChordMutualPairingState()
     sameBatchPairing.recordSettledLeft(
@@ -1196,6 +1309,7 @@ func runSchemaListStoreSmokeTest() -> Bool {
     )
     let sameBatchComplement = sameBatchPairing.takeComplement(
         before: .rightOnly,
+        currentKeyCount: 2,
         policy: .sameBatchOnly,
         currentContext: settledLeftContext
     )
@@ -1212,7 +1326,8 @@ func runSchemaListStoreSmokeTest() -> Bool {
           mutualLeftReplay == [leftQ],
           mutualRightDecision == .process([rightY]),
           mutualRightReplay == [rightY],
-          immediateComplement == expectedComplement,
+          singletonComplement == nil,
+          multiKeyComplement == expectedComplement,
           sameBatchComplement == nil,
           complementAfterBoundary == nil,
           complementAfterCursorMove == nil,
@@ -1223,6 +1338,8 @@ func runSchemaListStoreSmokeTest() -> Bool {
             == .init(before: true, after: false),
           FlyChordBoundaryRules.plan(for: movedCursorContext)
             == .init(before: false, after: true),
+          !FlyChordBoundaryRules.shouldInsert(forKeyCount: 1),
+          FlyChordBoundaryRules.shouldInsert(forKeyCount: 2),
           FlyChordInputRollback.insertedScalarCount(before: "ni", after: "nshi") == 2,
           FlyChordInputRollback.insertedScalarCount(before: "ni", after: "ni") == 0,
           FlyChordInputRollback.insertedScalarCount(before: "ni", after: "n") == nil,

@@ -206,8 +206,10 @@ func runFlyChordLearningSmokeTest() -> Bool {
               mappingByChord["eui"] == "er",
               mappingByChord["dv"] == "n",
               mappingByChord["ef"] == "sh",
-              mappingByChord["y"] == "ing",
               mappingByChord["km"] == "ong",
+              mappingByChord["y"] == nil,
+              mappingByChord["o"] == nil,
+              mappingByChord["v"] == nil,
               schema.mappings.allSatisfy({ !$0.output.contains("*") }) else {
             return fail("real my_combo mapping extraction")
         }
@@ -270,10 +272,9 @@ func runFlyChordLearningSmokeTest() -> Bool {
             return fail("progress reload")
         }
         let persistedJSON = try String(contentsOf: store.storageURL, encoding: .utf8)
-        // One-sided 互击 lessons legitimately contain one-character chords;
-        // substring checks against JSON metadata would therefore false-positive
-        // (for example `m` occurs in `schemaID`). Assert the storage shape does
-        // not persist either plaintext field instead.
+        // Substring checks against JSON metadata would false-positive (for
+        // example `m` occurs in `schemaID`). Assert the storage shape does not
+        // persist either plaintext field instead.
         guard !persistedJSON.contains("\"chord\""),
               !persistedJSON.contains("\"output\""),
               !persistedJSON.localizedCaseInsensitiveContains("focus"),

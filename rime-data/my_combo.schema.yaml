@@ -1,9 +1,13 @@
 # encoding: utf-8
 
+# 飞耀只改变物理键到拼音的映射；候选、单字、英文混输与翻页能力
+# 直接继承完整的雾凇拼音链，避免维护一套会逐渐退化的精简翻译器。
+__include: rime_ice.schema:/
+
 schema:
   schema_id: my_combo
   name: 飞耀互击
-  version: '1.1'
+  version: '1.2'
   author:
     - 你的名字
   description: |
@@ -17,6 +21,7 @@ switches:
 
 engine:
   processors:
+    - lua_processor@*select_character
     - ascii_composer
     - recognizer
     - chord_composer  # 核心：并击处理器
@@ -30,13 +35,34 @@ engine:
     - ascii_segmentor
     - matcher
     - abc_segmentor
+    - affix_segmentor@radical_lookup
     - punct_segmentor
     - fallback_segmentor
   translators:
     - punct_translator
     - script_translator
-    - echo_translator  # 无映射和弦仍给出可提交的原码候选
+    - lua_translator@*date_translator
+    - lua_translator@*lunar
+    - table_translator@custom_phrase
+    - table_translator@melt_eng
+    - table_translator@cn_en
+    - table_translator@radical_lookup
+    - lua_translator@*unicode
+    - lua_translator@*number_translator
+    - lua_translator@*calc_translator
+    - lua_translator@*force_gc
+    - echo_translator  # 无可用拼写时提供原码兜底；Return 始终可提交原码
   filters:
+    - lua_filter@*corrector
+    - reverse_lookup_filter@radical_reverse_lookup
+    - lua_filter@*autocap_filter
+    - lua_filter@*v_filter
+    - lua_filter@*pin_cand_filter
+    - lua_filter@*long_word_filter
+    - lua_filter@*reduce_english_filter
+    - simplifier@emoji
+    - simplifier@traditionalize
+    - lua_filter@*search@radical_pinyin
     - uniquifier
 
 ascii_composer:
@@ -691,11 +717,11 @@ chord_composer:
     - 'xform/^ah$/ang/'      # ang - 昂、盎
     - 'xform/^eui$/e*r/'     # er - 儿、耳、尔（临时标记，避免命中左手 er）
 
-    # ===== 互击：左右半区可独立结算 =====
+    # ===== 互击：左右半区的多键和弦可独立结算 =====
     # 位于完整音节之后，避免解码出的声母（如 sh）再次命中跨区规则。先处理
     # 右侧，再处理左侧；少数上下文相关拼写由 speller.algebra 接受为等价码。
-    # Multi-key finals precede single keys so decoded `o -> uo` cannot cascade
-    # into the physical `uo -> uang` rule in the same algebra pipeline.
+    # 单物理键始终保留原字母，因为用户可能正在输入英文；同时按下
+    # 或至少一侧为多键的互击组合，仍由前面的完整音节规则映射。
     - 'xform/^jl$/iu/'
     - 'xform/^ij$/e/'
     - 'xform/^ui$/uan/'
@@ -711,18 +737,6 @@ chord_composer:
     - 'xform/^,\.$/ui/'
     - 'xform/^kl$/ou/'
     - 'xform/^k\.$/ia/'
-    - 'xform/^y$/ing/'
-    - 'xform/^u$/u/'
-    - 'xform/^i$/i/'
-    - 'xform/^o$/uo/'
-    - 'xform/^p$/un/'
-    - 'xform/^h$/ang/'
-    - 'xform/^j$/an/'
-    - 'xform/^k$/ao/'
-    - 'xform/^l$/ai/'
-    - 'xform/^n$/in/'
-    - 'xform/^m$/ian/'
-
     - 'xform/^df$/y/'
     - 'xform/^ef$/sh/'
     - 'xform/^er$/ch/'
@@ -734,7 +748,6 @@ chord_composer:
     - 'xform/^sd$/l/'
     - 'xform/^dv$/n/'
     - 'xform/^we$/m/'
-    - 'xform/^v$/zh/'
 
     # 还原临时标记，解决二次映射问题
     - 'xform/^x\*o$/o/'      # 还原零声母 o
@@ -747,13 +760,22 @@ chord_composer:
 
 
 speller:
+  __include: rime_ice.schema:/speller
   # ,/. 只属于 chord_composer 的双角色物理键；和弦结算为单键时必须
   # 继续交给 punctuator，而不能在这里被当作无候选拼音编码吞掉。
   alphabet: 'qwertyuiopasdfghjklzxcvbnm'
-  delimiter: "'"
+  initials: 'qwertyuiopasdfghjklzxcvbnm'
+  delimiter: " '"
 translator:
-  dictionary: rime_ice  # 使用雾凇拼音词典
-  prism: my_combo
+  dictionary: rime_ice
+  prism: rime_ice
+  enable_word_completion: true
+  spelling_hints: 8
+  always_show_comments: true
+  initial_quality: 1.2
+  comment_format:
+    - xform/^/［/
+    - xform/$/］/
   preedit_format:
     - xform/([nl])v/$1ü/
     - xform/([nl])ue/$1üe/

@@ -8,7 +8,7 @@
 >
 > **2026-07-19 当前缓冲 UI/按键覆盖**：工作台折叠为 44pt 单行细条，主条固定为拖拽图标、展开箭头、缓冲块轨和右侧发送按钮；向上展开到总高 78pt 后依次显示无去向信息的状态文字、插件动作、刷新/重置和关闭。刷新/重置保留缓冲正文，只取消过时插件任务、重新检测上下文或重启当前翻译。工作台不再提供块编辑器或面板内缓冲开关，缓冲启停仍由设置/输入法菜单管理。展开前后底边与候选锚点不动；缓冲模式复用常规 `CandidateWindow`，默认显示在细条下方。普通/Shift+Return 与 Backspace 在缓冲模式下永不落到宿主文本框：若有未决组字/并击，本次 Return 只收束为块；否则轻按发送下一块，按住约 1.2 秒发送全部，条底部显示按住进度。成功发送的 block 立即从 live buffer 消失且不保留发送历史；失败和未发送 block 保留。本文若有更早的投影/留块描述，以本条和 `SYSTEM-ARCHITECTURE.md` 为准。
 >
-> **2026-07-19 输入配置/翻译覆盖**：设置层已把输入编码（自然码双拼/全拼/英文）与键入模式（串击/并击/互击）拆开，再映射到经过验证的固定 schema。飞耀互击复用 `my_combo`：并击结算同一计时批内的全部按键，允许左侧、右侧或跨区组合但不跨批重组；互击在此基础上允许相邻的左侧声母与右侧韵母跨批配对。苹果本地翻译已作为内置缓冲插件实现：只出现在缓冲插件列表，与 Marine 共用唯一 owner；源文在上方连续缓冲轨显示，译文在下方独立分块轨显示，拖拽/展开与原文行对齐，发送与目标语言行对齐，只能经 `BufferDeliveryCoordinator -> Delivery.insert` 手动发送。
+> **2026-07-20 输入配置/翻译覆盖**：设置层已把输入编码（自然码双拼/全拼/英文）与键入模式（串击/并击/互击）拆开，再映射到经过验证的固定 schema。飞耀互击复用 `my_combo`：并击结算同一计时批内的全部按键，多键的左侧、右侧或跨区组合均可映射但不跨批重组；互击在此基础上允许相邻的左侧声母与右侧韵母跨批配对。单独敲下的物理字母保留为英文原码，不自动插入分词符，也不与另一个单键批次重组。苹果本地翻译已作为内置缓冲插件实现：只出现在缓冲插件列表，与 Marine 共用唯一 owner；源文在上方连续缓冲轨显示，译文在下方独立分块轨显示，拖拽/展开与原文行对齐，发送与目标语言行对齐，只能经 `BufferDeliveryCoordinator -> Delivery.insert` 手动发送。
 >
 > **2026-07-20 AI 插件/连接器覆盖**：「AI 生成」已收敛为唯一内置 `.bufferAction`；Codex CLI、Claude Code CLI 与 OpenAI 兼容 API 改为“连接器 › AI 模型”中独立单选的三个模型源。Marine 只通过 Action Plugin `preparePath` 冻结上下文并准备话术，RimeBuffer 使用当前连接器的 CLI/API 授权执行模型、关闭工具并校验结果；插件 owner 与连接器选择互不改写。生成仍把 source 冻结在上轨、以稳定 block 更新下轨，只有目标块全部成功投递后才消费对应源块；切换 owner 不撤销已完成 Marine 结果原有的 runtime/context/focus 复核权限。`my_combo` 中旧 Lua/Python AI processor/translator/filter 与 `ai_mode` 已下线。`Command+Shift+B` 继续通过进程级全局快捷键切换工作台：关闭时打开并恢复捕获，打开时收束组字、保留内容并关闭暂停。
 
@@ -187,7 +187,8 @@
 
 - 机制（Squirrel 同款，原型验证过）：chording 键（a–z , .）按下且 Rime 已 handled → 入重放缓冲 + 重置定时器；到期把缓冲键全部以 `mask | releaseMask(1<<30)` 重放 → chord_composer 判定成 chord → drain commit。
 - **门控**：仅 `schemaId == "my_combo"`。串击/双拼绝不注入合成 release（会扰乱 speller 时序）。
-- **并击/互击区别**：两者都结算当前计时批，单侧批次不丢弃；只有互击会把相邻的左侧声母批与右侧韵母批回滚重组为同一音节。无映射批由 `echo_translator` 提供原码候选；`,`/`.` 保留为和弦双角色键，单键结算后落到 Rime punctuator。
+- **并击/互击区别**：两者都结算当前计时批，多键单侧批次不丢弃；单个物理字母保持英文原码且不添加 `'`。只有互击会在至少一侧为多键和弦时，把相邻的左侧声母批与右侧韵母批回滚重组为同一音节。无映射批保留可由 Return 提交的原码；`,`/`.` 保留为和弦双角色键，单键结算后落到 Rime punctuator。
+- **候选能力**：`my_combo` 只维护物理和弦到规范拼音的映射，speller、主/英文翻译器和候选过滤链直接继承 `rime_ice`；多音节输入必须同时保留整词、前缀单字和后续候选页。
 - **duration 的唯一来源**：`ChordSettings.duration`（UserDefaults `chord.duration`），默认 0.10s、范围 0.02–0.50s；设置变化通过通知实时更新所有 controller。
 - flush 时机：非 chord 键按下前 / `deactivateServer` / `commitComposition` 前 / FocusObserver 触发。flush 期间**强持有** client 引用。
 
