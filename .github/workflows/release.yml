@@ -65,6 +65,10 @@ jobs:
             echo 'Parent input method must not declare a repertoire; only the Hans child mode does.'
             exit 1
           fi
+          if /usr/libexec/PlistBuddy -c "Print :ComponentInputModeDict:tsInputModeListKey:${MODE_ID}:tsInputModeKeyEquivalentKey" Info.plist >/dev/null 2>&1; then
+            echo 'Do not declare an empty/per-mode key equivalent; global input-source shortcuts are owned by macOS.'
+            exit 1
+          fi
           bash -n build_install.sh
           bash -n scripts/pkg/scripts/postinstall
           python3 scripts/lint-log-privacy.py

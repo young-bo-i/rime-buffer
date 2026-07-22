@@ -564,24 +564,34 @@ func installInputSource() -> Bool {
         return false
     }
     let list = cf as! [TISInputSource]
-    var parentSource: TISInputSource?
-    var selectableMode: TISInputSource?
+    func matchingSources(in sources: [TISInputSource])
+        -> (parent: TISInputSource?, mode: TISInputSource?) {
+        var parent: TISInputSource?
+        var mode: TISInputSource?
+        for source in sources {
+            guard tisStringProperty(source, kTISPropertyBundleID) == bundleID else {
+                continue
+            }
+            let id = tisStringProperty(source, kTISPropertyInputSourceID)
+            if id == bundleID,
+               !tisBoolProperty(source, kTISPropertyInputSourceIsSelectCapable) {
+                parent = source
+            }
+            if id == modeID,
+               tisBoolProperty(source, kTISPropertyInputSourceIsSelectCapable) {
+                mode = source
+            }
+        }
+        return (parent, mode)
+    }
 
     // TIS exposes a non-selectable parent input method plus one or more
     // selectable modes. Both must be enabled, but only the child mode may be
     // passed to TISSelectInputSource. Discover both first because TIS does not
     // promise list order; enabling the child before its parent can fail.
-    for src in list {
-        guard tisStringProperty(src, kTISPropertyBundleID) == bundleID else { continue }
-        let id = tisStringProperty(src, kTISPropertyInputSourceID) ?? "(unknown)"
-        if id == bundleID, !tisBoolProperty(src, kTISPropertyInputSourceIsSelectCapable) {
-            parentSource = src
-        }
-        if id == modeID, tisBoolProperty(src, kTISPropertyInputSourceIsSelectCapable) {
-            selectableMode = src
-        }
-    }
-
+    let discovered = matchingSources(in: list)
+    let parentSource = discovered.parent
+    let selectableMode = discovered.mode
     guard let parentSource, let selectableMode else {
         print("install: parent or selectable mode \(modeID) not found in TIS list")
         return false
@@ -601,21 +611,51 @@ func installInputSource() -> Bool {
         return false
     }
 
-    let parentEnableStatus = tisBoolProperty(parentSource, kTISPropertyInputSourceIsEnabled)
-        ? noErr : TISEnableInputSource(parentSource)
-    print("install: enable parent=\(parentEnableStatus) \(bundleID)")
+    // Reconcile both levels on every install, even when the cached IsEnabled
+    // property already says true. On macOS 26 that property can reflect the
+    // mode's default state while Control-Space's enabled-source roster is still
+    // stale. TISEnableInputSource is idempotent and is the API that makes a
+    // source available for UI/keyboard selection.
+    let parentWasEnabled = tisBoolProperty(parentSource,
+                                           kTISPropertyInputSourceIsEnabled)
+    let parentEnableStatus = TISEnableInputSource(parentSource)
+    print("install: enable parent=\(parentEnableStatus) reportedBefore=\(parentWasEnabled) \(bundleID)")
     guard parentEnableStatus == noErr else { return false }
 
-    let modeEnableStatus = tisBoolProperty(selectableMode, kTISPropertyInputSourceIsEnabled)
-        ? noErr : TISEnableInputSource(selectableMode)
-    print("install: enable mode=\(modeEnableStatus) \(modeID)")
+    let modeWasEnabled = tisBoolProperty(selectableMode,
+                                         kTISPropertyInputSourceIsEnabled)
+    let modeEnableStatus = TISEnableInputSource(selectableMode)
+    print("install: enable mode=\(modeEnableStatus) reportedBefore=\(modeWasEnabled) \(modeID)")
     guard modeEnableStatus == noErr else { return false }
 
-    guard tisBoolProperty(parentSource, kTISPropertyInputSourceIsEnabled),
-          tisBoolProperty(selectableMode, kTISPropertyInputSourceIsEnabled) else {
-        print("install: parent/mode did not remain enabled")
+    // Re-fetch from the enabled-only list. Re-reading the two discovery
+    // objects above would merely validate the same stale cache that caused the
+    // shortcut bug, and selecting that old child reference would not prove it
+    // participates in the Control-Space roster.
+    var enabledPair: (parent: TISInputSource, mode: TISInputSource)?
+    for _ in 0..<20 {
+        if let enabledCF = TISCreateInputSourceList(nil, false)?.takeRetainedValue() {
+            let enabledList = enabledCF as! [TISInputSource]
+            let refreshed = matchingSources(in: enabledList)
+            if let parent = refreshed.parent,
+               let mode = refreshed.mode,
+               tisBoolProperty(parent, kTISPropertyInputSourceIsEnabled),
+               !tisBoolProperty(parent, kTISPropertyInputSourceIsSelectCapable),
+               tisBoolProperty(parent, kTISPropertyInputSourceIsASCIICapable),
+               tisBoolProperty(mode, kTISPropertyInputSourceIsEnabled),
+               tisBoolProperty(mode, kTISPropertyInputSourceIsSelectCapable),
+               !tisBoolProperty(mode, kTISPropertyInputSourceIsASCIICapable) {
+                enabledPair = (parent, mode)
+                break
+            }
+        }
+        Thread.sleep(forTimeInterval: 0.1)
+    }
+    guard let enabledPair else {
+        print("install: parent/mode missing from enabled-only TIS roster")
         return false
     }
+    print("install: enabled roster verified parent=\(bundleID) mode=\(modeID)")
 
     // The historical WeChat crash is in Apple's input-source HUD before our
     // controller runs. Never trigger that path automatically while WeChat is
@@ -625,7 +665,7 @@ func installInputSource() -> Bool {
         return true
     }
 
-    let selectStatus = TISSelectInputSource(selectableMode)
+    let selectStatus = TISSelectInputSource(enabledPair.mode)
     print("install: select=\(selectStatus) \(modeID)")
 
     // On macOS 26 the first selection after changing input-mode metadata can
