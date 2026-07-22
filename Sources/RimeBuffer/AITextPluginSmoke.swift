@@ -1710,6 +1710,7 @@ private enum AITextPluginSmoke {
         let alternativesSystem = alternativesMessages.first?["content"] as? String,
         alternativesSystem.contains("1 to 3 complete"),
         alternativesSystem.contains("mutually exclusive"),
+        alternativesSystem.contains("minimumGuessCount"),
         alternativesMessages.last?["content"] as? String == "prepared-stream-prompt" else {
             return false
         }

@@ -50,7 +50,14 @@ struct TranslationRailSnapshot: Equatable {
     }
 
     let sourceText: String
+    /// Visual-only source selection used by workbench Select All. It does not
+    /// participate in provider generations or delivery authorization.
+    let sourceSelected: Bool
     let outputBlocks: [TranslationOutputBlock]
+    /// Target blocks grouped into independently visible horizontal rows. Most
+    /// derived workspaces use one row; consciousness-stream input uses one
+    /// stable row per mutually exclusive candidate.
+    let outputRows: [TranslationOutputRow]
     let phase: Phase
     /// Optional provider-specific status shown in the target rail. Keeping the
     /// renderer generic lets translation and explicit AI processors share the
@@ -65,7 +72,9 @@ struct TranslationRailSnapshot: Equatable {
     let updatingText: String
 
     init(sourceText: String,
+         sourceSelected: Bool = false,
          outputBlocks: [TranslationOutputBlock],
+         outputRows: [TranslationOutputRow]? = nil,
          phase: Phase,
          message: String? = nil,
          sourceRole: String = "原",
@@ -76,7 +85,11 @@ struct TranslationRailSnapshot: Equatable {
          processingText: String = "正在翻译",
          updatingText: String = "更新译文") {
         self.sourceText = sourceText
+        self.sourceSelected = sourceSelected
         self.outputBlocks = outputBlocks
+        self.outputRows = outputRows ?? [
+            TranslationOutputRow(key: 0, blocks: outputBlocks),
+        ]
         self.phase = phase
         self.message = message
         self.sourceRole = sourceRole
@@ -87,6 +100,15 @@ struct TranslationRailSnapshot: Equatable {
         self.processingText = processingText
         self.updatingText = updatingText
     }
+
+    var targetRowCount: Int {
+        min(max(outputRows.count, 1), 3)
+    }
+}
+
+struct TranslationOutputRow: Equatable {
+    let key: Int
+    let blocks: [TranslationOutputBlock]
 }
 
 enum TranslationRefreshPolicy {
@@ -283,6 +305,7 @@ final class AppleTranslationWorkspace {
             message = value
         }
         return TranslationRailSnapshot(sourceText: sourceText,
+                                       sourceSelected: sourceModel.allContentSelected,
                                        outputBlocks: outputBlocks,
                                        phase: railPhase,
                                        message: message)

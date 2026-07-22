@@ -234,6 +234,7 @@ let bufferPluginSelectionObserver = NotificationCenter.default.addObserver(
     object: BufferPluginSelectionStore.shared,
     queue: .main
 ) { notification in
+    BufferModel.shared.clearAllContentSelection()
     if notification.userInfo?["current"] as? PluginKey
         == StreamInputWorkspace.pluginKey {
         if BufferModel.shared.enabled,
@@ -304,6 +305,7 @@ InputFocusCoordinator.shared.onChange = {
     BufferWindowController.shared.refresh()
 }
 InputFocusCoordinator.shared.onInvalidated = { owner in
+    BufferModel.shared.clearAllContentSelection()
     candidateWindow.hide(owner: owner)
     ActionPluginHost.shared.focusInvalidated(owner)
     StreamInputWorkspace.shared.focusInvalidated(owner)
@@ -3815,7 +3817,24 @@ func runBufferSmokeTest() -> Bool {
           ),
           !RimeBufferController.shouldConsumeCodexBufferControlText(
               [0x01], bundleId: "com.openai.codex", bufferActive: true
-          ) else {
+          ),
+          BufferClipboardShortcutRules.shortcut(
+            keycode: 0x61, mask: RimeKey.controlMask
+          ) == .selectAll,
+          BufferClipboardShortcutRules.shortcut(
+            keycode: 0x76, mask: RimeKey.superMask
+          ) == .paste,
+          BufferClipboardShortcutRules.shortcut(
+            keycode: 0x61,
+            mask: RimeKey.superMask | RimeKey.shiftMask
+          ) == nil,
+          BufferClipboardShortcutRules.shortcut(
+            keycode: 0x76,
+            mask: RimeKey.superMask | RimeKey.controlMask
+          ) == nil,
+          BufferClipboardTextRules.validated("可粘贴") == "可粘贴",
+          BufferClipboardTextRules.validated("") == nil,
+          BufferClipboardTextRules.validated("a\0b") == nil else {
         print("FAILED: buffer control-key escape gate")
         return false
     }
@@ -3991,6 +4010,52 @@ func runBufferSmokeTest() -> Bool {
     _ = model.appendDirectInputFragment("Y", owner: .testing(2))
     guard model.blocks.suffix(2).map(\.text) == ["中", "Y"] else {
         print("FAILED: Rime commit must end direct input run")
+        return false
+    }
+    model.discardForPrivacy()
+
+    model.append("旧内容")
+    let generationBeforeSelection = model.changeCount
+    guard model.selectAllContent(),
+          model.allContentSelected,
+          model.changeCount == generationBeforeSelection,
+          model.insertPastedText("New useful words and another phrase."),
+          !model.allContentSelected,
+          model.stagedText == "New useful words and another phrase.",
+          model.blocks.count > 1,
+          model.changeCount == generationBeforeSelection + 1 else {
+        print("FAILED: select-all paste replacement and semantic segmentation")
+        return false
+    }
+    _ = model.selectAllContent()
+    model.append("替换")
+    guard model.blocks.map(\.text) == ["替换"],
+          !model.allContentSelected else {
+        print("FAILED: local typing must replace selected workbench content")
+        return false
+    }
+    _ = model.selectAllContent()
+    model.beginTransientLoading(requestId: "selection-heartbeat", message: "处理中")
+    model.updateTransientLoading(requestId: "selection-heartbeat", message: "仍在处理")
+    guard model.allContentSelected else {
+        print("FAILED: plugin status heartbeat must preserve select-all state")
+        return false
+    }
+    model.finishTransientLoading(requestId: "selection-heartbeat")
+    model.stageExternal("外部", origin: .mcp(client: "selection-smoke"))
+    guard model.blocks.map(\.text) == ["替换", "外部"],
+          !model.allContentSelected else {
+        print("FAILED: asynchronous external content must invalidate, not replace, selection")
+        return false
+    }
+    _ = model.selectAllContent()
+    guard model.removeLastBlock(), model.blocks.isEmpty else {
+        print("FAILED: backspace semantics must delete an all-selected buffer")
+        return false
+    }
+    guard model.insertPastedText(" \n "),
+          model.stagedText == " \n " else {
+        print("FAILED: clipboard paste must preserve whitespace-only text")
         return false
     }
     model.discardForPrivacy()
@@ -4248,6 +4313,12 @@ func runBufferWindowSmokeTest() -> Bool {
     let translationTargetOffset = BufferWorkbenchMetrics.mainControlYOffset(
         row: .target, mode: .translation
     )
+    let streamSourceOffset = BufferWorkbenchMetrics.mainControlYOffset(
+        row: .source, mode: .derived(targetRows: 3)
+    )
+    let streamTargetOffset = BufferWorkbenchMetrics.mainControlYOffset(
+        row: .target, mode: .derived(targetRows: 3)
+    )
     guard BufferWorkbenchLayout.mainBar
             == [.dragHandle, .disclosure, .bufferRail, .send],
           BufferWorkbenchLayout.expandedShelf
@@ -4299,6 +4370,9 @@ func runBufferWindowSmokeTest() -> Bool {
           translationSourceOffset < 0,
           translationTargetOffset > 0,
           translationSourceOffset == -translationTargetOffset,
+          streamSourceOffset == -46.5,
+          streamTargetOffset == 46.5,
+          streamSourceOffset == -streamTargetOffset,
           !BufferWorkbenchLayout.windowBackgroundDraggable,
           FirstMouseButton(frame: .zero).acceptsFirstMouse(for: nil),
           readyText == "可发送",
@@ -5360,6 +5434,10 @@ func runBufferWindowSmokeTest() -> Bool {
     let rail = BufferInlineView()
     _ = rail.renderStandardForPreview()
     let renderedBeforeShield = !rail.isHidden && rail.renderedBlockCount == 1
+    _ = model.selectAllContent()
+    _ = rail.renderStandardForPreview()
+    let renderedStandardSelection = rail.renderedSelectedStandardBlockCount == 1
+    model.clearAllContentSelection()
     model.failTransientLoading(requestId: "visible-error",
                                message: "收信箱已满，插件结果未保存")
     _ = rail.renderStandardForPreview()
@@ -5380,7 +5458,7 @@ func runBufferWindowSmokeTest() -> Bool {
     model.enabled = oldEnabled
     model.discardForPrivacy()
     model.onChange = oldOnChange
-    guard renderedBeforeShield, renderedErrorBesideContent,
+    guard renderedBeforeShield, renderedStandardSelection, renderedErrorBesideContent,
           skippedUnchangedRail, showedEnterHoldProgress,
           scrubbedByShield else {
         print("FAILED: buffer rail secure-input shielding behavior")
@@ -5395,6 +5473,7 @@ func runBufferWindowSmokeTest() -> Bool {
     let targetPreviewBID = UUID()
     let translationPreview = TranslationRailSnapshot(
         sourceText: sourcePreview,
+        sourceSelected: true,
         outputBlocks: [
             TranslationOutputBlock(id: targetPreviewAID, text: targetPreviewA),
             TranslationOutputBlock(id: targetPreviewBID, text: targetPreviewB),
@@ -5403,7 +5482,7 @@ func runBufferWindowSmokeTest() -> Bool {
     )
     let renderedStackedTranslation = translationRail.renderTranslationForPreview(
         translationPreview
-    )
+    ) && translationRail.renderedTranslationSourceSelected
     let translationFragments = translationRail.renderedTextFragments
     let sourcePosition = translationFragments.firstIndex(of: sourcePreview)
     let targetPosition = translationFragments.firstIndex(of: targetPreviewA)
@@ -5434,9 +5513,125 @@ func runBufferWindowSmokeTest() -> Bool {
         && translationRail.renderedTextFragments.contains(where: {
             $0.contains("\(targetPreviewA)续")
         })
+    let multiCandidateAID = UUID()
+    let multiCandidateBID = UUID()
+    let multiCandidateCID = UUID()
+    let multiCandidatePreview = TranslationRailSnapshot(
+        sourceText: "fangan",
+        outputBlocks: [
+            TranslationOutputBlock(id: multiCandidateAID, text: "方案", ordinal: 1,
+                                   selected: true),
+            TranslationOutputBlock(id: multiCandidateBID, text: "翻案", ordinal: 2),
+            TranslationOutputBlock(id: multiCandidateCID, text: "凡干", ordinal: 3),
+        ],
+        outputRows: [
+            TranslationOutputRow(
+                key: 0,
+                blocks: [TranslationOutputBlock(id: multiCandidateAID, text: "方案",
+                                                ordinal: 1, selected: true)]
+            ),
+            TranslationOutputRow(
+                key: 1,
+                blocks: [TranslationOutputBlock(id: multiCandidateBID, text: "翻案",
+                                                ordinal: 2)]
+            ),
+            TranslationOutputRow(
+                key: 2,
+                blocks: [TranslationOutputBlock(id: multiCandidateCID, text: "凡干",
+                                                ordinal: 3)]
+            ),
+        ],
+        phase: .ready,
+        sourceRole: "拼",
+        targetRole: "文"
+    )
+    let renderedMultiCandidateLayout = translationRail.renderTranslationForPreview(
+        multiCandidatePreview
+    ) && translationRail.renderedTranslationTargetRowCount == 3
+        && translationRail.translationRailCount == 4
+        && translationRail.preferredHeight
+            == BufferInlineView.translationPreferredHeight(targetRows: 3)
+    let threeRowIdentities = translationRail.renderedTranslationTargetViewIdentities
+    let renderedMultiCandidateRows = renderedMultiCandidateLayout
+        && threeRowIdentities.count == 3
+    let reorderedCandidateIdentities = threeRowIdentities.count == 3
+        ? [threeRowIdentities[2], threeRowIdentities[0]]
+        : []
+    let retainedCandidateIdentity = threeRowIdentities.count == 3
+        ? threeRowIdentities[2]
+        : nil
+    let twoCandidatePreview = TranslationRailSnapshot(
+        sourceText: "fangan",
+        outputBlocks: [
+            TranslationOutputBlock(id: multiCandidateCID, text: "凡干", ordinal: 1,
+                                   selected: true),
+            TranslationOutputBlock(id: multiCandidateAID, text: "方案", ordinal: 2),
+        ],
+        outputRows: [
+            TranslationOutputRow(
+                key: 2,
+                blocks: [TranslationOutputBlock(id: multiCandidateCID, text: "凡干",
+                                                ordinal: 1, selected: true)]
+            ),
+            TranslationOutputRow(
+                key: 0,
+                blocks: [TranslationOutputBlock(id: multiCandidateAID, text: "方案",
+                                                ordinal: 2)]
+            ),
+        ],
+        phase: .ready,
+        sourceRole: "拼",
+        targetRole: "文"
+    )
+    let renderedTwoCandidateRows = translationRail.renderTranslationForPreview(
+        twoCandidatePreview
+    ) && translationRail.renderedTranslationTargetRowCount == 2
+        && translationRail.translationRailCount == 3
+        && !translationRail.renderedTextFragments.contains("翻案")
+        && translationRail.renderedTranslationTargetViewIdentities
+            == reorderedCandidateIdentities
+    let retainedChildID = UUID()
+    let segmentedOneRowPreview = TranslationRailSnapshot(
+        sourceText: "fangan",
+        outputBlocks: [
+            TranslationOutputBlock(id: multiCandidateCID, text: "修复"),
+            TranslationOutputBlock(id: retainedChildID,
+                                   text: "一个问题",
+                                   retainedTailStart: 0),
+        ],
+        outputRows: [
+            TranslationOutputRow(
+                key: 2,
+                blocks: [
+                    TranslationOutputBlock(id: multiCandidateCID, text: "修复"),
+                    TranslationOutputBlock(id: retainedChildID,
+                                           text: "一个问题",
+                                           retainedTailStart: 0),
+                ]
+            ),
+        ],
+        phase: .translating,
+        sourceRole: "拼",
+        targetRole: "文"
+    )
+    let renderedSegmentedOneRow = translationRail.renderTranslationForPreview(
+        segmentedOneRowPreview
+    ) && translationRail.renderedTranslationTargetRowCount == 1
+        && translationRail.translationRailCount == 2
+        && retainedCandidateIdentity != nil
+        && translationRail.renderedTranslationTargetViewIdentities.first
+            == retainedCandidateIdentity
+        && translationRail.renderedTranslationRetainedTailStarts[retainedChildID] == 0
+        && !translationRail.renderedTextFragments.contains("方案")
+        && !translationRail.renderedTextFragments.contains("翻案")
     _ = translationRail.refresh(shielded: true)
     let translationShielded = !translationRail.renderedTextFragments.contains(sourcePreview)
         && !translationRail.renderedTextFragments.contains(targetPreviewA)
+        && !translationRail.renderedTextFragments.contains("方案")
+        && !translationRail.renderedTextFragments.contains("翻案")
+        && !translationRail.renderedTextFragments.contains("凡干")
+        && !translationRail.renderedTextFragments.contains("修复")
+        && !translationRail.renderedTextFragments.contains("一个问题")
     guard renderedStackedTranslation,
           translationRail.translationRailCount == 0,
           sourcePosition != nil,
@@ -5450,6 +5645,9 @@ func runBufferWindowSmokeTest() -> Bool {
           TranslationRailRoleSymbolRules.resolve("答", target: true)
             == .init(name: "sparkles", accessibilityLabel: "AI 回答"),
           reusedTargetViews,
+          renderedMultiCandidateRows,
+          renderedTwoCandidateRows,
+          renderedSegmentedOneRow,
           translationShielded else {
         print("FAILED: translation rail must render two stacked, independently shielded buffers")
         return false
@@ -5523,6 +5721,19 @@ func runBufferWindowSmokeTest() -> Bool {
         visibleFrames: [primary],
         fallback: primary
     )
+    let streamCandidatesCollapsed = BufferWindowGeometry.clampedFrame(
+        translationCollapsed,
+        mode: .derived(targetRows: 3),
+        visibleFrames: [primary],
+        fallback: primary
+    )
+    let streamCandidatesExpanded = BufferWindowGeometry.clampedFrame(
+        streamCandidatesCollapsed,
+        expanded: true,
+        mode: .derived(targetRows: 3),
+        visibleFrames: [primary],
+        fallback: primary
+    )
     let standardAfterTranslation = BufferWindowGeometry.clampedFrame(
         translationExpanded,
         expanded: false,
@@ -5553,6 +5764,14 @@ func runBufferWindowSmokeTest() -> Bool {
           translationCollapsed.minY == collapsedAgain.minY,
           translationExpanded.height == BufferWindowGeometry.translationExpandedHeight,
           translationExpanded.minY == translationCollapsed.minY,
+          streamCandidatesCollapsed.height
+            == BufferWindowGeometry.translationCollapsedHeight
+                + BufferInlineView.additionalTranslationTargetRowHeight * 2,
+          streamCandidatesCollapsed.minY == translationCollapsed.minY,
+          streamCandidatesExpanded.height
+            == BufferWindowGeometry.translationExpandedHeight
+                + BufferInlineView.additionalTranslationTargetRowHeight * 2,
+          streamCandidatesExpanded.minY == streamCandidatesCollapsed.minY,
           standardAfterTranslation.height == BufferWindowGeometry.collapsedHeight,
           standardAfterTranslation.minY == translationExpanded.minY,
           anchor.minY == migrated.minY,

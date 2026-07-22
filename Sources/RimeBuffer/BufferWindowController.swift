@@ -16,7 +16,14 @@ enum BufferCandidatePlacement: String, CaseIterable {
 
 enum BufferWorkbenchLayoutMode: Equatable {
     case standard
-    case translation
+    case derived(targetRows: Int)
+
+    static let translation = BufferWorkbenchLayoutMode.derived(targetRows: 1)
+
+    var targetRows: Int? {
+        guard case let .derived(targetRows) = self else { return nil }
+        return min(max(targetRows, 1), 3)
+    }
 }
 
 /// Pure frame math shared by runtime restoration and the CLI smoke test.
@@ -32,11 +39,14 @@ enum BufferWindowGeometry {
 
     static func height(expanded: Bool,
                        mode: BufferWorkbenchLayoutMode = .standard) -> CGFloat {
-        switch (mode, expanded) {
-        case (.standard, false): return collapsedHeight
-        case (.standard, true): return expandedHeight
-        case (.translation, false): return translationCollapsedHeight
-        case (.translation, true): return translationExpandedHeight
+        switch mode {
+        case .standard:
+            return expanded ? expandedHeight : collapsedHeight
+        case let .derived(targetRows):
+            let extra = CGFloat(min(max(targetRows, 1), 3) - 1)
+                * BufferInlineView.additionalTranslationTargetRowHeight
+            return (expanded ? translationExpandedHeight : translationCollapsedHeight)
+                + extra
         }
     }
 
@@ -61,7 +71,11 @@ enum BufferWindowGeometry {
         // The 52pt predecessor and both current states preserve their bottom
         // edge, keeping the candidate panel stationary. Only the legacy 340pt
         // workbench migrates by preserving its old top edge.
-        var y = proposed.height <= translationExpandedHeight + 1
+        let maximumCurrentExpandedHeight = Self.height(
+            expanded: true,
+            mode: .derived(targetRows: 3)
+        )
+        var y = proposed.height <= maximumCurrentExpandedHeight + 1
             ? proposed.minY
             : proposed.maxY - height
         if proposed == .zero || intersectionArea(proposed, target) == 0 {
@@ -193,13 +207,14 @@ enum BufferWorkbenchMetrics {
     static let translationRailSpacing: CGFloat = 4
 
     static func railHeight(for mode: BufferWorkbenchLayoutMode) -> CGFloat {
-        mode == .translation
-            ? BufferInlineView.translationPreferredHeight
-            : BufferInlineView.standardPreferredHeight
+        guard let targetRows = mode.targetRows else {
+            return BufferInlineView.standardPreferredHeight
+        }
+        return BufferInlineView.translationPreferredHeight(targetRows: targetRows)
     }
 
     static func mainBarHeight(for mode: BufferWorkbenchLayoutMode) -> CGFloat {
-        mode == .translation ? 74 : 40
+        mode.targetRows == nil ? 40 : railHeight(for: mode) + 6
     }
 
     /// Translation renders two equal rails inside a 5pt vertical inset with a
@@ -207,12 +222,9 @@ enum BufferWorkbenchMetrics {
     /// not just their artwork, line up with the source and target rows.
     static func mainControlYOffset(row: BufferMainControlRow,
                                    mode: BufferWorkbenchLayoutMode) -> CGFloat {
-        guard mode == .translation else { return 0 }
-        let offset = (
-            BufferInlineView.translationPreferredHeight
-                - translationVerticalInset * 2
-                + translationRailSpacing
-        ) / 4
+        guard let targetRows = mode.targetRows else { return 0 }
+        let offset = BufferInlineView.additionalTranslationTargetRowHeight
+            * CGFloat(targetRows) / 2
         // NSStackView lays this main bar out in a flipped view coordinate
         // system: the visually upper source row has the negative constant.
         return row == .source ? -offset : offset
@@ -854,7 +866,7 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
             ? (DerivedBufferWorkspaceRouter.selectedWorkspace != nil
                 ? .translation
                 : .standard)
-            : .translation
+            : .derived(targetRows: translationSnapshot?.targetRowCount ?? 1)
         syncLayoutMode(previewMode)
         adjustingFrame = true
         panel.setFrame(NSRect(x: 0, y: 0, width: 760,
@@ -901,16 +913,46 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         }
         let secureInputEnabled = IsSecureEventInputEnabled()
         let contentProtected = secureInputEnabled || sessionProtectionActive
+        if contentProtected {
+            BufferModel.shared.clearAllContentSelection(notify: false)
+            // Scrub every text-bearing view before protection notifications or
+            // frame changes can synchronously re-enter AppKit and repaint the
+            // old source/candidates at a smaller layout.
+            _ = bufferRail.refresh(
+                shielded: true,
+                translationSnapshot: nil
+            )
+        }
         pluginSelector.isEnabled = !contentProtected
         // Protect every stable derived singleton before resolving presentation
         // state. A secure refresh must not ask any source for a text snapshot.
         DerivedBufferWorkspaceRouter.setProtectedOnAll(contentProtected)
         let derivedWorkspace = DerivedBufferWorkspaceRouter.selectedWorkspace
         let derivedWorkspaceSelected = derivedWorkspace != nil
+        // Never ask a protected workspace for plaintext merely to size the
+        // panel. In the normal path this one frozen snapshot drives both
+        // geometry and rendering so row count cannot tear across a refresh.
+        let derivedSnapshot = contentProtected
+            ? nil
+            : derivedWorkspace?.railSnapshot
         let availability: BufferDeliveryCoordinator.Availability = contentProtected
             ? .blocked(.secureInput)
             : BufferDeliveryCoordinator.shared.availability()
-        syncLayoutMode(derivedWorkspaceSelected ? .translation : .standard)
+        // Row reconciliation and panel geometry are one visual transaction.
+        // This prevents 3→2→1 candidate changes from briefly squeezing stale
+        // rows into the new frame, and prevents 1→2→3 from drawing before the
+        // larger frame is ready.
+        let nextLayoutMode: BufferWorkbenchLayoutMode = derivedWorkspaceSelected
+            ? .derived(targetRows: derivedSnapshot?.targetRowCount ?? 1)
+            : .standard
+        if layoutMode != nextLayoutMode {
+            panel.disableScreenUpdatesUntilFlush()
+        }
+        _ = bufferRail.refresh(
+            shielded: contentProtected,
+            translationSnapshot: derivedSnapshot
+        )
+        syncLayoutMode(nextLayoutMode)
         let pluginFailure = contentProtected || derivedWorkspaceSelected
             ? nil
             : ActionPluginHost.shared.workbenchFailureMessage
@@ -940,7 +982,6 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         )
         statusLabel.textColor = RimeUI.textSecondary
 
-        _ = bufferRail.refresh(shielded: contentProtected)
         assert(!contentProtected || bufferRail.isHidden,
                "secure input must leave the text-bearing rail hidden")
         refreshPrimaryAction(workspace: derivedWorkspace,

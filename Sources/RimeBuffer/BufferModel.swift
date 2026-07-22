@@ -213,6 +213,10 @@ final class BufferModel {
 
     private(set) var blocks: [Block] = []
     private(set) var insertionIndex = 0
+    /// Block-level selection owned by the workbench. The panel is deliberately
+    /// not an editable NSTextView, so Select All is represented explicitly and
+    /// the next local text/paste/backspace operation applies to this selection.
+    private(set) var allContentSelected = false
     private(set) var transientEnabled = false
     private(set) var loadingMessage: String?
     private(set) var loadingRequestId: String?
@@ -319,6 +323,9 @@ final class BufferModel {
                 origin: Origin = .rime,
                 pluginMetadata: PluginMetadata? = nil) {
         guard !text.isEmpty else { return }
+        if origin == .rime, pluginMetadata == nil {
+            removeSelectedContentBeforeLocalInsertion()
+        }
         directInputRun = nil
         let index = clampedInsertionIndex()
         blocks.insert(Block(text: text,
@@ -339,6 +346,7 @@ final class BufferModel {
     func appendDirectInputFragment(_ text: String,
                                    owner: DirectInputRunOwner) -> UUID? {
         guard !text.isEmpty else { return nil }
+        removeSelectedContentBeforeLocalInsertion()
         let existingIndex: Int?
         if let run = directInputRun,
            run.owner == owner,
@@ -394,6 +402,7 @@ final class BufferModel {
     /// semantics.
     @discardableResult
     func deleteBackwardInDirectInput(owner: DirectInputRunOwner) -> Bool {
+        if removeSelectedContentForDeletion() { return true }
         guard var run = directInputRun,
               run.owner == owner,
               let tailID = run.tailID,
@@ -497,8 +506,65 @@ final class BufferModel {
         notifyChange(reason: .pause)
     }
 
+    /// Select every staged block without changing source text or its delivery
+    /// generation. Derived plugins therefore keep a valid ready result while
+    /// the source rail merely changes its visual selection state.
+    @discardableResult
+    func selectAllContent() -> Bool {
+        let selected = !blocks.isEmpty
+        guard allContentSelected != selected else { return true }
+        allContentSelected = selected
+        directInputRun = nil
+        notifyPresentationChange()
+        return true
+    }
+
+    func clearAllContentSelection(notify: Bool = true) {
+        guard allContentSelected else { return }
+        allContentSelected = false
+        if notify { notifyPresentationChange() }
+    }
+
+    /// Insert explicit clipboard text at the block caret, or replace the
+    /// complete workbench selection. The shared semantic segmenter keeps paste
+    /// behavior aligned with AI/translation/plugin output while preserving the
+    /// exact concatenated text, including whitespace-only input.
+    @discardableResult
+    func insertPastedText(_ text: String) -> Bool {
+        guard !text.isEmpty else { return false }
+        var segments = SemanticBlockSegmenter.segments(from: text)
+        guard !segments.isEmpty else { return false }
+        if segments.count > SemanticBlockSegmenter.maximumWorkbenchSegments {
+            let maximum = SemanticBlockSegmenter.maximumWorkbenchSegments
+            var compacted: [String] = []
+            compacted.reserveCapacity(maximum)
+            var cursor = 0
+            for index in 0..<maximum {
+                let remaining = segments.count - cursor
+                let groups = maximum - index
+                let take = Int(ceil(Double(remaining) / Double(groups)))
+                compacted.append(segments[cursor..<cursor + take].joined())
+                cursor += take
+            }
+            segments = compacted
+        }
+
+        removeSelectedContentBeforeLocalInsertion()
+        directInputRun = nil
+        var insertion = clampedInsertionIndex()
+        for segment in segments {
+            blocks.insert(Block(text: segment), at: insertion)
+            insertion += 1
+        }
+        insertionIndex = insertion
+        IMELog.write("buffer pasted chars=\(text.count) fragments=\(segments.count)")
+        notifyChange()
+        return true
+    }
+
     @discardableResult
     func removeLastBlock() -> Bool {
+        if removeSelectedContentForDeletion() { return true }
         guard let removed = blocks.popLast() else { return false }
         if directInputRun?.blockIDs.contains(removed.id) == true { directInputRun = nil }
         clampInsertionIndexInPlace()
@@ -512,6 +578,7 @@ final class BufferModel {
     /// Rime commit boundaries remain internally available for provenance.
     @discardableResult
     func removeLastCharacter() -> Bool {
+        if removeSelectedContentForDeletion() { return true }
         guard let index = blocks.indices.last else { return false }
         directInputRun = nil
         if blocks[index].text.count <= 1 {
@@ -720,6 +787,13 @@ final class BufferModel {
     @discardableResult
     func moveInsertionPoint(delta: Int) -> Bool {
         directInputRun = nil
+        if allContentSelected {
+            allContentSelected = false
+            insertionIndex = delta < 0 ? 0 : blocks.count
+            IMELog.write("buffer selection collapsed index=\(insertionIndex)")
+            notifyPresentationChange()
+            return true
+        }
         let old = clampedInsertionIndex()
         let next = min(max(old + delta, 0), blocks.count)
         insertionIndex = next
@@ -769,6 +843,28 @@ final class BufferModel {
         directInputRun = nil
         IMELog.write("buffer privacy discard blocks=\(blockCount)")
         notifyChange(reason: .privacyDiscard)
+    }
+
+    private func removeSelectedContentBeforeLocalInsertion() {
+        guard allContentSelected else { return }
+        blocks.removeAll()
+        insertionIndex = 0
+        directInputRun = nil
+        allContentSelected = false
+    }
+
+    @discardableResult
+    private func removeSelectedContentForDeletion() -> Bool {
+        guard allContentSelected else { return false }
+        let removed = blocks.count
+        blocks.removeAll()
+        insertionIndex = 0
+        directInputRun = nil
+        allContentSelected = false
+        settleTransientIfIdle()
+        IMELog.write("buffer selected content removed blocks=\(removed)")
+        notifyChange(reason: .blockRemoval)
+        return true
     }
 
     private func clampedInsertionIndex() -> Int {
@@ -847,10 +943,20 @@ final class BufferModel {
     }
 
     private func notifyChange(reason: MutationReason = .ordinary) {
+        // Loading/error heartbeats are presentation-only and must not make a
+        // user's Select All evaporate while an Action plugin is still working.
+        // Every actual source/block mutation uses a non-transient reason.
+        if reason != .transient {
+            allContentSelected = false
+        }
         lastMutationReason = reason
         changeCount += 1
         onChange?()
         NotificationCenter.default.post(name: .bufferModelDidChange, object: self)
+    }
+
+    private func notifyPresentationChange() {
+        onChange?()
     }
 }
 

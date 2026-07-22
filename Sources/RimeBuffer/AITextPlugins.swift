@@ -2759,7 +2759,7 @@ enum AITextOpenAIRequestBuilder {
         case .semanticBlocks:
             systemPrompt = "Return only JSON in this shape: {\"blocks\":[{\"text\":\"...\",\"title\":null}]}. Make blocks as fine-grained as practical: one short clause, sentence, list item, or step per block. Keep code, URLs, numbers, and quotations intact. Never use tools."
         case .alternativeGuesses:
-            systemPrompt = "Answer directly in non-thinking mode. Return only JSON in this shape: {\"blocks\":[{\"text\":\"...\",\"title\":null}]}. Return 1 to 3 complete, mutually exclusive guesses for the entire input, ordered most likely first. Use one guess when intent is clear; use 2 or 3 only for meaningful ambiguity. Each block must stand alone as the full intended text, never one segment of a longer answer. Alternatives must reflect materially different readings, not stylistic paraphrases. Titles must be null. Never use tools."
+            systemPrompt = "Answer directly in non-thinking mode. Return only JSON in this shape: {\"blocks\":[{\"text\":\"...\",\"title\":null}]}. Return 1 to 3 complete, mutually exclusive guesses for the entire input, ordered most likely first. Respect minimumGuessCount in the user payload: whenever it is 2, return at least 2 materially different readings. Otherwise use one guess only when pronunciation and intent are both highly certain, and use 2 or 3 for any reasonable syllable, homophone, or semantic ambiguity. Each block must stand alone as the full intended text, never one segment of a longer answer. Alternatives must not be stylistic paraphrases. Titles must be null. Never use tools."
         }
         var body: [String: Any] = [
             "model": configuration.model,
@@ -3541,6 +3541,7 @@ final class AITextPluginWorkspace: BufferDeliveryContentSource {
         }
         return TranslationRailSnapshot(
             sourceText: sourceText,
+            sourceSelected: sourceModel.allContentSelected,
             outputBlocks: outputBlocks.map { TranslationOutputBlock(id: $0.id, text: $0.text) },
             phase: railPhase,
             message: message,

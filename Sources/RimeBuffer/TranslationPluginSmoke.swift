@@ -4,8 +4,10 @@ private final class TranslationSmokeDeliverySource: BufferDeliveryContentSource 
     let deliveryWorkspaceID = "translation-smoke"
     var deliveryGeneration: UInt64 = 1
     var hasIncompleteDeliveryBlocks = false
+    var prepareAllowed = true
     var blocks: [BufferModel.Block]
     private(set) var consumedIDs: [UUID] = []
+    private(set) var prepareCallCount = 0
 
     init(texts: [String], allowsRemoteMirror: Bool = true) {
         blocks = texts.map {
@@ -19,6 +21,11 @@ private final class TranslationSmokeDeliverySource: BufferDeliveryContentSource 
 
     var deliveryPendingBlocks: [BufferModel.Block] {
         hasIncompleteDeliveryBlocks ? [] : blocks
+    }
+
+    func prepareForDelivery() -> Bool {
+        prepareCallCount += 1
+        return prepareAllowed
     }
 
     func deliveryBlock(id: UUID, generation: UInt64) -> BufferModel.Block? {
@@ -270,6 +277,21 @@ func runTranslationPluginSmokeTest() -> Bool {
     guard translated.blocks.allSatisfy({ !$0.origin.allowsRemoteMirror }) else {
         return fail("processor mirror policy inheritance")
     }
+    translated.prepareAllowed = false
+    let prepareBlockedCoordinator = BufferDeliveryCoordinator(
+        model: BufferModel(),
+        dependencies: dependencies,
+        contentSourceResolver: { translated }
+    )
+    let prepareBlocked = prepareBlockedCoordinator.sendNext(expectedToken: focus)
+    guard prepareBlocked.sentCount == 0,
+          prepareBlocked.blockedReason == .contentChanged,
+          translated.prepareCallCount == 1,
+          inserted.isEmpty,
+          translated.blocks.count == 2 else {
+        return fail("delivery preparation must precede host insertion")
+    }
+    translated.prepareAllowed = true
     inserted.removeAll()
     deliveryCalls = 0
     let coordinator = BufferDeliveryCoordinator(
@@ -282,7 +304,8 @@ func runTranslationPluginSmokeTest() -> Bool {
           sent.sentCount == 2,
           inserted == ["Hello", " world"],
           translated.blocks.isEmpty,
-          translated.consumedIDs.count == 2 else {
+          translated.consumedIDs.count == 2,
+          translated.prepareCallCount == 2 else {
         return fail("target-only send-all")
     }
 

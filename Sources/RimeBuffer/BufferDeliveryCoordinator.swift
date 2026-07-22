@@ -10,10 +10,19 @@ protocol BufferDeliveryContentSource: AnyObject {
     var deliveryGeneration: UInt64 { get }
     var hasIncompleteDeliveryBlocks: Bool { get }
     var deliveryPendingBlocks: [BufferModel.Block] { get }
+    /// Final mutable preflight immediately before the coordinator freezes a
+    /// generation. Most sources are already committed; candidate workspaces
+    /// use this seam to make the highlighted interpretation exclusive.
+    @discardableResult func prepareForDelivery() -> Bool
     func deliveryBlock(id: UUID, generation: UInt64) -> BufferModel.Block?
     func consumeDelivered(blockIDs: [UUID], generation: UInt64)
     @discardableResult
     func markDeliveryBlockStale(id: UUID, generation: UInt64) -> Bool
+}
+
+extension BufferDeliveryContentSource {
+    @discardableResult
+    func prepareForDelivery() -> Bool { true }
 }
 
 extension BufferModel: BufferDeliveryContentSource {
@@ -291,6 +300,11 @@ final class BufferDeliveryCoordinator {
         }
 
         let source = contentSourceResolver()
+        guard source.prepareForDelivery() else {
+            return finishImmediate(.init(sentCount: 0,
+                                         blockedReason: .contentChanged),
+                                   completion: completion)
+        }
         let sourceGeneration = source.deliveryGeneration
         guard !source.hasIncompleteDeliveryBlocks else {
             return finishImmediate(.init(sentCount: 0,

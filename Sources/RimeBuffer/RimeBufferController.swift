@@ -22,6 +22,39 @@ enum BufferControlRoutingRules {
     }
 }
 
+enum BufferClipboardShortcut: Equatable {
+    case selectAll
+    case paste
+}
+
+enum BufferClipboardShortcutRules {
+    /// RIMES accepts both the user's Control convention and native macOS
+    /// Command shortcuts. Extra Shift/Option or Control+Command combinations
+    /// remain host shortcuts and are never reinterpreted.
+    static func shortcut(keycode: Int32?, mask: Int32) -> BufferClipboardShortcut? {
+        let primary = mask & (RimeKey.controlMask | RimeKey.superMask)
+        guard primary == RimeKey.controlMask || primary == RimeKey.superMask,
+              mask & (RimeKey.shiftMask | RimeKey.altMask) == 0 else { return nil }
+        switch keycode {
+        case 0x61: return .selectAll
+        case 0x76: return .paste
+        default: return nil
+        }
+    }
+}
+
+enum BufferClipboardTextRules {
+    static let maximumBytes = 1_048_576
+
+    static func validated(_ text: String?) -> String? {
+        guard let text,
+              !text.isEmpty,
+              !text.contains("\0"),
+              text.utf8.count <= maximumBytes else { return nil }
+        return text
+    }
+}
+
 enum BufferUnhandledPrintableRules {
     private static let excludedModifiers: NSEvent.ModifierFlags = [
         .command, .control, .option, .function,
@@ -214,6 +247,7 @@ final class RimeBufferController: IMKInputController {
     }
     private static let duplicateBackspaceCommandWindow: CFTimeInterval = 0.05
     private static let duplicateArrowCommandWindow: CFTimeInterval = 0.05
+    private static let duplicateClipboardCommandWindow: CFTimeInterval = 0.5
     private static let bufferEnterHoldDelay: TimeInterval = 1.2
     private static let bufferEnterPollInterval: TimeInterval = 0.02
     /// Rime pages fetched per matrix batch — also the initial expand size, so
@@ -233,6 +267,12 @@ final class RimeBufferController: IMKInputController {
     private var lastBufferArrowCommandHandledAt: CFAbsoluteTime = 0
     private var lastBufferArrowKeyDirection = 0
     private var lastBufferArrowCommandDirection = 0
+    private var lastStreamAlternativeArrowKeyHandledAt: CFAbsoluteTime = 0
+    private var lastStreamAlternativeArrowDirection = 0
+    private var streamAlternativeNavigationKeysDown = Set<UInt16>()
+    private var bufferClipboardShortcutKeysDown = Set<UInt16>()
+    private var lastBufferClipboardShortcutHandledAt: CFAbsoluteTime = 0
+    private var lastBufferClipboardShortcutHandled: BufferClipboardShortcut?
     private var bufferEnterPending = false
     private var bufferEnterSuppressUntilPhysicalUp = false
     private var bufferEnterCallbackOwnership = BufferEnterCallbackOwnership()
@@ -326,6 +366,11 @@ final class RimeBufferController: IMKInputController {
         )
     }
 
+    private func streamAlternativeDirection(keycode: Int32?, mask: Int32) -> Int? {
+        StreamInputAlternativeNavigationRules.direction(keycode: keycode,
+                                                        mask: mask)
+    }
+
     /// Stream raw input and librime composition are mutually exclusive. The
     /// plugin-selection callback normally settles the old composition, but a
     /// delayed IMK callback can race that transition. Recheck and settle it on
@@ -388,6 +433,13 @@ final class RimeBufferController: IMKInputController {
             ownClient: ownClient,
             exactFocus: shouldUseBufferCommands(client: client)
         )
+    }
+
+    private func bufferClipboardDisposition(client: IMKTextInput?) -> BufferControlDisposition {
+        // Secure fields retain native shortcut handling. In particular, never
+        // inspect NSPasteboard while macOS secure event input is active.
+        guard !IsSecureEventInputEnabled() else { return .passThrough }
+        return bufferControlDisposition(client: client)
     }
 
     private func shouldCaptureCommit(from client: IMKTextInput,
@@ -895,6 +947,9 @@ final class RimeBufferController: IMKInputController {
 
     private func applyFocusActivation(_ activation: InputFocusCoordinator.Activation,
                                       client: IMKTextInput) {
+        if focusToken != activation.token {
+            BufferModel.shared.clearAllContentSelection()
+        }
         // Resolve the displaced session before exposing the new token. If the
         // same proxy is reused, a pending chord flush can otherwise publish the
         // old session's candidates under the new owner.
@@ -937,6 +992,7 @@ final class RimeBufferController: IMKInputController {
     /// Rime result to the enabled buffer, or discard it when capture is off.
     func finalizeProtectedSession(_ lease: FocusLease, reason: String) {
         guard lease.controller === self else { return }
+        BufferModel.shared.clearAllContentSelection()
         cancelFocusBoundGestures()
         abandonCompositionWithoutClient(lease, reason: reason)
         if focusToken == lease.token {
@@ -984,6 +1040,7 @@ final class RimeBufferController: IMKInputController {
               let client = lease.client else {
             return
         }
+        BufferModel.shared.clearAllContentSelection()
         cancelFocusBoundGestures()
         if lease.deliverySuspended {
             abandonCompositionWithoutClient(lease, reason: "deactivate after lifecycle suspension")
@@ -1186,6 +1243,30 @@ final class RimeBufferController: IMKInputController {
             }
             IMELog.write("handle: stale event rejected bundle=\(bundleId(of: client))")
             if event.type == .keyDown || event.type == .keyUp {
+                if BufferClipboardShortcutRules.shortcut(
+                    keycode: keysym(for: event),
+                    mask: RimeKey.modifierMask(from: event.modifierFlags)
+                ) != nil,
+                   bufferClipboardDisposition(client: client) != .passThrough {
+                    bufferClipboardShortcutKeysDown.remove(event.keyCode)
+                    BufferModel.shared.clearAllContentSelection()
+                    if streamInputModeSelected {
+                        StreamInputWorkspace.shared.authorityRejected()
+                    }
+                    IMELog.write("buffer clipboard shortcut consumed after stale event")
+                    return true
+                }
+                if streamAlternativeDirection(
+                    keycode: keysym(for: event),
+                    mask: RimeKey.modifierMask(from: event.modifierFlags)
+                ) != nil,
+                   streamInputModeSelected,
+                   StreamInputWorkspace.shared.ownsAlternativeNavigation {
+                    streamAlternativeNavigationKeysDown.remove(event.keyCode)
+                    StreamInputWorkspace.shared.authorityRejected()
+                    IMELog.write("stream alternative arrow consumed after stale event")
+                    return true
+                }
                 switch streamInputDisposition(
                     keycode: keysym(for: event),
                     mask: RimeKey.modifierMask(from: event.modifierFlags),
@@ -1301,6 +1382,33 @@ final class RimeBufferController: IMKInputController {
 
     private func handleKeyUp(_ event: NSEvent, client: IMKTextInput) -> Bool {
         guard let keycode = keysym(for: event) else { return false }
+        if bufferClipboardShortcutKeysDown.remove(event.keyCode) != nil {
+            return true
+        }
+        if BufferClipboardShortcutRules.shortcut(
+            keycode: keycode,
+            mask: RimeKey.modifierMask(from: event.modifierFlags)
+        ) != nil,
+           bufferClipboardDisposition(client: client) != .passThrough {
+            return true
+        }
+        if streamAlternativeNavigationKeysDown.remove(event.keyCode) != nil {
+            if streamInputLease(client: client) == nil {
+                StreamInputWorkspace.shared.authorityRejected()
+            }
+            return true
+        }
+        if streamAlternativeDirection(
+            keycode: keycode,
+            mask: RimeKey.modifierMask(from: event.modifierFlags)
+        ) != nil,
+           streamInputModeSelected,
+           StreamInputWorkspace.shared.ownsAlternativeNavigation {
+            if streamInputLease(client: client) == nil {
+                StreamInputWorkspace.shared.authorityRejected()
+            }
+            return true
+        }
         if keycode != RimeKey.return
             || !event.modifierFlags
                 .intersection([.command, .control, .option]).isEmpty {
@@ -1373,6 +1481,43 @@ final class RimeBufferController: IMKInputController {
         }
         publishTelemetryKey(event, client: client)
 
+        let routedKeycode = keysym(for: event)
+        let routedMask = RimeKey.modifierMask(from: event.modifierFlags)
+        if let shortcut = BufferClipboardShortcutRules.shortcut(
+            keycode: routedKeycode,
+            mask: routedMask
+        ) {
+            switch bufferClipboardDisposition(client: client) {
+            case .passThrough:
+                if IsSecureEventInputEnabled() || isOwnClient(client) {
+                    return false
+                }
+                break
+            case .consumeOnly:
+                bufferClipboardShortcutKeysDown.insert(event.keyCode)
+                BufferModel.shared.clearAllContentSelection()
+                if streamInputModeSelected {
+                    StreamInputWorkspace.shared.authorityRejected()
+                }
+                IMELog.write("buffer clipboard shortcut consumed without authority")
+                return true
+            case .executeBufferAction:
+                bufferClipboardShortcutKeysDown.insert(event.keyCode)
+                if event.isARepeat {
+                    IMELog.write("buffer clipboard shortcut repeat consumed")
+                    return true
+                }
+                _ = performBufferClipboardShortcut(
+                    shortcut,
+                    client: client,
+                    expectedLease: eventLease
+                )
+                lastBufferClipboardShortcutHandledAt = CFAbsoluteTimeGetCurrent()
+                lastBufferClipboardShortcutHandled = shortcut
+                return true
+            }
+        }
+
         // Cmd belongs to the app, always (macOS Rime configs never bind Super).
         // In my_combo every letter is a chording key, so without this early-out
         // chord_composer would eat Cmd+C/Cmd+V outright. Resolve any live
@@ -1382,9 +1527,27 @@ final class RimeBufferController: IMKInputController {
             return false
         }
 
-        let routedKeycode = keysym(for: event)
-        let routedMask = RimeKey.modifierMask(from: event.modifierFlags)
         let streamLease = streamInputLease(client: client)
+        if let direction = streamAlternativeDirection(
+            keycode: routedKeycode,
+            mask: routedMask
+        ), StreamInputWorkspace.shared.ownsAlternativeNavigation {
+            guard let streamLease,
+                  StreamInputWorkspace.shared.moveAlternativeSelection(
+                    delta: direction,
+                    focusToken: streamLease.token
+                  ),
+                  self.streamInputLease(client: client) === streamLease else {
+                StreamInputWorkspace.shared.authorityRejected()
+                IMELog.write("stream alternative arrow consumed after authority changed")
+                return true
+            }
+            streamAlternativeNavigationKeysDown.insert(event.keyCode)
+            lastStreamAlternativeArrowKeyHandledAt = CFAbsoluteTimeGetCurrent()
+            lastStreamAlternativeArrowDirection = direction
+            updateUI(client: client)
+            return true
+        }
         switch streamInputDisposition(
             keycode: routedKeycode,
             mask: routedMask,
@@ -1785,6 +1948,38 @@ final class RimeBufferController: IMKInputController {
         let newlineCommand = isInsertNewlineSelector(selector)
         let callbackClient = currentCallbackClient(sender)
         let explicitClientMismatch = sender is IMKTextInput && callbackClient == nil
+        if let shortcut = bufferClipboardShortcut(for: selector) {
+            if !bufferClipboardShortcutKeysDown.isEmpty {
+                IMELog.write("buffer clipboard command consumed after owned keyDown")
+                return true
+            }
+            switch bufferClipboardDisposition(client: callbackClient) {
+            case .passThrough:
+                return false
+            case .consumeOnly:
+                BufferModel.shared.clearAllContentSelection()
+                if streamInputModeSelected {
+                    StreamInputWorkspace.shared.authorityRejected()
+                }
+                IMELog.write("buffer clipboard command consumed without authority")
+                return true
+            case .executeBufferAction:
+                let duplicate = lastBufferClipboardShortcutHandled == shortcut
+                    && CFAbsoluteTimeGetCurrent()
+                        - lastBufferClipboardShortcutHandledAt
+                            < Self.duplicateClipboardCommandWindow
+                if !duplicate, let client = callbackClient {
+                    _ = performBufferClipboardShortcut(
+                        shortcut,
+                        client: client,
+                        expectedLease: currentLease(matching: client)
+                    )
+                    lastBufferClipboardShortcutHandledAt = CFAbsoluteTimeGetCurrent()
+                    lastBufferClipboardShortcutHandled = shortcut
+                }
+                return true
+            }
+        }
         if newlineCommand {
             if explicitClientMismatch, bufferEnterGestureActive {
                 // Do not let an old field's command mutate ownership belonging
@@ -1798,6 +1993,36 @@ final class RimeBufferController: IMKInputController {
                 IMELog.write("buffer enter owned newline command consumed selector=\(NSStringFromSelector(selector)) keyUpSuppressed=\(bufferEnterCallbackOwnership.suppressesKeyUp) suppressionRetained=true")
                 return true
             }
+        }
+
+        if let direction = verticalMoveDirection(for: selector),
+           streamInputModeSelected,
+           StreamInputWorkspace.shared.ownsAlternativeNavigation {
+            guard !explicitClientMismatch,
+                  let client = callbackClient,
+                  let lease = streamInputLease(client: client) else {
+                StreamInputWorkspace.shared.authorityRejected()
+                IMELog.write("stream alternative arrow command consumed without authority")
+                return true
+            }
+            // A handled NSEvent may still be followed by AppKit's command
+            // callback. The physical-key set makes that callback consume-only.
+            let duplicateKeyEvent = !streamAlternativeNavigationKeysDown.isEmpty
+                || (CFAbsoluteTimeGetCurrent()
+                    - lastStreamAlternativeArrowKeyHandledAt
+                        < Self.duplicateArrowCommandWindow
+                    && lastStreamAlternativeArrowDirection == direction)
+            if !duplicateKeyEvent {
+                guard StreamInputWorkspace.shared.moveAlternativeSelection(
+                    delta: direction,
+                    focusToken: lease.token
+                ), streamInputLease(client: client) === lease else {
+                    StreamInputWorkspace.shared.authorityRejected()
+                    return true
+                }
+                updateUI(client: client)
+            }
+            return true
         }
 
         if explicitClientMismatch {
@@ -1916,6 +2141,16 @@ final class RimeBufferController: IMKInputController {
             || selector == #selector(NSResponder.deleteBackwardByDecomposingPreviousCharacter(_:))
     }
 
+    private func bufferClipboardShortcut(
+        for selector: Selector
+    ) -> BufferClipboardShortcut? {
+        switch NSStringFromSelector(selector) {
+        case "selectAll:": return .selectAll
+        case "paste:": return .paste
+        default: return nil
+        }
+    }
+
     private func isCancelOperationSelector(_ selector: Selector) -> Bool {
         selector == #selector(NSResponder.cancelOperation(_:))
     }
@@ -1932,6 +2167,16 @@ final class RimeBufferController: IMKInputController {
             return -1
         }
         if selector == #selector(NSResponder.moveRight(_:)) {
+            return 1
+        }
+        return nil
+    }
+
+    private func verticalMoveDirection(for selector: Selector) -> Int? {
+        if selector == #selector(NSResponder.moveUp(_:)) {
+            return -1
+        }
+        if selector == #selector(NSResponder.moveDown(_:)) {
             return 1
         }
         return nil
@@ -1991,6 +2236,8 @@ final class RimeBufferController: IMKInputController {
             scheduleBufferEnterPoll()
         }
         resetCandidateOptionGesture()
+        streamAlternativeNavigationKeysDown.removeAll()
+        bufferClipboardShortcutKeysDown.removeAll()
     }
 
     /// End delivery/hold tracking only. Callback ownership is intentionally not
@@ -2005,6 +2252,22 @@ final class RimeBufferController: IMKInputController {
         bufferEnterPollTimer?.invalidate()
         bufferEnterPollTimer = nil
         BufferWindowController.shared.setEnterHoldProgress(nil)
+    }
+
+    /// Editing the staged source cancels a pending tap/hold action. Keep the
+    /// physical Return callbacks owned until release so its later timer/keyUp
+    /// cannot send the text that was just selected or pasted.
+    private func cancelBufferEnterActionForSourceEditing() {
+        guard bufferEnterActionActive || bufferEnterCallbackOwnership.ownsCallbacks else {
+            return
+        }
+        let mustConsumeRelease = bufferEnterActionActive
+            || bufferEnterCallbackOwnership.suppressesKeyUp
+        resetBufferEnterGesture()
+        if mustConsumeRelease {
+            bufferEnterSuppressUntilPhysicalUp = true
+            scheduleBufferEnterPoll()
+        }
     }
 
     private func beginBufferEnterGesture(client: IMKTextInput,
@@ -2329,6 +2592,19 @@ final class RimeBufferController: IMKInputController {
         return true
     }
 
+    private func bufferCompositionIsSettledForSourceEditing() -> Bool {
+        guard !chord.hasPending,
+              !composition.composing,
+              candidateWindow.rawInputForCommit.isEmpty else { return false }
+        guard session != 0 else { return true }
+        // If the engine is unavailable, the controller-owned mirrors above are
+        // the only state we can safely inspect. A pending mirror already failed
+        // the guard; an idle mirror must not disable clipboard editing entirely.
+        guard rimeEngine.isHealthy else { return true }
+        let context = rimeEngine.getContext(session: session)
+        return !context.active && context.input.isEmpty && context.preedit.isEmpty
+    }
+
     @discardableResult
     private func performBufferEnterSend(all: Bool,
                                         client: IMKTextInput?,
@@ -2379,6 +2655,114 @@ final class RimeBufferController: IMKInputController {
         if currentCallbackClient(resolvedClient) != nil {
             updateUI(client: resolvedClient)
         }
+        return true
+    }
+
+    @discardableResult
+    private func performBufferClipboardShortcut(
+        _ shortcut: BufferClipboardShortcut,
+        client: IMKTextInput,
+        expectedLease: FocusLease?
+    ) -> Bool {
+        guard !IsSecureEventInputEnabled(),
+              let lease = expectedLease ?? currentLease(matching: client),
+              lease.controller === self,
+              lease.clientIdentity == ObjectIdentifier(client as AnyObject),
+              shouldUseBufferCommands(client: client),
+              InputFocusCoordinator.shared.interactionTarget(
+                expected: lease.token
+              ) === lease,
+              focusToken == lease.token else {
+            BufferModel.shared.clearAllContentSelection()
+            if streamInputModeSelected {
+                StreamInputWorkspace.shared.authorityRejected()
+            }
+            IMELog.write("buffer clipboard shortcut rejected before source access")
+            return true
+        }
+
+        cancelBufferEnterActionForSourceEditing()
+
+        if streamInputModeSelected {
+            guard let streamLease = streamInputLease(client: client),
+                  streamLease === lease,
+                  prepareForStreamInputCapture(client: client, lease: streamLease),
+                  self.streamInputLease(client: client) === streamLease else {
+                StreamInputWorkspace.shared.authorityRejected()
+                return true
+            }
+        } else {
+            // Make Select All include any active chord/preedit. Paste likewise
+            // resolves the composition before it changes the selected source.
+            _ = settlePendingBufferCompositionIfNeeded(
+                client: client,
+                source: "clipboard shortcut"
+            )
+            guard bufferCompositionIsSettledForSourceEditing() else {
+                IMELog.write("buffer clipboard shortcut consumed with unresolved composition")
+                return true
+            }
+        }
+
+        guard !IsSecureEventInputEnabled(),
+              currentLease(matching: client) === lease,
+              InputFocusCoordinator.shared.interactionTarget(
+                expected: lease.token
+              ) === lease,
+              focusToken == lease.token else {
+            BufferModel.shared.clearAllContentSelection()
+            if streamInputModeSelected {
+                StreamInputWorkspace.shared.authorityRejected()
+            }
+            IMELog.write("buffer clipboard shortcut rejected after composition settlement")
+            return true
+        }
+
+        switch shortcut {
+        case .selectAll:
+            if streamInputModeSelected {
+                _ = StreamInputWorkspace.shared.selectAllInput(
+                    focusToken: lease.token
+                )
+            } else {
+                _ = BufferModel.shared.selectAllContent()
+            }
+        case .paste:
+            // Pasteboard access happens only after every secure-input and exact
+            // lease check above. Revalidate once more after AppKit returns the
+            // value because pasteboard providers can be lazy.
+            guard let text = BufferClipboardTextRules.validated(
+                NSPasteboard.general.string(forType: .string)
+            ) else {
+                IMELog.write("buffer paste consumed without accepted plain text")
+                return true
+            }
+            guard !IsSecureEventInputEnabled(),
+                  currentLease(matching: client) === lease,
+                  InputFocusCoordinator.shared.interactionTarget(
+                    expected: lease.token
+                  ) === lease,
+                  focusToken == lease.token else {
+                BufferModel.shared.clearAllContentSelection()
+                if streamInputModeSelected {
+                    StreamInputWorkspace.shared.authorityRejected()
+                }
+                IMELog.write("buffer paste rejected after pasteboard read")
+                return true
+            }
+            if streamInputModeSelected {
+                _ = StreamInputWorkspace.shared.insertPastedText(
+                    text,
+                    focusToken: lease.token
+                )
+            } else {
+                _ = BufferModel.shared.insertPastedText(text)
+            }
+        }
+
+        IMELog.write("buffer clipboard shortcut handled action=\(shortcut)")
+        updateUI(client: client)
+        BufferWindowController.shared.refresh()
         return true
     }
 

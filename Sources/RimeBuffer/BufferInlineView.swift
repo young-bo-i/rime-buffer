@@ -55,6 +55,7 @@ enum TranslationRailRoleSymbolRules {
 private final class TranslationRailChipView: NSStackView {
     private let valueLabel = NSTextField(labelWithString: "")
     private let target: Bool
+    private(set) var renderedRetainedTailStart: Int?
 
     init(target: Bool) {
         self.target = target
@@ -92,6 +93,7 @@ private final class TranslationRailChipView: NSStackView {
                 retainedTailStart: Int? = nil,
                 stale: Bool,
                 scale: CGFloat) {
+        renderedRetainedTailStart = nil
         let prefix: String
         if let ordinal {
             prefix = selected ? "✓ \(ordinal) · " : "\(ordinal) · "
@@ -116,6 +118,7 @@ private final class TranslationRailChipView: NSStackView {
             let textLength = text.utf16.count
             let start = min(max(retainedTailStart, 0), textLength)
             if start < textLength {
+                renderedRetainedTailStart = start
                 attributed.addAttribute(
                     .foregroundColor,
                     value: RimeUI.textMuted.withAlphaComponent(0.58),
@@ -141,6 +144,7 @@ private final class TranslationRailChipView: NSStackView {
     }
 
     func scrub() {
+        renderedRetainedTailStart = nil
         valueLabel.stringValue = ""
         valueLabel.toolTip = nil
         toolTip = nil
@@ -190,11 +194,43 @@ private final class TranslationRailMessageView: NSView {
     }
 }
 
+/// One independently scrollable target row. The stable row key lets a stream
+/// candidate keep its row while partial text grows or the selection changes.
+private final class TranslationTargetRail {
+    let key: Int
+    let scroll = NSScrollView()
+    let row = NSStackView()
+    let leadingPlaceholder = NSView()
+    let trailingSpacer = NSView()
+
+    init(key: Int) {
+        self.key = key
+        leadingPlaceholder.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            leadingPlaceholder.widthAnchor.constraint(equalToConstant: 14),
+            leadingPlaceholder.heightAnchor.constraint(equalToConstant: 14),
+        ])
+        leadingPlaceholder.setContentHuggingPriority(.required, for: .horizontal)
+        leadingPlaceholder.setContentCompressionResistancePriority(.required,
+                                                                   for: .horizontal)
+        trailingSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        trailingSpacer.setContentCompressionResistancePriority(.defaultLow,
+                                                               for: .horizontal)
+    }
+}
+
 /// Compact block rail used by the independent workbench window. It never holds
 /// an IMK client or action buttons; it only renders staged blocks.
 final class BufferInlineView: NSView {
     static let standardPreferredHeight: CGFloat = 34
     static let translationPreferredHeight: CGFloat = 68
+    static let additionalTranslationTargetRowHeight: CGFloat = 31
+
+    static func translationPreferredHeight(targetRows: Int) -> CGFloat {
+        translationPreferredHeight
+            + CGFloat(min(max(targetRows, 1), 3) - 1)
+                * additionalTranslationTargetRowHeight
+    }
 
     private struct RenderedBlock: Equatable {
         let id: UUID
@@ -206,6 +242,7 @@ final class BufferInlineView: NSView {
     private struct RenderSignature: Equatable {
         let blocks: [RenderedBlock]
         let insertionIndex: Int
+        let allContentSelected: Bool
         let active: Bool
         let preedit: String
         let loadingMessage: String?
@@ -221,11 +258,8 @@ final class BufferInlineView: NSView {
     private let translationContainer = NSStackView()
     private let translationSourceScroll = NSScrollView()
     private let translationSourceRow = NSStackView()
-    private let translationTargetScroll = NSScrollView()
-    private let translationTargetRow = NSStackView()
     private let leadingSpacer = NSView()
     private let translationSourceSpacer = NSView()
-    private let translationTargetSpacer = NSView()
     private let caretView = NSView()
     private let emptyLabel = NSTextField(labelWithString: "等待暂存内容")
     private let translationSourceEmptyLabel = NSTextField(labelWithString: "等待原文")
@@ -236,6 +270,8 @@ final class BufferInlineView: NSView {
     private var translationSourceRoleView: NSImageView?
     private var translationTargetRoleView: NSImageView?
     private var translationSourceChipView: TranslationRailChipView?
+    private var translationTargetRails: [Int: TranslationTargetRail] = [:]
+    private var renderedTranslationTargetRowKeys: [Int] = []
     private var translationTargetChipViews: [UUID: TranslationRailChipView] = [:]
     private var translationMessageView: TranslationRailMessageView?
     private var translationLoadingActive = false
@@ -243,11 +279,18 @@ final class BufferInlineView: NSView {
     private var contentShielded = false
     private var enterHoldProgress: CGFloat?
     private(set) var renderPassCount = 0
+    private(set) var renderedSelectedStandardBlockCount = 0
+    private(set) var renderedTranslationSourceSelected = false
     var renderedBlockCount: Int { renderedBlockIDs.count }
     var renderedTranslationTargetViewIdentities: [ObjectIdentifier] {
         renderedBlockIDs.compactMap {
             translationTargetChipViews[$0].map(ObjectIdentifier.init)
         }
+    }
+    var renderedTranslationRetainedTailStarts: [UUID: Int] {
+        Dictionary(uniqueKeysWithValues: translationTargetChipViews.compactMap { id, chip in
+            chip.renderedRetainedTailStart.map { (id, $0) }
+        })
     }
     var isEnterHoldProgressVisible: Bool { enterHoldProgress != nil }
     var renderedTextFragments: [String] {
@@ -257,17 +300,28 @@ final class BufferInlineView: NSView {
         }
         return collect(chipRow)
             + collect(translationSourceRow)
-            + collect(translationTargetRow)
+            + renderedTranslationTargetRowKeys.flatMap {
+                translationTargetRails[$0].map { collect($0.row) } ?? []
+            }
     }
 
     var preferredHeight: CGFloat {
         translationContainer.isHidden
             ? Self.standardPreferredHeight
-            : Self.translationPreferredHeight
+            : Self.translationPreferredHeight(
+                targetRows: renderedTranslationTargetRowKeys.count
+            )
     }
 
     var usesStackedTranslationLayout: Bool { !translationContainer.isHidden }
-    var translationRailCount: Int { usesStackedTranslationLayout ? 2 : 0 }
+    var translationRailCount: Int {
+        usesStackedTranslationLayout
+            ? 1 + max(renderedTranslationTargetRowKeys.count, 1)
+            : 0
+    }
+    var renderedTranslationTargetRowCount: Int {
+        usesStackedTranslationLayout ? max(renderedTranslationTargetRowKeys.count, 1) : 0
+    }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -301,7 +355,7 @@ final class BufferInlineView: NSView {
         chipRow.spacing = BufferInlineMetrics.blockSpacing
         chipRow.alignment = .centerY
         chipRow.distribution = .fill
-        for spacer in [leadingSpacer, translationSourceSpacer, translationTargetSpacer] {
+        for spacer in [leadingSpacer, translationSourceSpacer] {
             spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
             spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         }
@@ -328,14 +382,16 @@ final class BufferInlineView: NSView {
         addSubview(normalRailContainer)
 
         configureHorizontalRail(translationSourceScroll, row: translationSourceRow)
-        configureHorizontalRail(translationTargetScroll, row: translationTargetRow)
+        let initialTargetRail = makeTranslationTargetRail(key: 0)
+        translationTargetRails[0] = initialTargetRail
+        renderedTranslationTargetRowKeys = [0]
         translationContainer.orientation = .vertical
         translationContainer.alignment = .width
         translationContainer.distribution = .fillEqually
         translationContainer.spacing = 4
         translationContainer.translatesAutoresizingMaskIntoConstraints = false
         translationContainer.addArrangedSubview(translationSourceScroll)
-        translationContainer.addArrangedSubview(translationTargetScroll)
+        translationContainer.addArrangedSubview(initialTargetRail.scroll)
         translationContainer.isHidden = true
         addSubview(translationContainer)
         NSLayoutConstraint.activate([
@@ -376,6 +432,12 @@ final class BufferInlineView: NSView {
         scroll.wantsLayer = true
         scroll.layer?.cornerRadius = 5
         scroll.layer?.masksToBounds = true
+    }
+
+    private func makeTranslationTargetRail(key: Int) -> TranslationTargetRail {
+        let rail = TranslationTargetRail(key: key)
+        configureHorizontalRail(rail.scroll, row: rail.row)
+        return rail
     }
 
     override func viewDidMoveToWindow() {
@@ -428,6 +490,17 @@ final class BufferInlineView: NSView {
                             .selectedWorkspace?.railSnapshot)
     }
 
+    /// Runtime seam for callers that already froze a derived snapshot to size
+    /// the panel. Using the exact same value for geometry and rendering avoids
+    /// a one-frame row-count mismatch during streaming updates.
+    @discardableResult
+    func refresh(preedit: String = "",
+                 shielded: Bool,
+                 translationSnapshot: TranslationRailSnapshot?) -> Bool {
+        if shielded { return refreshShielded() }
+        return refresh(preedit: preedit, translation: translationSnapshot)
+    }
+
     /// Deterministic standard-rail seam for CLI smoke tests and previews. It
     /// deliberately ignores the user's currently selected buffer plugin.
     @discardableResult
@@ -454,6 +527,7 @@ final class BufferInlineView: NSView {
                               pluginMetadata: $0.pluginMetadata)
             },
             insertionIndex: min(max(model.insertionIndex, 0), model.blocks.count),
+            allContentSelected: model.allContentSelected,
             active: active,
             preedit: preeditText,
             loadingMessage: model.loadingMessage,
@@ -474,11 +548,13 @@ final class BufferInlineView: NSView {
             if !wasRenderingTranslation { resetRailContents() }
             normalRailContainer.isHidden = true
             translationContainer.isHidden = false
+            renderedSelectedStandardBlockCount = 0
+            renderedTranslationSourceSelected = translation.sourceSelected
             renderTranslation(translation, active: active)
             applyAppearance()
             layoutSubtreeIfNeeded()
             updateTranslationDocumentSizes()
-            scrollTranslationRailsToEnd()
+            scrollTranslationRails(for: translation.phase)
             isHidden = false
             return true
         }
@@ -486,6 +562,10 @@ final class BufferInlineView: NSView {
         resetRailContents()
         normalRailContainer.isHidden = false
         translationContainer.isHidden = true
+        renderedSelectedStandardBlockCount = signature.allContentSelected
+            ? model.blocks.count
+            : 0
+        renderedTranslationSourceSelected = false
 
         let insertionIndex = signature.insertionIndex
         if model.blocks.isEmpty, preeditText.isEmpty {
@@ -504,15 +584,25 @@ final class BufferInlineView: NSView {
                     if !preeditText.isEmpty {
                         chipRow.addArrangedSubview(preeditChip(text: preeditText))
                     }
-                    chipRow.addArrangedSubview(caretView)
+                    if !signature.allContentSelected {
+                        chipRow.addArrangedSubview(caretView)
+                    }
                 }
                 if index < model.blocks.count {
-                    chipRow.addArrangedSubview(chip(for: model.blocks[index], index: index))
+                    chipRow.addArrangedSubview(chip(
+                        for: model.blocks[index],
+                        index: index,
+                        selected: signature.allContentSelected
+                    ))
                 }
             }
         } else {
             for (index, block) in model.blocks.enumerated() {
-                chipRow.addArrangedSubview(chip(for: block, index: index))
+                chipRow.addArrangedSubview(chip(
+                    for: block,
+                    index: index,
+                    selected: signature.allContentSelected
+                ))
             }
             if !preeditText.isEmpty {
                 chipRow.addArrangedSubview(preeditChip(text: preeditText))
@@ -543,6 +633,7 @@ final class BufferInlineView: NSView {
         let signature = RenderSignature(
             blocks: [],
             insertionIndex: 0,
+            allContentSelected: false,
             active: false,
             preedit: "",
             loadingMessage: nil,
@@ -559,6 +650,8 @@ final class BufferInlineView: NSView {
         lastRenderSignature = signature
         renderPassCount += 1
         resetRailContents()
+        renderedSelectedStandardBlockCount = 0
+        renderedTranslationSourceSelected = false
         normalRailContainer.isHidden = false
         translationContainer.isHidden = true
         emptyLabel.stringValue = "内容已隐藏"
@@ -580,13 +673,15 @@ final class BufferInlineView: NSView {
         if translationContainer.isHidden { resetRailContents() }
         normalRailContainer.isHidden = true
         translationContainer.isHidden = false
+        renderedSelectedStandardBlockCount = 0
+        renderedTranslationSourceSelected = snapshot.sourceSelected
         renderTranslation(snapshot, active: active)
         applyAppearance()
         layoutSubtreeIfNeeded()
         updateTranslationDocumentSizes()
-        scrollTranslationRailsToEnd()
+        scrollTranslationRails(for: snapshot.phase)
         isHidden = false
-        return usesStackedTranslationLayout && translationRailCount == 2
+        return usesStackedTranslationLayout && translationRailCount >= 2
     }
 
     private func renderTranslation(_ snapshot: TranslationRailSnapshot,
@@ -608,12 +703,13 @@ final class BufferInlineView: NSView {
             translationSourceChipView = sourceChip
             sourceChip.update(
                 text: snapshot.sourceText,
+                selected: snapshot.sourceSelected,
                 stale: false,
                 scale: window?.backingScaleFactor ?? 2
             )
             sourceViews.append(sourceChip)
         }
-        if active { sourceViews.append(caretView) }
+        if active, !snapshot.sourceSelected { sourceViews.append(caretView) }
         sourceViews.append(translationSourceSpacer)
         reconcileArrangedSubviews(sourceViews, in: translationSourceRow)
 
@@ -623,7 +719,27 @@ final class BufferInlineView: NSView {
         updateTranslationRoleIcon(targetRole,
                                   role: snapshot.targetRole,
                                   target: true)
-        var targetViews: [NSView] = [targetRole]
+        let rowSnapshots: [TranslationOutputRow]
+        if snapshot.outputRows.isEmpty {
+            rowSnapshots = [TranslationOutputRow(key: 0,
+                                                 blocks: snapshot.outputBlocks)]
+        } else {
+            rowSnapshots = Array(snapshot.outputRows.prefix(3))
+        }
+        let desiredRowKeys = rowSnapshots.map(\.key)
+        let oldRowKeys = Set(renderedTranslationTargetRowKeys)
+        for key in desiredRowKeys where translationTargetRails[key] == nil {
+            translationTargetRails[key] = makeTranslationTargetRail(key: key)
+        }
+        renderedTranslationTargetRowKeys = desiredRowKeys
+        let desiredTargetScrolls = desiredRowKeys.compactMap {
+            translationTargetRails[$0]?.scroll
+        }
+        reconcileArrangedSubviews(
+            [translationSourceScroll] + desiredTargetScrolls,
+            in: translationContainer
+        )
+
         var loading = false
         var message: String?
         if snapshot.outputBlocks.isEmpty {
@@ -639,32 +755,15 @@ final class BufferInlineView: NSView {
                 message = snapshot.message ?? "插件不可用"
             case .idle, .ready:
                 translationTargetEmptyLabel.stringValue = snapshot.targetEmptyText
-                targetViews.append(translationTargetEmptyLabel)
             }
         } else {
-            let targetIsCurrent = snapshot.phase == .ready
-            let liveIDs = Set(snapshot.outputBlocks.map(\.id))
+            let liveIDs = Set(rowSnapshots.flatMap(\.blocks).map(\.id))
             let obsoleteIDs = translationTargetChipViews.keys.filter {
                 !liveIDs.contains($0)
             }
             for id in obsoleteIDs {
                 translationTargetChipViews[id]?.scrub()
                 translationTargetChipViews.removeValue(forKey: id)
-            }
-            for block in snapshot.outputBlocks {
-                renderedBlockIDs.append(block.id)
-                let chip = translationTargetChipViews[block.id]
-                    ?? TranslationRailChipView(target: true)
-                translationTargetChipViews[block.id] = chip
-                chip.update(
-                    text: block.text,
-                    ordinal: block.ordinal,
-                    selected: block.selected,
-                    retainedTailStart: block.retainedTailStart,
-                    stale: !targetIsCurrent,
-                    scale: window?.backingScaleFactor ?? 2
-                )
-                targetViews.append(chip)
             }
             if snapshot.phase == .waiting || snapshot.phase == .translating {
                 loading = true
@@ -676,7 +775,6 @@ final class BufferInlineView: NSView {
             translationTargetChipViews.removeAll()
         }
         if loading {
-            targetViews.append(loadingIndicator)
             if !translationLoadingActive {
                 loadingIndicator.startAnimation(nil)
                 translationLoadingActive = true
@@ -689,10 +787,51 @@ final class BufferInlineView: NSView {
             let messageView = translationMessageView ?? TranslationRailMessageView()
             translationMessageView = messageView
             messageView.update(message)
-            targetViews.append(messageView)
         }
-        targetViews.append(translationTargetSpacer)
-        reconcileArrangedSubviews(targetViews, in: translationTargetRow)
+
+        for (rowIndex, rowSnapshot) in rowSnapshots.enumerated() {
+            guard let rail = translationTargetRails[rowSnapshot.key] else { continue }
+            var targetViews: [NSView] = [
+                rowIndex == 0 ? targetRole : rail.leadingPlaceholder,
+            ]
+            if snapshot.outputBlocks.isEmpty, rowIndex == 0 {
+                if !loading, message == nil {
+                    targetViews.append(translationTargetEmptyLabel)
+                }
+            } else {
+                let targetIsCurrent = snapshot.phase == .ready
+                for block in rowSnapshot.blocks {
+                    renderedBlockIDs.append(block.id)
+                    let chip = translationTargetChipViews[block.id]
+                        ?? TranslationRailChipView(target: true)
+                    translationTargetChipViews[block.id] = chip
+                    chip.update(
+                        text: block.text,
+                        ordinal: block.ordinal,
+                        selected: block.selected,
+                        retainedTailStart: block.retainedTailStart,
+                        stale: !targetIsCurrent,
+                        scale: window?.backingScaleFactor ?? 2
+                    )
+                    targetViews.append(chip)
+                }
+            }
+            if rowIndex == rowSnapshots.count - 1 {
+                if loading { targetViews.append(loadingIndicator) }
+                if let messageView = translationMessageView, message != nil {
+                    targetViews.append(messageView)
+                }
+            }
+            targetViews.append(rail.trailingSpacer)
+            reconcileArrangedSubviews(targetViews, in: rail.row)
+        }
+
+        let obsoleteRowKeys = oldRowKeys.subtracting(desiredRowKeys)
+        for key in obsoleteRowKeys {
+            guard let rail = translationTargetRails.removeValue(forKey: key) else { continue }
+            clearArrangedSubviews(of: rail.row)
+            rail.scroll.removeFromSuperview()
+        }
         active ? startCaretBlinking() : stopCaretBlinking()
     }
 
@@ -706,6 +845,10 @@ final class BufferInlineView: NSView {
         }
         for (index, view) in desired.enumerated() {
             if view.superview !== row {
+                if let previousRow = view.superview as? NSStackView {
+                    previousRow.removeArrangedSubview(view)
+                    view.removeFromSuperview()
+                }
                 row.insertArrangedSubview(view, at: index)
                 continue
             }
@@ -767,7 +910,9 @@ final class BufferInlineView: NSView {
         return dot
     }
 
-    private func chip(for block: BufferModel.Block, index: Int) -> NSView {
+    private func chip(for block: BufferModel.Block,
+                      index: Int,
+                      selected: Bool = false) -> NSView {
         if renderedBlockIDs.count <= index {
             renderedBlockIDs.append(block.id)
         } else {
@@ -806,9 +951,15 @@ final class BufferInlineView: NSView {
         let box = NSView()
         box.wantsLayer = true
         box.layer?.backgroundColor = RimeUI.accentBlue.withAlphaComponent(
-            RimeUI.isNight ? 0.22 : 0.14
+            selected
+                ? (RimeUI.isNight ? 0.34 : 0.24)
+                : (RimeUI.isNight ? 0.22 : 0.14)
         ).cgColor
         box.layer?.cornerRadius = BufferInlineMetrics.chipCornerRadius
+        box.layer?.borderColor = (selected ? RimeUI.accentBlue : RimeUI.border).cgColor
+        box.layer?.borderWidth = selected
+            ? 1 / max(window?.backingScaleFactor ?? 2, 1)
+            : 0
         box.toolTip = blockToolTip(block)
         row.translatesAutoresizingMaskIntoConstraints = false
         box.addSubview(row)
@@ -963,12 +1114,23 @@ final class BufferInlineView: NSView {
         translationMessageView?.scrub()
         clearArrangedSubviews(of: chipRow)
         clearArrangedSubviews(of: translationSourceRow)
-        clearArrangedSubviews(of: translationTargetRow)
+        for rail in translationTargetRails.values {
+            clearArrangedSubviews(of: rail.row)
+            rail.scroll.removeFromSuperview()
+        }
         loadingIndicator.stopAnimation(nil)
         translationLoadingActive = false
         translationSourceRoleView = nil
         translationTargetRoleView = nil
         translationSourceChipView = nil
+        translationTargetRails.removeAll()
+        let initialTargetRail = makeTranslationTargetRail(key: 0)
+        translationTargetRails[0] = initialTargetRail
+        renderedTranslationTargetRowKeys = [0]
+        reconcileArrangedSubviews(
+            [translationSourceScroll, initialTargetRail.scroll],
+            in: translationContainer
+        )
         translationTargetChipViews.removeAll()
         translationMessageView = nil
         renderedBlockIDs.removeAll(keepingCapacity: true)
@@ -985,7 +1147,10 @@ final class BufferInlineView: NSView {
 
     private func updateTranslationDocumentSizes() {
         updateDocumentSize(for: translationSourceRow, in: translationSourceScroll)
-        updateDocumentSize(for: translationTargetRow, in: translationTargetScroll)
+        for key in renderedTranslationTargetRowKeys {
+            guard let rail = translationTargetRails[key] else { continue }
+            updateDocumentSize(for: rail.row, in: rail.scroll)
+        }
     }
 
     private func updateDocumentSize(for row: NSStackView, in scroll: NSScrollView) {
@@ -997,9 +1162,21 @@ final class BufferInlineView: NSView {
         row.layoutSubtreeIfNeeded()
     }
 
-    private func scrollTranslationRailsToEnd() {
+    private func scrollTranslationRails(for phase: TranslationRailSnapshot.Phase) {
         scrollToEnd(row: translationSourceRow, in: translationSourceScroll)
-        scrollToEnd(row: translationTargetRow, in: translationTargetScroll)
+        for key in renderedTranslationTargetRowKeys {
+            guard let rail = translationTargetRails[key] else { continue }
+            if phase == .waiting || phase == .translating {
+                scrollToEnd(row: rail.row, in: rail.scroll)
+            } else {
+                scrollToStart(in: rail.scroll)
+            }
+        }
+    }
+
+    private func scrollToStart(in scroll: NSScrollView) {
+        scroll.contentView.scroll(to: .zero)
+        scroll.reflectScrolledClipView(scroll.contentView)
     }
 
     private func scrollToEnd(row: NSView, in scroll: NSScrollView) {
@@ -1042,8 +1219,10 @@ final class BufferInlineView: NSView {
         layer?.borderColor = RimeUI.borderStrong.cgColor
         translationSourceScroll.layer?.backgroundColor = RimeUI.surface2
             .withAlphaComponent(RimeUI.isNight ? 0.70 : 0.78).cgColor
-        translationTargetScroll.layer?.backgroundColor = RimeUI.accentBlue
-            .withAlphaComponent(RimeUI.isNight ? 0.13 : 0.08).cgColor
+        for rail in translationTargetRails.values {
+            rail.scroll.layer?.backgroundColor = RimeUI.accentBlue
+                .withAlphaComponent(RimeUI.isNight ? 0.13 : 0.08).cgColor
+        }
         caretView.layer?.backgroundColor = RimeUI.accentBlue.cgColor
         enterHoldProgressLayer.backgroundColor = RimeUI.accentBlue.cgColor
         emptyLabel.textColor = RimeUI.isNight ? RimeUI.textSecondary : RimeUI.textMuted
