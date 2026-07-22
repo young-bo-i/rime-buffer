@@ -3822,6 +3822,12 @@ func runBufferSmokeTest() -> Bool {
             keycode: 0x61, mask: RimeKey.controlMask
           ) == .selectAll,
           BufferClipboardShortcutRules.shortcut(
+            keycode: 0x61, mask: RimeKey.superMask
+          ) == .selectAll,
+          BufferClipboardShortcutRules.shortcut(
+            keycode: 0x76, mask: RimeKey.controlMask
+          ) == .paste,
+          BufferClipboardShortcutRules.shortcut(
             keycode: 0x76, mask: RimeKey.superMask
           ) == .paste,
           BufferClipboardShortcutRules.shortcut(
@@ -3832,6 +3838,46 @@ func runBufferSmokeTest() -> Bool {
             keycode: 0x76,
             mask: RimeKey.superMask | RimeKey.controlMask
           ) == nil,
+          BufferClipboardPhysicalShortcutRules.shortcut(
+            aKeyDown: false,
+            vKeyDown: true,
+            mask: RimeKey.controlMask
+          ) == .paste,
+          BufferClipboardPhysicalShortcutRules.shortcut(
+            aKeyDown: true,
+            vKeyDown: false,
+            mask: RimeKey.controlMask
+          ) == .selectAll,
+          BufferClipboardPhysicalShortcutRules.shortcut(
+            aKeyDown: true,
+            vKeyDown: true,
+            mask: RimeKey.controlMask
+          ) == nil,
+          BufferClipboardPhysicalShortcutRules.shortcut(
+            aKeyDown: false,
+            vKeyDown: true,
+            mask: RimeKey.controlMask | RimeKey.shiftMask
+          ) == nil,
+          BufferClipboardCommandRules.shortcut(
+            selectorName: "pageDown:",
+            physicalShortcut: .paste
+          ) == .paste,
+          BufferClipboardCommandRules.shortcut(
+            selectorName: "pageDown:",
+            physicalShortcut: nil
+          ) == nil,
+          BufferClipboardCommandRules.shortcut(
+            selectorName: "pageDown:",
+            physicalShortcut: .selectAll
+          ) == nil,
+          BufferClipboardCommandRules.shortcut(
+            selectorName: "moveToBeginningOfParagraph:",
+            physicalShortcut: .selectAll
+          ) == .selectAll,
+          BufferClipboardCommandRules.shortcut(
+            selectorName: "paste:",
+            physicalShortcut: nil
+          ) == .paste,
           BufferClipboardTextRules.validated("可粘贴") == "可粘贴",
           BufferClipboardTextRules.validated("") == nil,
           BufferClipboardTextRules.validated("a\0b") == nil else {

@@ -43,6 +43,45 @@ enum BufferClipboardShortcutRules {
     }
 }
 
+enum BufferClipboardPhysicalShortcutRules {
+    static func shortcut(aKeyDown: Bool,
+                         vKeyDown: Bool,
+                         mask: Int32) -> BufferClipboardShortcut? {
+        // A simultaneous A+V snapshot is ambiguous and must never turn an
+        // unrelated Cocoa command into a workbench edit.
+        guard aKeyDown != vKeyDown else { return nil }
+        return BufferClipboardShortcutRules.shortcut(
+            keycode: aKeyDown ? 0x61 : 0x76,
+            mask: mask
+        )
+    }
+}
+
+enum BufferClipboardCommandRules {
+    static func shortcut(selectorName: String,
+                         physicalShortcut: BufferClipboardShortcut?)
+        -> BufferClipboardShortcut? {
+        switch selectorName {
+        case "selectAll:":
+            return .selectAll
+        case "paste:":
+            return .paste
+        // Cocoa's standard key-binding dictionary translates physical
+        // Control+A/V before some native clients offer the event to IMK.
+        // Require the matching live physical chord so real navigation keys
+        // that share these selectors retain their native behavior.
+        case "moveToBeginningOfParagraph:",
+             "moveToBeginningOfLine:",
+             "moveToLeftEndOfLine:":
+            return physicalShortcut == .selectAll ? .selectAll : nil
+        case "pageDown:", "scrollPageDown:":
+            return physicalShortcut == .paste ? .paste : nil
+        default:
+            return nil
+        }
+    }
+}
+
 enum BufferClipboardTextRules {
     static let maximumBytes = 1_048_576
 
@@ -544,6 +583,34 @@ final class RimeBufferController: IMKInputController {
               lease.controller === self,
               ObjectIdentifier(client as AnyObject) == lease.clientIdentity else { return nil }
         return client
+    }
+
+    /// Native AppKit clients may send a command-only callback with a nil or
+    /// non-client sender after translating Control+A/V through the standard
+    /// key-binding dictionary. Recover only for a matching live physical chord
+    /// and a fully revalidated current lease/controller client identity.
+    private func currentClipboardCommandClient(
+        _ sender: Any?,
+        shortcut: BufferClipboardShortcut,
+        physicalShortcut: BufferClipboardShortcut?
+    ) -> IMKTextInput? {
+        if sender is IMKTextInput {
+            return currentCallbackClient(sender)
+        }
+        guard physicalShortcut == shortcut,
+              let focusToken,
+              let lease = InputFocusCoordinator.shared.liveTarget(
+                expected: focusToken,
+                forceOverlayVisibilityRefresh: true
+              ),
+              lease.controller === self,
+              let leaseClient = lease.client,
+              let controllerClient = self.client(),
+              ObjectIdentifier(leaseClient as AnyObject)
+                == lease.clientIdentity,
+              ObjectIdentifier(controllerClient as AnyObject)
+                == lease.clientIdentity else { return nil }
+        return leaseClient
     }
 
     /// Lifecycle callbacks are less regular than key callbacks: some hosts
@@ -1948,12 +2015,22 @@ final class RimeBufferController: IMKInputController {
         let newlineCommand = isInsertNewlineSelector(selector)
         let callbackClient = currentCallbackClient(sender)
         let explicitClientMismatch = sender is IMKTextInput && callbackClient == nil
-        if let shortcut = bufferClipboardShortcut(for: selector) {
+        let physicalClipboardShortcut = physicalBufferClipboardShortcut()
+        if let shortcut = bufferClipboardShortcut(
+            for: selector,
+            physicalShortcut: physicalClipboardShortcut
+        ) {
+            let clipboardClient = callbackClient
+                ?? currentClipboardCommandClient(
+                    sender,
+                    shortcut: shortcut,
+                    physicalShortcut: physicalClipboardShortcut
+                )
             if !bufferClipboardShortcutKeysDown.isEmpty {
                 IMELog.write("buffer clipboard command consumed after owned keyDown")
                 return true
             }
-            switch bufferClipboardDisposition(client: callbackClient) {
+            switch bufferClipboardDisposition(client: clipboardClient) {
             case .passThrough:
                 return false
             case .consumeOnly:
@@ -1968,7 +2045,7 @@ final class RimeBufferController: IMKInputController {
                     && CFAbsoluteTimeGetCurrent()
                         - lastBufferClipboardShortcutHandledAt
                             < Self.duplicateClipboardCommandWindow
-                if !duplicate, let client = callbackClient {
+                if !duplicate, let client = clipboardClient {
                     _ = performBufferClipboardShortcut(
                         shortcut,
                         client: client,
@@ -2142,13 +2219,33 @@ final class RimeBufferController: IMKInputController {
     }
 
     private func bufferClipboardShortcut(
-        for selector: Selector
+        for selector: Selector,
+        physicalShortcut: BufferClipboardShortcut?
     ) -> BufferClipboardShortcut? {
-        switch NSStringFromSelector(selector) {
-        case "selectAll:": return .selectAll
-        case "paste:": return .paste
-        default: return nil
-        }
+        BufferClipboardCommandRules.shortcut(
+            selectorName: NSStringFromSelector(selector),
+            physicalShortcut: physicalShortcut
+        )
+    }
+
+    private func physicalBufferClipboardShortcut() -> BufferClipboardShortcut? {
+        let flags = CGEventSource.flagsState(.combinedSessionState)
+        var mask: Int32 = 0
+        if flags.contains(.maskShift) { mask |= RimeKey.shiftMask }
+        if flags.contains(.maskControl) { mask |= RimeKey.controlMask }
+        if flags.contains(.maskAlternate) { mask |= RimeKey.altMask }
+        if flags.contains(.maskCommand) { mask |= RimeKey.superMask }
+        return BufferClipboardPhysicalShortcutRules.shortcut(
+            aKeyDown: CGEventSource.keyState(
+                .combinedSessionState,
+                key: CGKeyCode(0)
+            ),
+            vKeyDown: CGEventSource.keyState(
+                .combinedSessionState,
+                key: CGKeyCode(9)
+            ),
+            mask: mask
+        )
     }
 
     private func isCancelOperationSelector(_ selector: Selector) -> Bool {
@@ -2285,7 +2382,7 @@ final class RimeBufferController: IMKInputController {
         // current IME marked-text transaction even if the web editor silently
         // ended the lease's earlier idle guard, while preserving tap/hold
         // timing for the actual delivery decision.
-        reassertBufferEnterGuardIfAllowed(client: client)
+        reassertBufferControlGuardIfAllowed(client: client)
         BufferWindowController.shared.setEnterHoldProgress(0)
         scheduleBufferEnterPoll()
         IMELog.write("buffer enter gesture began keyCode=\(hardwareKeyCode)")
@@ -2321,7 +2418,7 @@ final class RimeBufferController: IMKInputController {
         bufferEnterUsesStreamInput = false
         bufferEnterHardwareKeyCode = CGKeyCode(hardwareKeyCode)
         bufferEnterStartedAt = CFAbsoluteTimeGetCurrent()
-        reassertBufferEnterGuardIfAllowed(client: client)
+        reassertBufferControlGuardIfAllowed(client: client)
         BufferWindowController.shared.setEnterHoldProgress(nil)
         scheduleBufferEnterPoll()
     }
@@ -2329,7 +2426,7 @@ final class RimeBufferController: IMKInputController {
     /// The invisible Chromium guard is never legal in a secure field. This is
     /// checked at the action boundary instead of relying on the workbench's
     /// periodic privacy refresh, which can lag an OS secure-input transition.
-    private func reassertBufferEnterGuardIfAllowed(client: IMKTextInput) {
+    private func reassertBufferControlGuardIfAllowed(client: IMKTextInput) {
         guard BufferEnterSecureInputRules.disposition(
             secureInputEnabled: IsSecureEventInputEnabled()
         ) == .normal else { return }
@@ -2705,6 +2802,7 @@ final class RimeBufferController: IMKInputController {
         }
 
         guard !IsSecureEventInputEnabled(),
+              shouldUseBufferCommands(client: client),
               currentLease(matching: client) === lease,
               InputFocusCoordinator.shared.interactionTarget(
                 expected: lease.token
@@ -2715,6 +2813,30 @@ final class RimeBufferController: IMKInputController {
                 StreamInputWorkspace.shared.authorityRejected()
             }
             IMELog.write("buffer clipboard shortcut rejected after composition settlement")
+            return true
+        }
+
+        // Chromium/Electron can silently end the lease's idle marked-text
+        // session, then observe an owned A/V key around IMK's handled result.
+        // Reinstall the guard for every exact shortcut, after real preedit has
+        // settled but before source mutation or any pasteboard access.
+        reassertBufferControlGuardIfAllowed(client: client)
+
+        // setMarkedText may synchronously re-enter the host and move focus or
+        // enable secure input. The shortcut remains consumed, but it cannot
+        // inspect the clipboard or edit source unless the same lease survived.
+        guard !IsSecureEventInputEnabled(),
+              shouldUseBufferCommands(client: client),
+              currentLease(matching: client) === lease,
+              InputFocusCoordinator.shared.interactionTarget(
+                expected: lease.token
+              ) === lease,
+              focusToken == lease.token else {
+            BufferModel.shared.clearAllContentSelection()
+            if streamInputModeSelected {
+                StreamInputWorkspace.shared.authorityRejected()
+            }
+            IMELog.write("buffer clipboard shortcut rejected after guard reassertion")
             return true
         }
 
@@ -2738,6 +2860,7 @@ final class RimeBufferController: IMKInputController {
                 return true
             }
             guard !IsSecureEventInputEnabled(),
+                  shouldUseBufferCommands(client: client),
                   currentLease(matching: client) === lease,
                   InputFocusCoordinator.shared.interactionTarget(
                     expected: lease.token

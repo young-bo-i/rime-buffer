@@ -9,8 +9,9 @@ enum HostMarkedTextPresentation: Equatable {
 
 /// Host marked-text policy is deliberately separate from buffer delivery and
 /// from Rime's semantic composition state. Chromium-based editors can observe
-/// Return before/around IMK's handled result; an idle marked session is what
-/// tells those editors that the input method still owns the key.
+/// Return or an owned clipboard shortcut before/around IMK's handled result;
+/// an idle marked session is what tells those editors that the input method
+/// still owns the key.
 enum HostMarkedTextPresentationRules {
     static func presentation(bufferControlsActive: Bool,
                              capturesRimeCommits: Bool,
@@ -111,10 +112,10 @@ final class CompositionSession {
         composing = rimeComposing
     }
 
-    /// Reassert the invisible session for the current Return keyDown. Some web
-    /// editors can end marked text without an observable focus transition,
-    /// leaving our local guard latch stale. A targeted refresh here makes the
-    /// same keyDown an explicit IME transaction before its block is inserted.
+    /// Reassert the invisible session for the current owned control keyDown.
+    /// Some web editors can end marked text without an observable focus
+    /// transition, leaving our local guard latch stale. A targeted refresh
+    /// makes the same keyDown an explicit IME transaction before its action.
     func reassertBufferGuard(rimeComposing: Bool, client: IMKTextInput) {
         installBufferGuard(client: client)
         composing = rimeComposing
