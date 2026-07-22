@@ -8,6 +8,14 @@ struct ForegroundApplicationIdentity: Equatable {
     let processIdentifier: pid_t
 }
 
+/// One uninterrupted direct-text capture lease. Runtime callers bind it to
+/// the exact IMK focus token; the testing case keeps BufferModel smoke tests
+/// deterministic without manufacturing focus-coordinator state.
+enum DirectInputRunOwner: Hashable {
+    case focus(FocusToken)
+    case testing(Int)
+}
+
 enum BufferPrivacyTransitionRules {
     static func externalIdentity(bundleID: String?,
                                  processIdentifier: pid_t,
@@ -211,6 +219,13 @@ final class BufferModel {
     private(set) var transientLoadingActive = false
     private(set) var lastMutationReason: MutationReason = .ordinary
     private(set) var changeCount = 0
+    private struct DirectInputRun {
+        let owner: DirectInputRunOwner
+        var blockIDs: [UUID]
+
+        var tailID: UUID? { blockIDs.last }
+    }
+    private var directInputRun: DirectInputRun?
 
     var stagedText: String { blocks.map(\.text).joined() }
     var stagedCharacterCount: Int { stagedText.count }
@@ -244,6 +259,7 @@ final class BufferModel {
         get { UserDefaults.standard.bool(forKey: "bufferEnabled") }
         set {
             UserDefaults.standard.set(newValue, forKey: "bufferEnabled")
+            if !newValue { directInputRun = nil }
             if !newValue, !blocks.isEmpty {
                 IMELog.write("buffer mode off; preserving \(blocks.count) queued blocks")
             }
@@ -279,10 +295,31 @@ final class BufferModel {
         append(text, origin: origin, pluginMetadata: pluginMetadata)
     }
 
+    /// Host-side normalization for plugin results that arrive as one coarse
+    /// logical block. Every child retains the same origin and delivery
+    /// authority; segmentation never launders plugin provenance.
+    func stageExternalSemantic(_ text: String,
+                               origin: Origin,
+                               pluginMetadata: PluginMetadata? = nil) {
+        transientEnabled = true
+        let fragments = SemanticBlockSegmenter.refine(
+            [SemanticLogicalBlock(sourceIndex: 0,
+                                  text: text,
+                                  title: pluginMetadata?.title)],
+            maximumSegments: SemanticBlockSegmenter.maximumWorkbenchSegments
+        )
+        for fragment in fragments {
+            append(fragment.text,
+                   origin: origin,
+                   pluginMetadata: pluginMetadata)
+        }
+    }
+
     func append(_ text: String,
                 origin: Origin = .rime,
                 pluginMetadata: PluginMetadata? = nil) {
         guard !text.isEmpty else { return }
+        directInputRun = nil
         let index = clampedInsertionIndex()
         blocks.insert(Block(text: text,
                             origin: origin,
@@ -291,6 +328,101 @@ final class BufferModel {
         insertionIndex = index + 1
         IMELog.write("buffer insert block at \(index) origin=\(origin.tag) count=\(blocks.count)")
         notifyChange()
+    }
+
+    /// Append one or more printable characters from an ASCII/direct input
+    /// event. The open tail keeps its UUID while it grows; when the shared
+    /// segmenter closes a short phrase, a new tail block is created. This gives
+    /// English immediate workbench visibility without producing one block per
+    /// physical key.
+    @discardableResult
+    func appendDirectInputFragment(_ text: String,
+                                   owner: DirectInputRunOwner) -> UUID? {
+        guard !text.isEmpty else { return nil }
+        let existingIndex: Int?
+        if let run = directInputRun,
+           run.owner == owner,
+           let tailID = run.tailID,
+           let index = blocks.firstIndex(where: { $0.id == tailID }),
+           index == insertionIndex - 1,
+           blocks[index].origin == .rime,
+           blocks[index].pluginMetadata == nil {
+            existingIndex = index
+        } else {
+            directInputRun = nil
+            existingIndex = nil
+        }
+
+        let prefix = existingIndex.map { blocks[$0].text } ?? ""
+        let segments = SemanticBlockSegmenter.segments(from: prefix + text)
+        guard !segments.isEmpty else { return nil }
+
+        var runIDs = existingIndex == nil ? [] : (directInputRun?.blockIDs ?? [])
+        var tailID: UUID
+        if let existingIndex {
+            blocks[existingIndex].text = segments[0]
+            tailID = blocks[existingIndex].id
+            var insertion = existingIndex + 1
+            for segment in segments.dropFirst() {
+                let block = Block(text: segment)
+                tailID = block.id
+                runIDs.append(block.id)
+                blocks.insert(block, at: insertion)
+                insertion += 1
+            }
+            insertionIndex = insertion
+        } else {
+            var insertion = clampedInsertionIndex()
+            tailID = UUID()
+            for segment in segments {
+                let block = Block(text: segment)
+                tailID = block.id
+                runIDs.append(block.id)
+                blocks.insert(block, at: insertion)
+                insertion += 1
+            }
+            insertionIndex = insertion
+        }
+        directInputRun = DirectInputRun(owner: owner, blockIDs: runIDs)
+        IMELog.write("buffer direct input fragments=\(segments.count) blocks=\(blocks.count)")
+        notifyChange()
+        return tailID
+    }
+
+    /// Character-level editing is reserved for the still-open direct tail.
+    /// Completed Rime/plugin blocks retain the workbench's block-level delete
+    /// semantics.
+    @discardableResult
+    func deleteBackwardInDirectInput(owner: DirectInputRunOwner) -> Bool {
+        guard var run = directInputRun,
+              run.owner == owner,
+              let tailID = run.tailID,
+              let index = blocks.firstIndex(where: { $0.id == tailID }),
+              index == insertionIndex - 1,
+              blocks[index].origin == .rime,
+              blocks[index].pluginMetadata == nil else {
+            directInputRun = nil
+            return false
+        }
+        if blocks[index].text.count > 1 {
+            blocks[index].text.removeLast()
+            IMELog.write("buffer direct input delete block=\(tailID)")
+            notifyChange(reason: .blockRemoval)
+            return true
+        }
+        blocks.remove(at: index)
+        insertionIndex = index
+        run.blockIDs.removeLast()
+        directInputRun = run.blockIDs.isEmpty ? nil : run
+        settleTransientIfIdle()
+        IMELog.write("buffer direct input delete removed block=\(tailID)")
+        notifyChange(reason: .blockRemoval)
+        return true
+    }
+
+    func finishDirectInputRun(owner: DirectInputRunOwner? = nil) {
+        guard owner == nil || directInputRun?.owner == owner else { return }
+        directInputRun = nil
     }
 
     func beginTransientLoading(requestId: String, message: String) {
@@ -320,8 +452,14 @@ final class BufferModel {
             loadingMessage = nil
             transientLoadingActive = false
         }
-        append(text, origin: .marine)
-        IMELog.write("buffer marine draft loaded request=\(requestId) chars=\(text.count)")
+        let fragments = SemanticBlockSegmenter.refine(
+            [SemanticLogicalBlock(sourceIndex: 0, text: text, title: nil)],
+            maximumSegments: SemanticBlockSegmenter.maximumWorkbenchSegments
+        )
+        for fragment in fragments {
+            append(fragment.text, origin: .marine)
+        }
+        IMELog.write("buffer marine draft loaded request=\(requestId) chars=\(text.count) blocks=\(fragments.count)")
     }
 
     func failTransientLoading(requestId: String, message: String) {
@@ -354,6 +492,7 @@ final class BufferModel {
         loadingRequestId = nil
         loadingMessage = nil
         transientLoadingActive = false
+        directInputRun = nil
         IMELog.write("buffer capture paused; preserved blocks=\(blocks.count), cleared transient state")
         notifyChange(reason: .pause)
     }
@@ -361,6 +500,7 @@ final class BufferModel {
     @discardableResult
     func removeLastBlock() -> Bool {
         guard let removed = blocks.popLast() else { return false }
+        if directInputRun?.blockIDs.contains(removed.id) == true { directInputRun = nil }
         clampInsertionIndexInPlace()
         IMELog.write("buffer remove last block \(IMELog.redact(removed.text)) remaining=\(blocks.count)")
         settleTransientIfIdle()
@@ -373,6 +513,7 @@ final class BufferModel {
     @discardableResult
     func removeLastCharacter() -> Bool {
         guard let index = blocks.indices.last else { return false }
+        directInputRun = nil
         if blocks[index].text.count <= 1 {
             return removeBlock(id: blocks[index].id)
         }
@@ -386,6 +527,7 @@ final class BufferModel {
     func removeBlock(id: UUID) -> Bool {
         guard let index = blocks.firstIndex(where: { $0.id == id }) else { return false }
         let removed = blocks.remove(at: index)
+        if directInputRun?.blockIDs.contains(removed.id) == true { directInputRun = nil }
         if insertionIndex > index { insertionIndex -= 1 }
         clampInsertionIndexInPlace()
         settleTransientIfIdle()
@@ -433,6 +575,7 @@ final class BufferModel {
                   blocks[existingIndex].origin == update.origin else { return false }
         }
 
+        directInputRun = nil
         for update in updates.sorted(by: { $0.index < $1.index }) {
             if let existingIndex = blocks.firstIndex(where: { $0.id == update.id }) {
                 blocks[existingIndex].text = update.text
@@ -512,6 +655,7 @@ final class BufferModel {
                   blocks[existingIndex].origin == final.origin else { return false }
         }
 
+        directInputRun = nil
         let finalIDs = Set(finalBlocks.map(\.id))
         removeBlocksWithoutNotification(ids: partialBlockIDs.subtracting(finalIDs),
                                         requestId: requestId,
@@ -552,6 +696,10 @@ final class BufferModel {
                                         requestId: requestId,
                                         requireIncomplete: true)
         guard blocks.count != before else { return }
+        if let run = directInputRun,
+           !run.blockIDs.allSatisfy({ id in blocks.contains(where: { $0.id == id }) }) {
+            directInputRun = nil
+        }
         settleTransientIfIdle()
         IMELog.write("buffer plugin stream removed request=\(requestId) blocks=\(before - blocks.count)")
         notifyChange(reason: .pluginStreamCancellation)
@@ -571,6 +719,7 @@ final class BufferModel {
 
     @discardableResult
     func moveInsertionPoint(delta: Int) -> Bool {
+        directInputRun = nil
         let old = clampedInsertionIndex()
         let next = min(max(old + delta, 0), blocks.count)
         insertionIndex = next
@@ -597,6 +746,10 @@ final class BufferModel {
             if index < insertionIndex { count += 1 }
         }
         blocks.removeAll { ids.contains($0.id) && $0.pluginMetadata?.incomplete != true }
+        if let run = directInputRun,
+           !run.blockIDs.allSatisfy({ id in blocks.contains(where: { $0.id == id }) }) {
+            directInputRun = nil
+        }
         insertionIndex -= removedBeforeInsertion
         clampInsertionIndexInPlace()
         settleTransientIfIdle()
@@ -613,6 +766,7 @@ final class BufferModel {
         loadingMessage = nil
         transientLoadingActive = false
         transientEnabled = false
+        directInputRun = nil
         IMELog.write("buffer privacy discard blocks=\(blockCount)")
         notifyChange(reason: .privacyDiscard)
     }

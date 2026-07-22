@@ -74,7 +74,9 @@ enum AITextRuntimeLimits {
     /// Providers may return at most this many schema-level blocks. Rime then
     /// refines them into shorter, independently visible units for the rail.
     static let maximumModelBlockCount = 20
-    static let maximumBlockCount = 20
+    /// Host-created delivery segments use a roomier budget than schema-level
+    /// blocks so forced refinement does not collapse back into one giant tail.
+    static let maximumBlockCount = SemanticBlockSegmenter.maximumWorkbenchSegments
     static let maximumBlockBytes = 20_000
     static let maximumTitleBytes = 200
     static let defaultTimeout: TimeInterval = 120
@@ -278,12 +280,12 @@ enum AITextResultDecoder {
             guard logicalBlocks.count <= AITextRuntimeLimits.maximumModelBlockCount else {
                 throw AITextProviderError.invalidResult
             }
-            return try validate(AITextFineBlockSegmenter.refine(logicalBlocks))
+            return try validateLogicalBlocks(logicalBlocks)
         }
         if candidate.hasPrefix("{") || candidate.hasPrefix("[") {
             throw AITextProviderError.invalidResult
         }
-        return try validate(progressiveBlocks(from: candidate))
+        return try validateLogicalBlocks(progressiveBlocks(from: candidate))
     }
 
     /// Decodes the consciousness-stream contract without applying semantic
@@ -318,7 +320,9 @@ enum AITextResultDecoder {
     ) throws -> [AITextProviderBlock] {
         guard maximumCount > 0,
               !blocks.isEmpty,
-              blocks.count <= maximumCount else {
+              blocks.count <= maximumCount,
+              blocks.reduce(0, { $0 + $1.text.utf8.count })
+                <= AITextRuntimeLimits.maximumWireBytes else {
             throw AITextProviderError.invalidResult
         }
         var seenIndices = Set<Int>()
@@ -332,7 +336,7 @@ enum AITextResultDecoder {
             }
             let text = block.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { throw AITextProviderError.invalidResult }
-            guard text.utf8.count <= AITextRuntimeLimits.maximumBlockBytes else {
+            guard text.utf8.count <= AITextRuntimeLimits.maximumWireBytes else {
                 throw AITextProviderError.resultTooLarge
             }
             guard seenTexts.insert(text).inserted else { continue }
@@ -358,18 +362,17 @@ enum AITextResultDecoder {
         }
         let text = block.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { throw AITextProviderError.invalidResult }
-        guard text.utf8.count <= AITextRuntimeLimits.maximumBlockBytes else {
+        guard text.utf8.count <= AITextRuntimeLimits.maximumWireBytes else {
             throw AITextProviderError.resultTooLarge
         }
         return AITextProviderBlock(index: block.index, text: text, title: nil)
     }
 
-    /// Plain-text fallback uses the same fine, prefix-stable boundaries as
-    /// structured output, so streaming and terminal snapshots reconcile.
+    /// Provider output stays at the schema/logical-block layer. The owning
+    /// workspace performs delivery segmentation while retaining the original
+    /// provider index as part of each child's stable identity.
     static func progressiveBlocks(from text: String) -> [AITextProviderBlock] {
-        AITextFineBlockSegmenter.refine([
-            AITextProviderBlock(index: 0, text: text, title: nil),
-        ])
+        [AITextProviderBlock(index: 0, text: text, title: nil)]
     }
 
     static func validate(_ blocks: [AITextProviderBlock]) throws -> [AITextProviderBlock] {
@@ -404,6 +407,42 @@ enum AITextResultDecoder {
         return result
     }
 
+    /// Provider/workspace boundary validation before host segmentation. A
+    /// plain-text fallback can legitimately be larger than one delivery block;
+    /// retain it as one logical source block (up to the wire cap), then let the
+    /// workspace split and re-run strict delivery-block validation.
+    static func validateLogicalBlocks(
+        _ blocks: [AITextProviderBlock]
+    ) throws -> [AITextProviderBlock] {
+        guard !blocks.isEmpty,
+              blocks.count <= AITextRuntimeLimits.maximumModelBlockCount,
+              blocks.reduce(0, { $0 + $1.text.utf8.count })
+                <= AITextRuntimeLimits.maximumWireBytes else {
+            throw AITextProviderError.resultTooLarge
+        }
+        var seen = Set<Int>()
+        var result: [AITextProviderBlock] = []
+        for block in blocks.sorted(by: { $0.index < $1.index }) {
+            guard block.index >= 0,
+                  block.index < AITextRuntimeLimits.maximumModelBlockCount,
+                  seen.insert(block.index).inserted,
+                  !block.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw AITextProviderError.invalidResult
+            }
+            let title = block.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let title,
+               title.utf8.count > AITextRuntimeLimits.maximumTitleBytes {
+                throw AITextProviderError.resultTooLarge
+            }
+            result.append(AITextProviderBlock(
+                index: block.index,
+                text: block.text,
+                title: title?.isEmpty == true ? nil : title
+            ))
+        }
+        return result
+    }
+
     private static func stripJSONFence(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.hasPrefix("```"), trimmed.hasSuffix("```") else { return trimmed }
@@ -415,10 +454,9 @@ enum AITextResultDecoder {
     }
 }
 
-/// Deterministic semantic segmentation shared by live snapshots and final
-/// validation. Completed prefixes never move as more text arrives; only the
-/// last unit grows. Punctuation, list lines and a modest hard length keep the
-/// workbench chips useful even when a model returns one large schema block.
+/// AI normalization adapter over the shared workbench segmenter. Below the
+/// bounded overflow budget, completed prefixes stay stable while only the live
+/// tail grows; oversized results use balanced, key-anchored compaction.
 enum AITextFineBlockSegmenter {
     private static let boundaryCharacters = Set<Character>(
         ["。", "！", "？", "!", "?", "；", ";", "，", ",", "：", ":"]
@@ -436,41 +474,30 @@ enum AITextFineBlockSegmenter {
     private static let preferredCharacterLimit = 80
 
     static func refine(_ logicalBlocks: [AITextProviderBlock]) -> [AITextProviderBlock] {
-        var units: [(text: String, title: String?)] = []
-        for block in logicalBlocks.sorted(by: { $0.index < $1.index }) {
-            let normalized = block.text
-                .replacingOccurrences(of: "\r\n", with: "\n")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !normalized.isEmpty else { continue }
-            let parts = split(normalized)
-            for (partIndex, part) in parts.enumerated() where !part.isEmpty {
-                units.append((part, partIndex == 0 ? block.title : nil))
-            }
+        SemanticBlockSegmenter.refine(
+            normalizedLogicalBlocks(logicalBlocks),
+            maximumSegments: AITextRuntimeLimits.maximumBlockCount
+        ).enumerated().map { index, fragment in
+            AITextProviderBlock(index: index,
+                                text: fragment.text,
+                                title: fragment.title)
         }
+    }
 
-        guard units.count > AITextRuntimeLimits.maximumBlockCount else {
-            return units.enumerated().map { index, unit in
-                AITextProviderBlock(index: index, text: unit.text, title: unit.title)
-            }
-        }
-        let prefixCount = AITextRuntimeLimits.maximumBlockCount - 1
-        let prefix = Array(units.prefix(prefixCount))
-        let tail = units.dropFirst(prefixCount).map(\.text).joined()
-        let prefixStable = prefix + [(tail, units[prefixCount].title)]
-        let selected: [(text: String, title: String?)]
-        if prefixStable.allSatisfy({
-            $0.text.utf8.count <= AITextRuntimeLimits.maximumBlockBytes
-        }) {
-            selected = prefixStable
-        } else {
-            // Extremely long responses can make the prefix-stable twentieth
-            // tail exceed the protocol budget even though the full response
-            // still fits in 20 legal blocks. Repack only in that exceptional
-            // case; ordinary streaming keeps its completed prefixes stable.
-            selected = compactToBlockBudget(units) ?? prefixStable
-        }
-        return selected.enumerated().map { index, unit in
-            AITextProviderBlock(index: index, text: unit.text, title: unit.title)
+    /// AI provider text historically normalizes envelope padding and CRLF.
+    /// Keep that adapter policy here; the shared workbench segmenter itself
+    /// must preserve exact Action/Marine/translation text.
+    static func normalizedLogicalBlocks(
+        _ blocks: [AITextProviderBlock]
+    ) -> [SemanticLogicalBlock] {
+        blocks.map {
+            SemanticLogicalBlock(
+                sourceIndex: $0.index,
+                text: $0.text
+                    .replacingOccurrences(of: "\r\n", with: "\n")
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                title: $0.title
+            )
         }
     }
 
@@ -1957,15 +1984,13 @@ enum AITextProviderStreamingOutput {
             if let complete = try? AITextResultDecoder.decodeFinalText(trimmed) {
                 return complete
             }
-            return AITextFineBlockSegmenter.refine(
-                AITextPartialJSONBlocks.decode(trimmed)
-            ).filter {
+            return AITextPartialJSONBlocks.decode(trimmed).filter {
                 !$0.text.isEmpty
-                    && $0.text.utf8.count <= AITextRuntimeLimits.maximumBlockBytes
+                    && $0.text.utf8.count <= AITextRuntimeLimits.maximumWireBytes
             }
         }
         return AITextResultDecoder.progressiveBlocks(from: snapshot).filter {
-            !$0.text.isEmpty && $0.text.utf8.count <= AITextRuntimeLimits.maximumBlockBytes
+            !$0.text.isEmpty && $0.text.utf8.count <= AITextRuntimeLimits.maximumWireBytes
         }
     }
 
@@ -2013,7 +2038,7 @@ enum AITextPartialJSONBlocks {
             let raw = Array(bytes[valueStart..<rawEnd])
             if let text = decodePossiblyIncompleteJSONString(raw),
                !text.isEmpty,
-               text.utf8.count <= AITextRuntimeLimits.maximumBlockBytes {
+               text.utf8.count <= AITextRuntimeLimits.maximumWireBytes {
                 blocks.append(AITextProviderBlock(index: blocks.count,
                                                   text: text,
                                                   title: nil))
@@ -3440,7 +3465,8 @@ final class AITextPluginWorkspace: BufferDeliveryContentSource {
     private var activityTimer: Timer?
     private var activityStartedAt: TimeInterval?
     private var activityMessage: String?
-    private var stableIDs: [Int: UUID] = [:]
+    private var stableIDs: [SemanticBlockKey: UUID] = [:]
+    private var streamingLogicalBlocks: [Int: AITextProviderBlock] = [:]
     private var capturedSourceText = ""
     private var capturedSourceBlockIDs: [UUID] = []
     private var outputAllowsRemoteMirror = true
@@ -3638,6 +3664,7 @@ final class AITextPluginWorkspace: BufferDeliveryContentSource {
         capturedSourceBlockIDs = job.sourceBlockIDs
         outputAllowsRemoteMirror = blocks.allSatisfy { $0.origin.allowsRemoteMirror }
         stableIDs.removeAll()
+        streamingLogicalBlocks.removeAll()
         outputBlocks.removeAll()
         phase = .running
         activityStartedAt = ProcessInfo.processInfo.systemUptime
@@ -3687,21 +3714,19 @@ final class AITextPluginWorkspace: BufferDeliveryContentSource {
             activityMessage = message
             notifyChange()
         case let .blockSnapshot(block):
-            guard let validated = try? AITextResultDecoder.validate([block]).first else { return }
-            let id = stableIDs[validated.index] ?? UUID()
-            stableIDs[validated.index] = id
-            let snapshot = AITextWorkspaceOutputBlock(id: id,
-                                                      index: validated.index,
-                                                      text: validated.text,
-                                                      title: validated.title,
-                                                      incomplete: true)
-            if let existing = outputBlocks.firstIndex(where: { $0.index == validated.index }) {
-                guard outputBlocks[existing] != snapshot else { return }
-                outputBlocks[existing] = snapshot
-            } else {
-                outputBlocks.append(snapshot)
-                outputBlocks.sort { $0.index < $1.index }
+            guard block.index >= 0,
+                  block.index < AITextRuntimeLimits.maximumModelBlockCount,
+                  let validated = try? AITextResultDecoder
+                    .validateLogicalBlocks([block]).first else {
+                return
             }
+            streamingLogicalBlocks[validated.index] = validated
+            guard let fragments = try? refinedFragments(
+                Array(streamingLogicalBlocks.values)
+            ) else { return }
+            let snapshots = makeOutputBlocks(fragments, incomplete: true)
+            guard outputBlocks != snapshots else { return }
+            outputBlocks = snapshots
             activityMessage = "\(kind.displayName) 正在流式返回"
             notifyChange()
         }
@@ -3717,6 +3742,7 @@ final class AITextPluginWorkspace: BufferDeliveryContentSource {
         case let .failure(error):
             outputBlocks.removeAll()
             stableIDs.removeAll()
+            streamingLogicalBlocks.removeAll()
             if error == .cancelled {
                 phase = .idle
             } else {
@@ -3724,24 +3750,19 @@ final class AITextPluginWorkspace: BufferDeliveryContentSource {
             }
         case let .success(blocks):
             do {
-                let validated = try AITextResultDecoder.validate(blocks)
-                outputBlocks = validated.map { block in
-                    let id = stableIDs[block.index] ?? UUID()
-                    stableIDs[block.index] = id
-                    return AITextWorkspaceOutputBlock(id: id,
-                                                      index: block.index,
-                                                      text: block.text,
-                                                      title: block.title,
-                                                      incomplete: false)
-                }
+                let fragments = try refinedFragments(blocks)
+                outputBlocks = makeOutputBlocks(fragments, incomplete: false)
+                streamingLogicalBlocks.removeAll()
                 phase = .ready
             } catch let error as AITextProviderError {
                 outputBlocks.removeAll()
                 stableIDs.removeAll()
+                streamingLogicalBlocks.removeAll()
                 phase = .failed(error.userFacingMessage)
             } catch {
                 outputBlocks.removeAll()
                 stableIDs.removeAll()
+                streamingLogicalBlocks.removeAll()
                 phase = .failed(AITextProviderError.invalidResult.userFacingMessage)
             }
         }
@@ -3766,6 +3787,44 @@ final class AITextPluginWorkspace: BufferDeliveryContentSource {
             }
         }
         notifyChange()
+    }
+
+    private func refinedFragments(_ blocks: [AITextProviderBlock]) throws
+        -> [SemanticBlockFragment] {
+        guard !blocks.isEmpty,
+              blocks.count <= AITextRuntimeLimits.maximumModelBlockCount,
+              blocks.allSatisfy({
+                  $0.index >= 0
+                      && $0.index < AITextRuntimeLimits.maximumModelBlockCount
+              }) else {
+            throw AITextProviderError.invalidResult
+        }
+        let logical = try AITextResultDecoder.validateLogicalBlocks(blocks)
+        let fragments = SemanticBlockSegmenter.refine(
+            AITextFineBlockSegmenter.normalizedLogicalBlocks(logical),
+            maximumSegments: AITextRuntimeLimits.maximumBlockCount
+        )
+        let delivery = fragments.enumerated().map { index, fragment in
+            AITextProviderBlock(index: index,
+                                text: fragment.text,
+                                title: fragment.title)
+        }
+        _ = try AITextResultDecoder.validate(delivery)
+        return fragments
+    }
+
+    private func makeOutputBlocks(_ fragments: [SemanticBlockFragment],
+                                  incomplete: Bool)
+        -> [AITextWorkspaceOutputBlock] {
+        fragments.enumerated().map { index, fragment in
+            let id = stableIDs[fragment.key] ?? UUID()
+            stableIDs[fragment.key] = id
+            return AITextWorkspaceOutputBlock(id: id,
+                                              index: index,
+                                              text: fragment.text,
+                                              title: fragment.title,
+                                              incomplete: incomplete)
+        }
     }
 
     private func accepts(_ job: Job) -> Bool {
@@ -3805,6 +3864,7 @@ final class AITextPluginWorkspace: BufferDeliveryContentSource {
         if clearOutput {
             outputBlocks.removeAll()
             stableIDs.removeAll()
+            streamingLogicalBlocks.removeAll()
         }
         phase = nextPhase
         notifyChange()
@@ -3932,6 +3992,7 @@ final class AITextPluginWorkspace: BufferDeliveryContentSource {
             capturedSourceText = ""
             capturedSourceBlockIDs.removeAll()
             stableIDs.removeAll()
+            streamingLogicalBlocks.removeAll()
             phase = .idle
             refreshAvailability()
             sourceModel.consumeDelivered(blockIDs: sourceIDs)

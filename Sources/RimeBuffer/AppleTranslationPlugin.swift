@@ -570,7 +570,14 @@ final class AppleTranslationWorkspace {
         }
         activeJob = nil
         detectedSourceLanguageID = sourceLanguageID
-        outputBlocks = [TranslationOutputBlock(id: UUID(), text: normalized)]
+        outputBlocks = SemanticBlockSegmenter.refine(
+            [SemanticLogicalBlock(sourceIndex: 0,
+                                  text: normalized,
+                                  title: nil)],
+            maximumSegments: SemanticBlockSegmenter.maximumWorkbenchSegments
+        ).map { fragment in
+            TranslationOutputBlock(id: UUID(), text: fragment.text)
+        }
 
         if TranslationResultGate.isCurrent(
             job: job,

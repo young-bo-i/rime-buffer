@@ -3,9 +3,7 @@
 /// These hints never decode Chinese and must never replace the complete raw
 /// value sent to the model. They only give the same global request a few
 /// compact, full-coverage readings of an otherwise unseparated `a`...`z`
-/// stream. Normalized spaces are hard short-sentence boundaries: candidates
-/// preserve them and never form a syllable across one. Unknown spans stay
-/// visible in brackets so no input is discarded.
+/// stream. Unknown spans stay visible in brackets so no input is discarded.
 ///
 /// Expected properties (not fixed golden output):
 /// - `xiufuyigewenti` strongly favors `xiu'fu'yi'ge'wen'ti`.
@@ -28,7 +26,7 @@ enum StreamInputPinyinHints {
         let segments: [Segment]
 
         /// A small prompt-friendly representation. Apostrophes are syllable
-        /// boundaries, ` | ` is a short-sentence boundary, and brackets mean
+        /// boundaries, and brackets mean
         /// "unrecognized, preserve verbatim".
         var compact: String {
             var clauses = [""]
@@ -64,9 +62,7 @@ enum StreamInputPinyinHints {
         guard limit > 0, !raw.isEmpty else { return [] }
 
         let bytes = Array(raw.utf8)
-        guard bytes.allSatisfy({
-            (0x61...0x7a).contains($0) || $0 == 0x20
-        }) else {
+        guard bytes.allSatisfy({ (0x61...0x7a).contains($0) }) else {
             return []
         }
 
@@ -82,14 +78,6 @@ enum StreamInputPinyinHints {
 
         for position in bytes.indices {
             guard !beams[position].isEmpty else { continue }
-            if bytes[position] == 0x20 {
-                for path in beams[position] {
-                    var next = path
-                    next.appendBoundary(at: position)
-                    insert(next, into: &beams[position + 1])
-                }
-                continue
-            }
             for path in beams[position] {
                 if let spellings = syllablesByFirstByte[bytes[position]] {
                     for spelling in spellings

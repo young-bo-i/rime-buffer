@@ -22,6 +22,54 @@ enum BufferControlRoutingRules {
     }
 }
 
+enum BufferUnhandledPrintableRules {
+    private static let excludedModifiers: NSEvent.ModifierFlags = [
+        .command, .control, .option, .function,
+    ]
+
+    static func capturedText(characters: String?,
+                             modifierFlags: NSEvent.ModifierFlags,
+                             bufferEnabled: Bool,
+                             exactExternalFocus: Bool,
+                             secureInputEnabled: Bool) -> String? {
+        guard bufferEnabled,
+              exactExternalFocus,
+              !secureInputEnabled,
+              isPlainASCIIPrintable(characters,
+                                    modifierFlags: modifierFlags) else { return nil }
+        return characters
+    }
+
+    /// A printable event whose focus lease was rejected cannot safely be
+    /// attached to either the old or the new field. While an external buffer
+    /// session is enabled, consume it fail-closed so it never leaks into the
+    /// host. Secure input and shortcut-modified events retain native handling.
+    static func shouldConsumeRejectedEvent(
+        characters: String?,
+        modifierFlags: NSEvent.ModifierFlags,
+        bufferEnabled: Bool,
+        externalClient: Bool,
+        secureInputEnabled: Bool
+    ) -> Bool {
+        bufferEnabled
+            && externalClient
+            && !secureInputEnabled
+            && isPlainASCIIPrintable(characters,
+                                     modifierFlags: modifierFlags)
+    }
+
+    private static func isPlainASCIIPrintable(
+        _ characters: String?,
+        modifierFlags: NSEvent.ModifierFlags
+    ) -> Bool {
+        modifierFlags.intersection(excludedModifiers).isEmpty
+            && characters?.isEmpty == false
+            && characters?.unicodeScalars.allSatisfy({
+                (0x20...0x7e).contains($0.value)
+            }) == true
+    }
+}
+
 enum BufferEnterSecureInputDisposition: Equatable {
     case normal
     case consumeWithoutGuardOrGeneration
@@ -237,15 +285,14 @@ final class RimeBufferController: IMKInputController {
     }
 
     /// Consciousness-stream capture is intentionally stricter than ordinary
-    /// buffer commands: persistent capture must be enabled, the exact external
-    /// client must still own the lease, and only 全拼 · 串击 is supported.
+    /// buffer commands: persistent capture must be enabled and the exact
+    /// external client must still own the lease. It consumes physical a-z as
+    /// full-pinyin data without changing or depending on the active schema.
     private var streamInputModeSelected: Bool {
         BufferModel.shared.enabled
             && BufferPluginSelectionStore.shared.isSelected(
                 StreamInputWorkspace.pluginKey
             )
-            && InputConfigurationStore.shared.configuration
-                == StreamInputCaptureRules.requiredConfiguration
     }
 
     private func streamInputLease(client: IMKTextInput) -> FocusLease? {
@@ -274,7 +321,6 @@ final class RimeBufferController: IMKInputController {
             pluginSelected: BufferPluginSelectionStore.shared.isSelected(
                 StreamInputWorkspace.pluginKey
             ),
-            configuration: InputConfigurationStore.shared.configuration,
             secureInput: IsSecureEventInputEnabled(),
             exactExternalFocus: exactExternalFocus
         )
@@ -346,7 +392,8 @@ final class RimeBufferController: IMKInputController {
 
     private func shouldCaptureCommit(from client: IMKTextInput,
                                      externalTarget: Bool? = nil) -> Bool {
-        (BufferModel.shared.enabled || forcedBufferCaptureDepth > 0)
+        !IsSecureEventInputEnabled()
+            && (BufferModel.shared.enabled || forcedBufferCaptureDepth > 0)
             && (externalTarget ?? !isOwnClient(client))
     }
 
@@ -1173,6 +1220,17 @@ final class RimeBufferController: IMKInputController {
                 IMELog.write("buffer control consumed without action after stale event")
                 return true
             }
+            if event.type == .keyDown || event.type == .keyUp,
+               BufferUnhandledPrintableRules.shouldConsumeRejectedEvent(
+                   characters: event.characters,
+                   modifierFlags: rejectedModifiers,
+                   bufferEnabled: BufferModel.shared.enabled,
+                   externalClient: !isOwnClient(client),
+                   secureInputEnabled: IsSecureEventInputEnabled()
+               ) {
+                IMELog.write("buffer printable consumed after stale event")
+                return true
+            }
             return false
         }
         if event.type == .keyDown,
@@ -1302,6 +1360,10 @@ final class RimeBufferController: IMKInputController {
     }
 
     private func handleKeyDown(_ event: NSEvent, client: IMKTextInput) -> Bool {
+        // Freeze the lease adopted for this physical event before any Rime/UI
+        // callback can synchronously reenter and move the same IMK proxy to a
+        // different field.
+        let eventLease = currentLease(matching: client)
         // Mark before every early return (Cmd shortcuts, stream capture,
         // buffer controls and direct shifted text). Those paths deliberately
         // do not feed this keyDown to librime, but it still means Shift was a
@@ -1407,16 +1469,22 @@ final class RimeBufferController: IMKInputController {
         // if a host reports a printable Unicode line/paragraph separator.
         if let shiftedText = shiftedDirectText(for: event) {
             if rimeEngine.start(), ensureSessionReady() {
-                return insertDirectText(shiftedText, client: client, source: "shift")
+                return insertDirectText(shiftedText,
+                                        client: client,
+                                        source: "shift",
+                                        expectedLease: eventLease)
             }
-            return insertDirectText(shiftedText, client: client, source: "shift fallback")
+            return insertDirectText(shiftedText,
+                                    client: client,
+                                    source: "shift fallback",
+                                    expectedLease: eventLease)
         }
         // Engine down → raw fallback so the user can still type latin.
         guard rimeEngine.start(), ensureSessionReady() else {
             if consumeLeakedCodexBufferControlText(event, client: client, path: "engine down") {
                 return true
             }
-            return rawFallback(event, client: client)
+            return rawFallback(event, client: client, expectedLease: eventLease)
         }
         guard let keycode = routedKeycode else {
             chord.flush()   // the app will insert this key NOW; a pending chord must land first
@@ -1459,7 +1527,47 @@ final class RimeBufferController: IMKInputController {
            consumeLeakedCodexBufferControlText(event, client: client, path: "Rime unhandled") {
             return true
         }
+        if !handled,
+           captureUnhandledPrintableIfNeeded(event,
+                                             client: client,
+                                             expectedLease: eventLease) {
+            return true
+        }
         return handled
+    }
+
+    /// In librime ASCII mode ordinary Latin keys are intentionally delegated
+    /// to the frontend. While persistent buffer capture owns the exact external
+    /// field, that frontend is the workbench rather than the host editor.
+    private func captureUnhandledPrintableIfNeeded(_ event: NSEvent,
+                                                    client: IMKTextInput,
+                                                    expectedLease: FocusLease?) -> Bool {
+        let exactExternalFocus = expectedLease.map { lease in
+            lease.controller === self
+                && lease.clientIdentity == ObjectIdentifier(client as AnyObject)
+                && lease.isExternalTarget
+                && InputFocusCoordinator.shared.interactionTarget(
+                    expected: lease.token
+                ) === lease
+        } ?? false
+        if BufferModel.shared.enabled,
+           expectedLease?.isExternalTarget == true,
+           !exactExternalFocus {
+            IMELog.write("Rime ASCII fallback consumed; adopted focus lease changed")
+            return true
+        }
+        guard let text = BufferUnhandledPrintableRules.capturedText(
+            characters: event.characters,
+            modifierFlags: event.modifierFlags
+                .intersection(.deviceIndependentFlagsMask),
+            bufferEnabled: BufferModel.shared.enabled,
+            exactExternalFocus: exactExternalFocus,
+            secureInputEnabled: IsSecureEventInputEnabled()
+        ) else { return false }
+        return insertDirectText(text,
+                                client: client,
+                                source: "Rime ASCII fallback",
+                                expectedLease: expectedLease)
     }
 
     private func handleBufferEscape(_ keycode: Int32, mask: Int32, client: IMKTextInput) -> Bool {
@@ -2335,9 +2443,16 @@ final class RimeBufferController: IMKInputController {
     }
 
     private func removeLastBufferedInput() -> Bool {
-        usesContinuousDerivedSourceRail
-            ? BufferModel.shared.removeLastCharacter()
-            : BufferModel.shared.removeLastBlock()
+        if usesContinuousDerivedSourceRail {
+            return BufferModel.shared.removeLastCharacter()
+        }
+        if let focusToken,
+           BufferModel.shared.deleteBackwardInDirectInput(
+               owner: .focus(focusToken)
+           ) {
+            return true
+        }
+        return BufferModel.shared.removeLastBlock()
     }
 
     private var usesContinuousDerivedSourceRail: Bool {
@@ -2347,7 +2462,7 @@ final class RimeBufferController: IMKInputController {
     private func shiftedDirectText(for event: NSEvent) -> String? {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         guard flags.contains(.shift),
-              flags.intersection([.control, .option, .command]).isEmpty,
+              flags.intersection([.control, .option, .command, .function]).isEmpty,
               let text = event.characters,
               !text.isEmpty,
               text.unicodeScalars.allSatisfy({ $0.value >= 0x20 && $0.value != 0x7f }) else {
@@ -2356,17 +2471,55 @@ final class RimeBufferController: IMKInputController {
         return text
     }
 
-    private func insertDirectText(_ text: String, client: IMKTextInput, source: String) -> Bool {
+    private func insertDirectText(_ text: String,
+                                  client: IMKTextInput,
+                                  source: String,
+                                  expectedLease: FocusLease? = nil) -> Bool {
+        // Secure fields keep native host handling. If secure input appears
+        // later in this transaction, fail closed instead of retaining text.
+        guard !IsSecureEventInputEnabled() else { return false }
+        let capturesInBuffer = BufferModel.shared.enabled
+            && expectedLease?.isExternalTarget == true
+        if BufferModel.shared.enabled,
+           !capturesInBuffer,
+           !isOwnClient(client) {
+            IMELog.write("\(source) text consumed; no adopted external buffer lease")
+            return true
+        }
+        if capturesInBuffer {
+            guard let expectedLease,
+                  expectedLease.controller === self,
+                  expectedLease.clientIdentity == ObjectIdentifier(client as AnyObject),
+                  InputFocusCoordinator.shared.interactionTarget(
+                    expected: expectedLease.token
+                  ) === expectedLease,
+                  focusToken == expectedLease.token else {
+                IMELog.write("\(source) text consumed; adopted buffer lease changed")
+                return true
+            }
+        }
         if rimeEngine.isHealthy, session != 0 {
             let ctx = rimeEngine.getContext(session: session)
             if chord.hasPending || composition.composing || ctx.active || !ctx.input.isEmpty || !ctx.preedit.isEmpty {
-                resolveComposition(client: client, owner: focusToken)
+                resolveComposition(client: client,
+                                   owner: expectedLease?.token ?? focusToken)
             }
         }
 
-        let capturesInBuffer = shouldCaptureCommit(from: client)
         if capturesInBuffer {
-            BufferModel.shared.append(text)
+            guard let expectedLease,
+                  !IsSecureEventInputEnabled(),
+                  InputFocusCoordinator.shared.interactionTarget(
+                    expected: expectedLease.token
+                  ) === expectedLease,
+                  focusToken == expectedLease.token else {
+                IMELog.write("\(source) text consumed; buffer lease changed before append")
+                return true
+            }
+            BufferModel.shared.appendDirectInputFragment(
+                text,
+                owner: .focus(expectedLease.token)
+            )
             clearCompositionPresentation(client: client)
             publishAuthoredCommitTelemetry(characterCount: text.count,
                                            source: .buffer,
@@ -2380,6 +2533,7 @@ final class RimeBufferController: IMKInputController {
                                                client: client)
             }
             IMELog.write("\(source) text \(IMELog.redact(text)) inserted=\(inserted) target=\(bundleId(of: client))")
+            guard inserted else { return false }
         }
         publishCompositionActive(false)
         BufferWindowController.shared.refresh()
@@ -2626,16 +2780,24 @@ final class RimeBufferController: IMKInputController {
 
     /// Engine-down path: printable keys and Return still insert (never drop a
     /// printable character); non-textual keys pass to the app.
-    private func rawFallback(_ event: NSEvent, client: IMKTextInput) -> Bool {
+    private func rawFallback(_ event: NSEvent,
+                             client: IMKTextInput,
+                             expectedLease: FocusLease?) -> Bool {
         StatusMenu.shared.setHealthy(false)
         if event.keyCode == 36 || event.keyCode == 76,
            event.modifierFlags.intersection([.command, .control]).isEmpty {
-            return insertDirectText("\n", client: client, source: "engine fallback")
+            return insertDirectText("\n",
+                                    client: client,
+                                    source: "engine fallback",
+                                    expectedLease: expectedLease)
         }
         if let chars = event.characters, !chars.isEmpty,
            event.modifierFlags.intersection([.command, .control]).isEmpty,
            chars.unicodeScalars.allSatisfy({ $0.value >= 0x20 && $0.value != 0x7f }) {
-            return insertDirectText(chars, client: client, source: "engine fallback")
+            return insertDirectText(chars,
+                                    client: client,
+                                    source: "engine fallback",
+                                    expectedLease: expectedLease)
         }
         return false
     }

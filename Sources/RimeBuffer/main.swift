@@ -236,14 +236,6 @@ let bufferPluginSelectionObserver = NotificationCenter.default.addObserver(
 ) { notification in
     if notification.userInfo?["current"] as? PluginKey
         == StreamInputWorkspace.pluginKey {
-        // Stream input has one product-level input profile. Persist and apply
-        // it in this same selection callback so there is no interval where the
-        // plugin is visible while an old schema can still receive raw letters.
-        _ = InputConfigurationStore.shared.set(
-            StreamInputCaptureRules.requiredConfiguration
-        )
-        RimeBufferController.applyStoredInputConfiguration()
-
         if BufferModel.shared.enabled,
            let target = InputFocusCoordinator.shared.liveTarget(
             forceOverlayVisibilityRefresh: true
@@ -2507,8 +2499,8 @@ private func runPreparedActionConnectorSmokeTest() -> Bool {
                             text: "越界索引",
                             title: nil),
         AITextProviderBlock(index: 0,
-                            text: String(repeating: "字",
-                                         count: ActionPluginStreamParser.maximumBlockBytes + 1),
+                            text: String(repeating: "x",
+                                         count: AITextRuntimeLimits.maximumWireBytes + 1),
                             title: nil),
         AITextProviderBlock(index: 0,
                             text: "标题越界",
@@ -2802,6 +2794,17 @@ private func runContextOnlyPreparedActionSmokeTest() -> Bool {
         print("FAILED: second context-only invocation did not start")
         return false
     }
+    let staleLargeResult = Array(repeating: "review-word", count: 2_200)
+        .joined(separator: " ")
+    guard staleLargeResult.utf8.count > InboundBus.maxTextCount else {
+        print("FAILED: large stale review fixture is too small")
+        return false
+    }
+    connector.blocks = [
+        AITextProviderBlock(index: 0,
+                            text: staleLargeResult,
+                            title: "长结果"),
+    ]
     connector.emitHeld(AITextProviderBlock(index: 0,
                                            text: "目标变化前的部分结果",
                                            title: nil))
@@ -2819,11 +2822,31 @@ private func runContextOnlyPreparedActionSmokeTest() -> Bool {
     }
     connector.complete()
     guard runMainLoopUntil({ bus.pendingCount == 1 }),
+          bus.pending[0].text == staleLargeResult,
           bus.pending[0].pluginMetadata?.stale == true,
           bus.pending[0].pluginMetadata?.focusToken == nil,
           bus.pending[0].pluginMetadata?.reviewedAsPlainText == false,
           model.blocks.isEmpty else {
         print("FAILED: context-changed result did not route to the review inbox")
+        return false
+    }
+    let staleReviewID = bus.pending[0].id
+    let reviewedModel = BufferModel.shared
+    reviewedModel.discardForPrivacy()
+    defer { reviewedModel.discardForPrivacy() }
+    bus.accept(staleReviewID)
+    guard bus.pending.isEmpty,
+          reviewedModel.stagedText == staleLargeResult,
+          reviewedModel.blocks.count > 1,
+          reviewedModel.blocks.allSatisfy({
+              $0.text.utf8.count <= ActionPluginStreamParser.maximumBlockBytes
+          }) else {
+        print("FAILED: large stale prepared result was not preserved through review",
+              bus.pendingCount,
+              reviewedModel.stagedText.count,
+              staleLargeResult.count,
+              reviewedModel.blocks.count,
+              reviewedModel.blocks.map { $0.text.utf8.count }.max() ?? 0)
         return false
     }
     return true
@@ -3756,6 +3779,115 @@ func runBufferSmokeTest() -> Bool {
         print("FAILED: buffer control-key escape gate")
         return false
     }
+    let printableFlags: NSEvent.ModifierFlags = []
+    let blockedPrintableModifiers: [NSEvent.ModifierFlags] = [
+        .command, .control, .option, .function,
+    ]
+    guard BufferUnhandledPrintableRules.capturedText(
+              characters: "a Z0 .,!?",
+              modifierFlags: printableFlags,
+              bufferEnabled: true,
+              exactExternalFocus: true,
+              secureInputEnabled: false
+          ) == "a Z0 .,!?",
+          BufferUnhandledPrintableRules.capturedText(
+              characters: "A",
+              modifierFlags: [.shift, .capsLock],
+              bufferEnabled: true,
+              exactExternalFocus: true,
+              secureInputEnabled: false
+          ) == "A",
+          BufferUnhandledPrintableRules.capturedText(
+              characters: "a",
+              modifierFlags: [],
+              bufferEnabled: false,
+              exactExternalFocus: true,
+              secureInputEnabled: false
+          ) == nil,
+          BufferUnhandledPrintableRules.capturedText(
+              characters: "a",
+              modifierFlags: [],
+              bufferEnabled: true,
+              exactExternalFocus: false,
+              secureInputEnabled: false
+          ) == nil,
+          BufferUnhandledPrintableRules.capturedText(
+              characters: "a",
+              modifierFlags: [],
+              bufferEnabled: true,
+              exactExternalFocus: true,
+              secureInputEnabled: true
+          ) == nil,
+          BufferUnhandledPrintableRules.capturedText(
+              characters: "a",
+              modifierFlags: [.command],
+              bufferEnabled: true,
+              exactExternalFocus: true,
+              secureInputEnabled: false
+          ) == nil,
+          blockedPrintableModifiers.allSatisfy({ flags in
+              BufferUnhandledPrintableRules.capturedText(
+                  characters: "a",
+                  modifierFlags: flags,
+                  bufferEnabled: true,
+                  exactExternalFocus: true,
+                  secureInputEnabled: false
+              ) == nil
+          }),
+          BufferUnhandledPrintableRules.capturedText(
+              characters: "é",
+              modifierFlags: [],
+              bufferEnabled: true,
+              exactExternalFocus: true,
+              secureInputEnabled: false
+          ) == nil,
+          BufferUnhandledPrintableRules.capturedText(
+              characters: "\t",
+              modifierFlags: [],
+              bufferEnabled: true,
+              exactExternalFocus: true,
+              secureInputEnabled: false
+          ) == nil,
+          BufferUnhandledPrintableRules.shouldConsumeRejectedEvent(
+              characters: "a Z0 .,! ?",
+              modifierFlags: [.shift, .capsLock],
+              bufferEnabled: true,
+              externalClient: true,
+              secureInputEnabled: false
+          ),
+          !BufferUnhandledPrintableRules.shouldConsumeRejectedEvent(
+              characters: "a",
+              modifierFlags: [],
+              bufferEnabled: false,
+              externalClient: true,
+              secureInputEnabled: false
+          ),
+          !BufferUnhandledPrintableRules.shouldConsumeRejectedEvent(
+              characters: "a",
+              modifierFlags: [],
+              bufferEnabled: true,
+              externalClient: false,
+              secureInputEnabled: false
+          ),
+          !BufferUnhandledPrintableRules.shouldConsumeRejectedEvent(
+              characters: "a",
+              modifierFlags: [],
+              bufferEnabled: true,
+              externalClient: true,
+              secureInputEnabled: true
+          ),
+          blockedPrintableModifiers.allSatisfy({ flags in
+              !BufferUnhandledPrintableRules.shouldConsumeRejectedEvent(
+                  characters: "a",
+                  modifierFlags: flags,
+                  bufferEnabled: true,
+                  externalClient: true,
+                  secureInputEnabled: false
+              )
+          }) else {
+        print("FAILED: unhandled printable buffer capture gate")
+        return false
+    }
     let model = BufferModel.shared
     let oldEnabled = model.enabled
     let oldOnChange = model.onChange
@@ -3769,6 +3901,60 @@ func runBufferSmokeTest() -> Bool {
     model.enabled = true
     model.discardForPrivacy()
 
+    let directOwner = DirectInputRunOwner.testing(1)
+    let directText = "Hello world, this is a phrase and more."
+    var firstDirectID: UUID?
+    for character in directText {
+        let id = model.appendDirectInputFragment(String(character), owner: directOwner)
+        if firstDirectID == nil { firstDirectID = id }
+    }
+    guard model.stagedText == directText,
+          model.blocks.map(\.text) == [
+              "Hello world, ",
+              "this is a phrase ",
+              "and more.",
+          ],
+          model.blocks.first?.id == firstDirectID else {
+        print("FAILED: direct English phrase capture", model.blocks.map(\.text))
+        return false
+    }
+    let tailID = model.blocks.last?.id
+    guard model.deleteBackwardInDirectInput(owner: directOwner),
+          model.stagedText == String(directText.dropLast()),
+          model.blocks.last?.id == tailID else {
+        print("FAILED: direct English character backspace")
+        return false
+    }
+    let remainingTailCount = model.blocks.last?.text.count ?? 0
+    for _ in 0..<remainingTailCount {
+        guard model.deleteBackwardInDirectInput(owner: directOwner) else {
+            print("FAILED: direct input tail removal")
+            return false
+        }
+    }
+    let previousTail = model.blocks.last?.text ?? ""
+    guard !previousTail.isEmpty,
+          model.deleteBackwardInDirectInput(owner: directOwner),
+          model.blocks.last?.text == String(previousTail.dropLast()) else {
+        print("FAILED: direct input character backspace across block boundary")
+        return false
+    }
+    _ = model.appendDirectInputFragment("!", owner: directOwner)
+    let countBeforeFocusChange = model.blocks.count
+    _ = model.appendDirectInputFragment("X", owner: .testing(2))
+    guard model.blocks.count == countBeforeFocusChange + 1,
+          model.blocks.last?.text == "X" else {
+        print("FAILED: direct input focus boundary")
+        return false
+    }
+    model.append("中")
+    _ = model.appendDirectInputFragment("Y", owner: .testing(2))
+    guard model.blocks.suffix(2).map(\.text) == ["中", "Y"] else {
+        print("FAILED: Rime commit must end direct input run")
+        return false
+    }
+    model.discardForPrivacy()
+
     // Accepted delivery attempts disappear from the live workbench without
     // retaining a plaintext delivery history.
     model.append("你")
@@ -3780,7 +3966,10 @@ func runBufferSmokeTest() -> Bool {
           model.pendingDeliveryBlocks.map(\.id) == [secondID],
           model.insertionIndex == 1,
           model.enabled else {
-        print("FAILED: accepted delivery must consume only the accepted block")
+        print("FAILED: accepted delivery must consume only the accepted block",
+              model.blocks.map(\.text),
+              model.insertionIndex,
+              model.enabled)
         return false
     }
     model.consumeDelivered(blockIDs: [secondID])

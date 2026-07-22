@@ -1068,6 +1068,23 @@ private func runActionPluginStreamHostSmokeTest() -> Bool {
         )
     }
 
+    let coarseStreamText = "This streamed answer contains one useful phrase and then another useful phrase."
+    first.onEvent(.block(.init(
+        identity: identity,
+        sequence: 131,
+        index: 0,
+        text: coarseStreamText,
+        title: "回复"
+    )))
+    guard streamSmokeRunLoopUntil(timeout: 1, {
+        model.blocks.count > 1
+            && model.blocks.map(\.text).joined() == coarseStreamText
+    }), model.blocks.first?.id == provisionalID,
+       model.blocks.allSatisfy({ $0.pluginMetadata?.incomplete == true }),
+       model.pendingDeliveryBlocks.isEmpty else {
+        return streamSmokeFail("coarse SSE block was not force-segmented with stable prefix ID")
+    }
+
     let beforeFinalChange = model.changeCount
     let response = ActionPluginInvokeResponse(
         requestId: first.payload.requestId,
@@ -1383,8 +1400,8 @@ private func runActionPluginStreamHostSmokeTest() -> Bool {
     )))
     guard streamSmokeRunLoopUntil(timeout: 1, {
         timeoutModel.blocks.first?.pluginMetadata?.incomplete == false
-    }), timeoutModel.blocks.count == 1,
-       timeoutModel.blocks[0].text.utf8.count
+    }), timeoutModel.blocks.count > 1,
+       timeoutModel.blocks.map(\.text).joined().utf8.count
         == ActionPluginStreamParser.maximumBlockBytes,
        timeoutModel.blocks[0].pluginMetadata?.title?.utf8.count
         == ActionPluginStreamParser.maximumTitleBytes,
@@ -1396,7 +1413,8 @@ private func runActionPluginStreamHostSmokeTest() -> Bool {
     // A provider can fail after sending provisional text. Its raw diagnostic
     // must never become rail text or a sendable block; only the scoped partial
     // is removed, while pre-existing user/result content stays intact.
-    let preservedBlockID = timeoutModel.blocks[0].id
+    let preservedBlockIDs = Set(timeoutModel.blocks.map(\.id))
+    let preservedBlockCount = timeoutModel.blocks.count
     timeoutHost.invoke(timeoutKey)
     guard timeoutTransport.invocations.count == 7 else {
         return streamSmokeFail("provider-failure invocation did not start")
@@ -1416,7 +1434,9 @@ private func runActionPluginStreamHostSmokeTest() -> Bool {
         text: "失败前的临时候选",
         title: nil
     )))
-    guard streamSmokeRunLoopUntil({ timeoutModel.blocks.count == 2 }) else {
+    guard streamSmokeRunLoopUntil({
+        timeoutModel.blocks.count == preservedBlockCount + 1
+    }) else {
         return streamSmokeFail("provider-failure provisional block never appeared")
     }
     let rawProviderError = "generation provider failed before producing a valid result"
@@ -1424,9 +1444,9 @@ private func runActionPluginStreamHostSmokeTest() -> Bool {
         ActionPluginStreamError.remote(rawProviderError)
     ))
     guard streamSmokeRunLoopUntil({ providerFailureInvocation.task.cancelled }),
-          timeoutModel.blocks.count == 1,
-          timeoutModel.blocks[0].id == preservedBlockID,
-          timeoutModel.pendingDeliveryCount == 1,
+          timeoutModel.blocks.count == preservedBlockCount,
+          Set(timeoutModel.blocks.map(\.id)) == preservedBlockIDs,
+          timeoutModel.pendingDeliveryCount == preservedBlockCount,
           timeoutModel.loadingMessage == nil,
           !timeoutModel.transientLoadingActive,
           !timeoutModel.blocks.contains(where: {
@@ -1442,8 +1462,8 @@ private func runActionPluginStreamHostSmokeTest() -> Bool {
     }
     timeoutHost.cancelActiveInvocationForWorkbench()
     guard timeoutHost.workbenchFailureMessage == nil,
-          timeoutModel.blocks.count == 1,
-          timeoutModel.blocks[0].id == preservedBlockID else {
+          timeoutModel.blocks.count == preservedBlockCount,
+          Set(timeoutModel.blocks.map(\.id)) == preservedBlockIDs else {
         return streamSmokeFail("closing the workbench did not clear only the failure status")
     }
 

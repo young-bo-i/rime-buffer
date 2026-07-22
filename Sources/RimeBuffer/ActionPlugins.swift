@@ -1496,6 +1496,14 @@ final class ActionPluginHost {
         let title: String?
     }
 
+    private struct HostedStreamSegment {
+        let index: Int
+        let text: String
+        let title: String?
+    }
+
+    private static let streamSegmentIndexStride = 100_000
+
     private struct ActiveInvocation {
         let nonce: UUID
         let hostGeneration: UInt64
@@ -1516,6 +1524,9 @@ final class ActionPluginHost {
         var markedStale: Bool
         var task: (any ActionPluginInvocationCancellable)?
         var receivedFirstContent: Bool
+        /// Latest authoritative snapshot for every upstream provider index.
+        /// Host-created semantic children are derived from this full map.
+        var streamLogicalBlocks: [Int: PendingStreamBlock]
         var streamBlockIDs: [Int: UUID]
         var stagedStreamBlockIDs: Set<UUID>
         var pendingStreamBlocks: [Int: PendingStreamBlock]
@@ -1875,6 +1886,7 @@ final class ActionPluginHost {
                                             markedStale: false,
                                             task: cancellationChain,
                                             receivedFirstContent: false,
+                                            streamLogicalBlocks: [:],
                                             streamBlockIDs: [:],
                                             stagedStreamBlockIDs: [],
                                             pendingStreamBlocks: [:],
@@ -2550,11 +2562,13 @@ final class ActionPluginHost {
         case .heartbeat:
             return
         case let .block(snapshot):
-            guard (0..<ActionPluginStreamParser.maximumBlocks).contains(snapshot.index),
+            let maximumLogicalBlocks = maximumStreamLogicalBlockCount(for: invocation)
+            let maximumLogicalBytes = maximumStreamLogicalBlockBytes(for: invocation)
+            guard (0..<maximumLogicalBlocks).contains(snapshot.index),
                   !snapshot.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   ActionPluginStreamParser.validText(
                       snapshot.text,
-                      maximumBytes: ActionPluginStreamParser.maximumBlockBytes
+                      maximumBytes: maximumLogicalBytes
                   ),
                   ActionPluginStreamParser.validOptionalText(
                       snapshot.title,
@@ -2565,14 +2579,23 @@ final class ActionPluginHost {
                                  preserveLegacyResultRouting: false)
                 return
             }
-            if invocation.streamBlockIDs[snapshot.index] == nil {
-                invocation.streamBlockIDs[snapshot.index] = UUID()
-            }
-            invocation.pendingStreamBlocks[snapshot.index] = PendingStreamBlock(
+            let logical = PendingStreamBlock(
                 index: snapshot.index,
                 text: snapshot.text,
                 title: snapshot.title
             )
+            var logicalBlocks = invocation.streamLogicalBlocks
+            logicalBlocks[snapshot.index] = logical
+            guard logicalBlocks.values.reduce(0, {
+                $0 + $1.text.utf8.count
+            }) <= maximumStreamLogicalTotalBytes(for: invocation) else {
+                cancelInvocation(invocation,
+                                 failureMessage: "连接器流结果过大",
+                                 preserveLegacyResultRouting: false)
+                return
+            }
+            invocation.streamLogicalBlocks = logicalBlocks
+            invocation.pendingStreamBlocks[snapshot.index] = logical
             let firstContent = !invocation.receivedFirstContent
             invocation.receivedFirstContent = true
             activeInvocation = invocation
@@ -2612,12 +2635,38 @@ final class ActionPluginHost {
         let pending = invocation.pendingStreamBlocks.values.sorted { $0.index < $1.index }
         invocation.pendingStreamBlocks.removeAll()
         invocation.streamFlushScheduled = false
-        activeInvocation = invocation
         guard !pending.isEmpty else { return }
 
+        let segments = hostedStreamSegments(
+            Array(invocation.streamLogicalBlocks.values)
+        )
+        guard !segments.isEmpty else {
+            cancelInvocation(invocation,
+                             failureMessage: "插件分块结果超过安全上限",
+                             preserveLegacyResultRouting: false)
+            return
+        }
+        let liveIndices = Set(segments.map(\.index))
+        let obsoleteIndices = Set(invocation.streamBlockIDs.keys)
+            .subtracting(liveIndices)
+        let obsoleteIDs = Set(obsoleteIndices.compactMap {
+            invocation.streamBlockIDs.removeValue(forKey: $0)
+        })
+        invocation.stagedStreamBlockIDs.subtract(obsoleteIDs)
+        for segment in segments where invocation.streamBlockIDs[segment.index] == nil {
+            invocation.streamBlockIDs[segment.index] = UUID()
+        }
+        activeInvocation = invocation
+        if !obsoleteIDs.isEmpty {
+            bufferModel.removePluginStreamBlocks(
+                requestId: invocation.requestId,
+                blockIDs: obsoleteIDs
+            )
+        }
+
         let origin = Origin.plugin(id: invocation.plugin.manifest.id)
-        let updates = pending.compactMap { snapshot -> BufferModel.PluginStreamUpdate? in
-            guard let id = invocation.streamBlockIDs[snapshot.index] else { return nil }
+        let updates = segments.compactMap { segment -> BufferModel.PluginStreamUpdate? in
+            guard let id = invocation.streamBlockIDs[segment.index] else { return nil }
             let metadata = BufferModel.PluginMetadata(
                 pluginId: invocation.plugin.manifest.id,
                 actionId: invocation.action.id,
@@ -2625,21 +2674,21 @@ final class ActionPluginHost {
                 contextId: invocation.contextId,
                 focusToken: invocation.focusToken,
                 runtimeIdentity: invocation.binding.identity,
-                title: snapshot.title,
+                title: segment.title,
                 targetSummary: invocation.targetSummary,
                 stale: false,
                 incomplete: true,
                 streamProtocolVersion: ActionPluginStreamParser.protocolVersion,
-                streamIndex: snapshot.index,
+                streamIndex: segment.index,
                 reviewedAsPlainText: invocation.focusToken == nil
             )
             return BufferModel.PluginStreamUpdate(id: id,
-                                                  index: snapshot.index,
-                                                  text: snapshot.text,
+                                                  index: segment.index,
+                                                  text: segment.text,
                                                   origin: origin,
                                                   metadata: metadata)
         }
-        guard updates.count == pending.count,
+        guard updates.count == segments.count,
               bufferModel.applyPluginStreamUpdates(requestId: invocation.requestId,
                                                    updates: updates) else {
             cancelInvocation(invocation,
@@ -2651,6 +2700,33 @@ final class ActionPluginHost {
         current.stagedStreamBlockIDs.formUnion(updates.map(\.id))
         activeInvocation = current
         onChange?()
+    }
+
+    private func hostedStreamSegments(_ blocks: [PendingStreamBlock])
+        -> [HostedStreamSegment] {
+        let fragments = SemanticBlockSegmenter.refine(
+            blocks.map {
+                SemanticLogicalBlock(sourceIndex: $0.index,
+                                     text: $0.text,
+                                     title: $0.title)
+            },
+            maximumSegments: SemanticBlockSegmenter.maximumWorkbenchSegments
+        )
+        guard !fragments.isEmpty,
+              fragments.allSatisfy({
+                  ActionPluginStreamParser.validText(
+                      $0.text,
+                      maximumBytes: ActionPluginStreamParser.maximumBlockBytes
+                  )
+              }) else { return [] }
+        return fragments.map { fragment in
+            HostedStreamSegment(
+                index: fragment.key.sourceIndex * Self.streamSegmentIndexStride
+                    + fragment.key.childIndex,
+                text: fragment.text,
+                title: fragment.title
+            )
+        }
     }
 
     private func reloadManifests(force: Bool) {
@@ -2983,7 +3059,8 @@ final class ActionPluginHost {
                 }
                 return
             }
-            guard !invocation.streaming || streamingResponseIsValid(response) else {
+            guard !invocation.streaming
+                    || streamingResponseIsValid(response, invocation: invocation) else {
                 cancelInvocation(invocation,
                                  failureMessage: "插件最终结果无效",
                                  preserveLegacyResultRouting: false)
@@ -3096,7 +3173,7 @@ final class ActionPluginHost {
                                            plugin: InstalledActionPlugin) {
         guard activeInvocation?.nonce == invocation.nonce,
               streamingInvocationCanStageLive(invocation),
-              streamingResponseIsValid(response) else {
+              streamingResponseIsValid(response, invocation: invocation) else {
             cancelInvocation(invocation,
                              failureMessage: "插件最终结果无效",
                              preserveLegacyResultRouting: false)
@@ -3106,9 +3183,22 @@ final class ActionPluginHost {
         var blockIDs = invocation.streamBlockIDs
         let origin = Origin.plugin(id: plugin.manifest.id)
         let targetSummary = response.targetSummary ?? invocation.targetSummary
-        let finals = response.blocks.enumerated().map { index, block -> BufferModel.PluginStreamFinalBlock in
-            let id = blockIDs[index] ?? UUID()
-            blockIDs[index] = id
+        let segments = hostedStreamSegments(
+            response.blocks.enumerated().map { index, block in
+                PendingStreamBlock(index: index,
+                                   text: block.text,
+                                   title: block.title)
+            }
+        )
+        guard !segments.isEmpty else {
+            cancelInvocation(invocation,
+                             failureMessage: "插件分块结果超过安全上限",
+                             preserveLegacyResultRouting: false)
+            return
+        }
+        let finals = segments.map { segment -> BufferModel.PluginStreamFinalBlock in
+            let id = blockIDs[segment.index] ?? UUID()
+            blockIDs[segment.index] = id
             let metadata = BufferModel.PluginMetadata(
                 pluginId: plugin.manifest.id,
                 actionId: invocation.action.id,
@@ -3116,17 +3206,17 @@ final class ActionPluginHost {
                 contextId: invocation.contextId,
                 focusToken: invocation.focusToken,
                 runtimeIdentity: invocation.binding.identity,
-                title: block.title,
+                title: segment.title,
                 targetSummary: targetSummary,
                 stale: false,
                 incomplete: false,
                 streamProtocolVersion: ActionPluginStreamParser.protocolVersion,
-                streamIndex: index,
+                streamIndex: segment.index,
                 reviewedAsPlainText: invocation.focusToken == nil
             )
             return BufferModel.PluginStreamFinalBlock(id: id,
-                                                      index: index,
-                                                      text: block.text,
+                                                      index: segment.index,
+                                                      text: segment.text,
                                                       origin: origin,
                                                       metadata: metadata)
         }
@@ -3148,14 +3238,37 @@ final class ActionPluginHost {
         onChange?()
     }
 
-    private func streamingResponseIsValid(_ response: ActionPluginInvokeResponse) -> Bool {
+    private func maximumStreamLogicalBlockCount(for invocation: ActiveInvocation) -> Int {
+        invocation.action.preparePath == nil
+            ? ActionPluginStreamParser.maximumBlocks
+            : AITextRuntimeLimits.maximumModelBlockCount
+    }
+
+    private func maximumStreamLogicalBlockBytes(for invocation: ActiveInvocation) -> Int {
+        invocation.action.preparePath == nil
+            ? ActionPluginStreamParser.maximumBlockBytes
+            : AITextRuntimeLimits.maximumWireBytes
+    }
+
+    private func maximumStreamLogicalTotalBytes(for invocation: ActiveInvocation) -> Int {
+        invocation.action.preparePath == nil
+            ? ActionPluginStreamParser.maximumWireBytes
+            : AITextRuntimeLimits.maximumWireBytes
+    }
+
+    private func streamingResponseIsValid(
+        _ response: ActionPluginInvokeResponse,
+        invocation: ActiveInvocation
+    ) -> Bool {
         !response.blocks.isEmpty
-            && response.blocks.count <= ActionPluginStreamParser.maximumBlocks
+            && response.blocks.count <= maximumStreamLogicalBlockCount(for: invocation)
+            && response.blocks.reduce(0, { $0 + $1.text.utf8.count })
+                <= maximumStreamLogicalTotalBytes(for: invocation)
             && response.blocks.allSatisfy { block in
                 !block.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     && ActionPluginStreamParser.validText(
                         block.text,
-                        maximumBytes: ActionPluginStreamParser.maximumBlockBytes
+                        maximumBytes: maximumStreamLogicalBlockBytes(for: invocation)
                     )
                     && ActionPluginStreamParser.validOptionalText(
                         block.title,
@@ -3192,14 +3305,33 @@ final class ActionPluginHost {
         let origin = Origin.plugin(id: plugin.manifest.id)
         let targetSummary = (response.targetSummary ?? invocation.targetSummary)
             .map { String($0.prefix(1_000)) }
-        let usableBlocks = response.blocks
-            .prefix(ActionPluginStreamParser.maximumBlocks)
+        let logicalBlocks = response.blocks
+            .prefix(maximumStreamLogicalBlockCount(for: invocation))
             .compactMap { block -> ActionPluginResultBlock? in
-            let text = String(block.text.prefix(InboundBus.maxTextCount))
+            let text = invocation.action.preparePath == nil
+                ? String(block.text.prefix(InboundBus.maxTextCount))
+                : block.text
             guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             return ActionPluginResultBlock(text: text,
                                            title: block.title.map { String($0.prefix(200)) })
             }
+        let usableBlocks: [ActionPluginResultBlock]
+        if direct {
+            usableBlocks = hostedStreamSegments(
+                logicalBlocks.enumerated().map { index, block in
+                    PendingStreamBlock(index: index,
+                                       text: block.text,
+                                       title: block.title)
+                }
+            ).map {
+                ActionPluginResultBlock(text: $0.text, title: $0.title)
+            }
+        } else {
+            // Keep one review item per upstream logical block. Accepting it
+            // applies the same semantic segmentation at the BufferModel gate,
+            // avoiding inbox-cap data loss from hundreds of tiny children.
+            usableBlocks = logicalBlocks
+        }
         guard !usableBlocks.isEmpty else {
             if wasForeground {
                 bufferModel.failTransientLoading(requestId: invocation.requestId,

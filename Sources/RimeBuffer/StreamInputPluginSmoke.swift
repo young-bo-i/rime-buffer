@@ -47,7 +47,6 @@ private final class StreamInputSmokeProvider: AITextProvider {
 private final class StreamInputSmokeRuntimeBox {
     var bufferEnabled = true
     var pluginSelected = true
-    var configuration = StreamInputCaptureRules.requiredConfiguration
     var secureInput = false
     var exactFocus = true
 
@@ -55,7 +54,6 @@ private final class StreamInputSmokeRuntimeBox {
         StreamInputRuntime(
             bufferEnabled: { [self] in bufferEnabled },
             pluginSelected: { [self] in pluginSelected },
-            configuration: { [self] in configuration },
             secureInput: { [self] in secureInput },
             liveFocus: { [self] _, _ in exactFocus }
         )
@@ -68,27 +66,21 @@ func runStreamInputPluginSmokeTest() -> Bool {
         return false
     }
 
-    let fullPinyin = StreamInputCaptureRules.requiredConfiguration
     let letter = StreamInputCaptureRules.letter(
         keycode: 0x61,
         mask: 0,
         bufferEnabled: true,
         pluginSelected: true,
-        configuration: fullPinyin,
         secureInput: false,
         exactExternalFocus: true
     )
     guard letter == "a" else { return fail("valid letter capture") }
 
-    let rejectedGates: [(Bool, Bool, InputConfiguration, Bool, Bool)] = [
-        (false, true, fullPinyin, false, true),
-        (true, false, fullPinyin, false, true),
-        (true, true, .init(encoding: .naturalDoublePinyin,
-                          keyingMode: .sequential), false, true),
-        (true, true, .init(encoding: .fullPinyin,
-                          keyingMode: .mutual), false, true),
-        (true, true, fullPinyin, true, true),
-        (true, true, fullPinyin, false, false),
+    let rejectedGates: [(Bool, Bool, Bool, Bool)] = [
+        (false, true, false, true),
+        (true, false, false, true),
+        (true, true, true, true),
+        (true, true, false, false),
     ]
     for gate in rejectedGates {
         guard StreamInputCaptureRules.letter(
@@ -96,9 +88,8 @@ func runStreamInputPluginSmokeTest() -> Bool {
             mask: 0,
             bufferEnabled: gate.0,
             pluginSelected: gate.1,
-            configuration: gate.2,
-            secureInput: gate.3,
-            exactExternalFocus: gate.4
+            secureInput: gate.2,
+            exactExternalFocus: gate.3
         ) == nil else { return fail("authority gate") }
     }
 
@@ -108,7 +99,6 @@ func runStreamInputPluginSmokeTest() -> Bool {
             mask: mask,
             bufferEnabled: true,
             pluginSelected: true,
-            configuration: fullPinyin,
             secureInput: false,
             exactExternalFocus: true
         ) == "a" else { return fail("shift and caps normalization") }
@@ -121,7 +111,6 @@ func runStreamInputPluginSmokeTest() -> Bool {
             mask: mask,
             bufferEnabled: true,
             pluginSelected: true,
-            configuration: fullPinyin,
             secureInput: false,
             exactExternalFocus: true
         ) == nil else { return fail("modifier ownership") }
@@ -132,7 +121,6 @@ func runStreamInputPluginSmokeTest() -> Bool {
             mask: 0,
             bufferEnabled: true,
             pluginSelected: true,
-            configuration: fullPinyin,
             secureInput: false,
             exactExternalFocus: true
         ) == .consumeOwned else { return fail("separator ownership") }
@@ -142,7 +130,6 @@ func runStreamInputPluginSmokeTest() -> Bool {
         mask: 0,
         bufferEnabled: true,
         pluginSelected: true,
-        configuration: fullPinyin,
         secureInput: true,
         exactExternalFocus: true
     ) == .consumeUntrusted,
@@ -151,7 +138,6 @@ func runStreamInputPluginSmokeTest() -> Bool {
         mask: 0,
         bufferEnabled: true,
         pluginSelected: true,
-        configuration: fullPinyin,
         secureInput: false,
         exactExternalFocus: false
     ) == .consumeUntrusted,
@@ -160,7 +146,6 @@ func runStreamInputPluginSmokeTest() -> Bool {
         mask: 0,
         bufferEnabled: true,
         pluginSelected: true,
-        configuration: fullPinyin,
         secureInput: false,
         exactExternalFocus: true
     ) == .passThrough else {
@@ -179,8 +164,8 @@ func runStreamInputPluginSmokeTest() -> Bool {
     guard prompt.contains("\"rawPinyin\":\"\(raw)\""),
           prompt.contains("\"syllableHints\""),
           prompt.contains("xiu'fu'yi'ge'wen'ti"),
-          prompt.contains("ASCII Space"),
-          prompt.contains("竖线表示用户输入的 Space 短句边界"),
+          prompt.contains("小写 ASCII 字母 a–z"),
+          prompt.contains("无论用户当前启用哪一种输入方案"),
           prompt.contains("English"),
           prompt.contains("不可信的数据"),
           prompt.contains("完整正文"),
@@ -208,12 +193,8 @@ func runStreamInputPluginSmokeTest() -> Bool {
           }) else {
         return fail("mixed-English pinyin boundary hints")
     }
-    guard !spacedCandidates.isEmpty,
-          spacedCandidates.allSatisfy({
-              $0.segments.map(\.spelling).joined() == "wo shi"
-                  && $0.compact.contains(" | ")
-          }) else {
-        return fail("space-aware pinyin boundary hints")
+    guard spacedCandidates.isEmpty else {
+        return fail("pinyin hints must reject non-letter raw input")
     }
     guard longHints.isEmpty,
           StreamInputPinyinHints.compactHints(for: "FanGan").isEmpty else {
@@ -233,10 +214,8 @@ func runStreamInputPluginSmokeTest() -> Bool {
         return fail("default provider must stay OpenAI-compatible")
     }
 
-    // Space ends a short sentence and immediately requests the complete raw
-    // snapshot. Leading/repeated spaces do not create revisions or requests.
-    // Continuing to type creates the ordinary trailing debounce, whose request
-    // re-evaluates the complete latest input rather than only the new suffix.
+    // Space is owned by the consciousness-stream rail but never enters the
+    // pure-letter raw snapshot and never creates an inference boundary.
     do {
         var epochs = FocusEpochState()
         let focus = epochs.activate()
@@ -255,48 +234,38 @@ func runStreamInputPluginSmokeTest() -> Bool {
               provider.pending.isEmpty,
               workspace.capture(letter: "a", focusToken: focus),
               workspace.capture(letter: "b", focusToken: focus),
-              workspace.consumeIgnoredKey(keycode: 0x20, focusToken: focus),
-              workspace.rawInput == "ab ",
-              provider.pending.count == 1,
-              provider.pending[0].request.sourceText == "ab ",
-              provider.pending[0].request.preparedPrompt?.contains(
-                "\"rawPinyin\":\"ab \""
-              ) == true,
-              workspace.maximumWaitTimerForTesting == nil else {
-            return fail("Space must create one immediate whole-raw request")
-        }
-        guard workspace.consumeIgnoredKey(keycode: 0x20, focusToken: focus),
-              workspace.rawInput == "ab ",
-              provider.pending.count == 1,
-              workspace.capture(letter: "c", focusToken: focus),
-              workspace.capture(letter: "d", focusToken: focus),
-              workspace.rawInput == "ab cd",
-              provider.pending.count == 1,
               workspace.maximumWaitTimerForTesting != nil else {
-            return fail("repeated Space must coalesce and later typing must debounce")
+            return fail("letter-only raw setup")
+        }
+        let generationBeforeSpace = workspace.deliveryGeneration
+        guard workspace.consumeIgnoredKey(keycode: 0x20, focusToken: focus),
+              workspace.consumeIgnoredKey(keycode: 0x20, focusToken: focus),
+              workspace.rawInput == "ab",
+              workspace.deliveryGeneration == generationBeforeSpace,
+              provider.pending.isEmpty,
+              workspace.maximumWaitTimerForTesting != nil else {
+            return fail("Space must not mutate or request raw input")
         }
         workspace.fireDebounceForTesting()
-        guard provider.pending.count == 2,
-              provider.pending[1].request.sourceText == "ab cd",
-              provider.pending[1].request.preparedPrompt?.contains(
-                "\"rawPinyin\":\"ab cd\""
-              ) == true,
-              provider.pending.allSatisfy({ !$0.task.isCancelled }) else {
-            return fail("trailing debounce must request the latest complete raw")
+        guard provider.pending.count == 1,
+              provider.pending[0].request.sourceText == "ab",
+              provider.pending[0].request.preparedPrompt?.contains(
+                "\"rawPinyin\":\"ab\""
+              ) == true else {
+            return fail("debounce must request the pure-letter snapshot")
         }
         provider.complete(.success([
             AITextProviderBlock(index: 0, text: "最新完整短句结果", title: nil),
-        ]), at: 1)
-        guard provider.pending[0].task.isCancelled,
-              workspace.phase == .ready,
+        ]), at: 0)
+        guard workspace.phase == .ready,
               workspace.outputBlocks.first?.text == "最新完整短句结果",
               workspace.deliveryPendingBlocks.first?.text == "最新完整短句结果" else {
-            return fail("latest post-Space whole-raw result must be authoritative")
+            return fail("pure-letter result must become authoritative")
         }
     }
 
-    // Provider-fast and provider-slow paths must expose identical Return
-    // semantics, and model segmentation must never leak into partial delivery.
+    // Alternatives stay mutually exclusive choices, while the selected answer
+    // is refined into sequential delivery blocks after final validation.
     do {
         var epochs = FocusEpochState()
         let focus = epochs.activate()
@@ -319,10 +288,19 @@ func runStreamInputPluginSmokeTest() -> Bool {
         provider.complete(.success([
             AITextProviderBlock(index: 0, text: "修复一个问题", title: "ignored"),
             AITextProviderBlock(index: 1, text: "修复仪表问题", title: nil),
+            AITextProviderBlock(
+                index: 2,
+                text: "Fix this useful issue with one short phrase and then another phrase.",
+                title: nil
+            ),
         ]), at: 0)
         guard workspace.phase == .ready,
               (1...3).contains(workspace.outputBlocks.count),
-              workspace.outputBlocks.map(\.text) == ["修复一个问题", "修复仪表问题"],
+              workspace.outputBlocks.map(\.text) == [
+                  "修复一个问题",
+                  "修复仪表问题",
+                  "Fix this useful issue with one short phrase and then another phrase.",
+              ],
               workspace.outputBlocks.allSatisfy({ $0.title == nil }),
               workspace.deliveryPendingBlocks.count == 1,
               workspace.deliveryPendingBlocks.first?.text == "修复一个问题",
@@ -334,17 +312,103 @@ func runStreamInputPluginSmokeTest() -> Bool {
                                           focusToken: focus),
               workspace.deliveryPendingBlocks.count == 1,
               workspace.deliveryPendingBlocks.first?.text == "修复仪表问题",
-              let selectedID = workspace.deliveryPendingBlocks.first?.id else {
+              workspace.deliveryPendingBlocks.first?.id != nil else {
             return fail("digit selection exposes only selected alternative")
         }
-        let resultGeneration = workspace.deliveryGeneration
-        workspace.consumeDelivered(blockIDs: [selectedID],
-                                   generation: resultGeneration)
+
+        guard workspace.consumeIgnoredKey(keycode: 0x33,
+                                          focusToken: focus) else {
+            return fail("third alternative selection")
+        }
+        let selectedText = workspace.deliveryPendingBlocks.map(\.text).joined()
+        let initialSegmentCount = workspace.deliveryPendingBlocks.count
+        guard initialSegmentCount > 1,
+              selectedText
+                == "Fix this useful issue with one short phrase and then another phrase.",
+              workspace.railSnapshot.outputBlocks.count > workspace.outputBlocks.count else {
+            return fail("selected alternative semantic segmentation")
+        }
+        let firstSegmentID = workspace.deliveryPendingBlocks[0].id
+        workspace.consumeDelivered(blockIDs: [firstSegmentID],
+                                   generation: workspace.deliveryGeneration)
+        let lockedRemainingIDs = workspace.deliveryPendingBlocks.map(\.id)
+        guard workspace.phase == .ready,
+              !workspace.rawInput.isEmpty,
+              workspace.deliveryPendingBlocks.count == initialSegmentCount - 1,
+              workspace.statusText.contains("已锁定") else {
+            return fail("partial selected-alternative delivery retention")
+        }
+        guard workspace.consumeIgnoredKey(keycode: 0x31, focusToken: focus),
+              workspace.selectedAlternativePosition == 2,
+              workspace.deliveryPendingBlocks.map(\.id) == lockedRemainingIDs else {
+            return fail("partial delivery must lock the selected alternative")
+        }
+        workspace.consumeDelivered(
+            blockIDs: workspace.deliveryPendingBlocks.map(\.id),
+            generation: workspace.deliveryGeneration
+        )
         guard workspace.rawInput.isEmpty,
               workspace.outputBlocks.isEmpty,
               workspace.deliveryPendingBlocks.isEmpty,
               workspace.phase == .idle else {
             return fail("selected delivery clears every alternative")
+        }
+    }
+
+    // Typing after one delivered child abandons the old answer and starts a
+    // fresh raw snapshot. The consumed prefix can never reappear in the next
+    // result or become deliverable a second time.
+    do {
+        var epochs = FocusEpochState()
+        let focus = epochs.activate()
+        let runtime = StreamInputSmokeRuntimeBox()
+        let provider = StreamInputSmokeProvider()
+        let workspace = StreamInputWorkspace(
+            provider: provider,
+            runtime: runtime.runtime,
+            observesRuntimeNotifications: false
+        )
+        workspace.start()
+        defer { workspace.stop() }
+
+        guard !workspace.capture(letter: " ", focusToken: focus),
+              !workspace.capture(letter: "A", focusToken: focus),
+              workspace.rawInput.isEmpty,
+              workspace.capture(letter: "a", focusToken: focus),
+              workspace.settleForReturn(focusToken: focus),
+              provider.pending.count == 1 else {
+            return fail("raw input must accept lowercase ASCII letters only")
+        }
+        let oldAnswer = "First useful phrase and a second useful phrase."
+        provider.complete(.success([
+            AITextProviderBlock(index: 0, text: oldAnswer, title: nil),
+        ]), at: 0)
+        guard workspace.deliveryPendingBlocks.count > 1 else {
+            return fail("fresh-input partial-delivery setup")
+        }
+        workspace.consumeDelivered(
+            blockIDs: [workspace.deliveryPendingBlocks[0].id],
+            generation: workspace.deliveryGeneration
+        )
+        guard !workspace.requestRefresh(),
+              workspace.capture(letter: "b", focusToken: focus),
+              workspace.rawInput == "b",
+              workspace.outputBlocks.isEmpty,
+              workspace.deliveryPendingBlocks.isEmpty,
+              workspace.phase == .waiting else {
+            return fail("typing after partial delivery must start fresh raw")
+        }
+        workspace.fireDebounceForTesting()
+        guard provider.pending.count == 2,
+              provider.pending[1].request.sourceText == "b",
+              provider.pending[1].request.preparedPrompt?.contains(oldAnswer) == false else {
+            return fail("fresh request must not revive consumed answer text")
+        }
+        provider.complete(.success([
+            AITextProviderBlock(index: 0, text: "全新结果", title: nil),
+        ]), at: 1)
+        guard workspace.deliveryPendingBlocks.map(\.text) == ["全新结果"] else {
+            return fail("fresh result must replace partially delivered answer")
         }
     }
 

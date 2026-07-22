@@ -45,6 +45,17 @@ func runTranslationPluginSmokeTest() -> Bool {
           TranslationRefreshPolicy.deadline(lastChange: 0.8, burstStarted: 0) == 0.9 else {
         return fail("debounce / maximum-wait policy")
     }
+    let coarseTranslation = "This translation contains several useful words and another phrase. 最后一句，也要单独发送。"
+    let translationSegments = SemanticBlockSegmenter.refine(
+        [SemanticLogicalBlock(sourceIndex: 0,
+                              text: coarseTranslation,
+                              title: nil)],
+        maximumSegments: SemanticBlockSegmenter.maximumWorkbenchSegments
+    )
+    guard translationSegments.count > 2,
+          translationSegments.map(\.text).joined() == coarseTranslation else {
+        return fail("shared semantic segmentation")
+    }
 
     let defaultsName = "RimeBuffer.TranslationPluginSmoke.\(UUID().uuidString)"
     guard let defaults = UserDefaults(suiteName: defaultsName) else {

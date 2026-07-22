@@ -15,6 +15,10 @@
 >
 > **2026-07-22 AI 插件/连接器覆盖决策（当前）**：内置 `.bufferAction` 已收敛为唯一「AI 生成」插件；Codex CLI、Claude Code CLI 与 OpenAI 兼容 API 是“连接器 › AI 模型”中的三个独立可切换模型源。展开层不再放独立“生成”按钮；主条右侧控件以 AI 图标/转圈/纸飞机表达无源禁用、可请求、生成中和可投递。Return 与它共用同一状态：有源无结果时请求 AI，ready 后的新一次轻按逐块发送、长按全部发送。生成冻结当前缓冲全文，在下方 target rail 以稳定 block 原位更新；只有目标块全部成功发送后才消费上方对应 source blocks。两轨角色使用图标，不再显示“原/答”文字。
 
+> **2026-07-22 全量捕获与强制分块决策（当前）**：缓冲持久开启后，ASCII/英文模式下 librime 未处理的可打印字母、数字、空格和普通标点也必须进入缓冲，只有快捷键、自有输入框、失效焦点与 secure input 例外；逐键英文在同一焦点内合并为短词组块并保留逐字退格。AI、苹果翻译、意识流所选候选、Action/Marine 的流式快照与最终结果统一由宿主细分，英文按完整单词/短词组，中文按句、分句和有界长度；不得把单个粗糙上游块当成一次性大段投递。上游 block 仍是硬边界，Action 子块完整继承原插件权限；轻按 Return/纸飞机逐块，长按 Return 才发送全部。
+
+> **2026-07-22 意识流配置隔离（当前）**：选择意识流输入不得修改 `InputConfigurationStore` 或重部署 Rime schema。它在任何当前方案下只截获物理 `a-z`，在独立 workspace 内按连续全拼解释；raw 不接受 Space、数字或标点。所选候选开始逐块投递后即锁定，继续输入字母会开启全新 raw，已发送前缀不能在下一轮重新出现。
+
 ---
 
 ## 0. 一句话定位
@@ -281,7 +285,7 @@ claude mcp add --transport http etinput http://127.0.0.1:47700/mcp \
 ### 5.1 派生 source/target workspace 契约
 
 - 用户显式点击“生成”时，`AITextPluginWorkspace` 冻结当前 `BufferModel.stagedText` 与 source block IDs。源文仍属于 `BufferModel`，上方 source rail 只是连续投影；结果存在 workspace 的下方 target rail，不会悄悄改写原 block。
-- 流式边界是“逻辑 block 快照”，不是 token。provider 可重复更新同一 index；workspace 为该 index 保留稳定 UUID，最终结构化 blocks 替换未完成快照而不产生逐字碎块。
+- 流式边界是“逻辑 block 快照”，不是 token。provider 可重复更新同一 index；workspace 对每个 `(providerIndex, childIndex)` 宿主子块保留稳定 UUID，最终结构化 blocks 替换未完成快照而不产生逐字碎块。英文 transport token 不直接成为 block；宿主只在完整单词/短词组或语义标点处封口。
 - 每个 workspace 同时一个 job。源文/block IDs 变化、切 owner、secure input、关闭或刷新会取消任务并提升 generation，迟到回调不能恢复旧结果。失败只更新 workspace 状态，原文不受损。
 - 只有完成且仍匹配 source/generation 的 target blocks 可经 `BufferDeliveryCoordinator` 发送。部分投递时已成功 target 从下轨消失，失败与未发后缀保留；上轨 source blocks 在最后一个 target 成功后才一次性消费。
 - 未 review 的 Action Plugin 目标绑定 block 不允许作为翻译/AI 源，避免把原 runtime/context/focus 权限洗成普通 `.processor` 块。

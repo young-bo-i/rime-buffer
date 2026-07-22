@@ -112,15 +112,6 @@ enum DerivedBufferWorkspaceRouter {
         guard let activeKey = BufferPluginSelectionStore.shared.activeKey else {
             return nil
         }
-        if activeKey == StreamInputWorkspace.pluginKey,
-           InputConfigurationStore.shared.configuration
-                != StreamInputCaptureRules.requiredConfiguration {
-            // An incompatible schema must immediately restore the ordinary
-            // BufferModel rail. StreamInputWorkspace will clear the stale
-            // owner selection asynchronously, but routing cannot wait for that
-            // notification round-trip without hiding regular buffered text.
-            return nil
-        }
         return all.first { $0.workspacePluginKey == activeKey }
     }
 

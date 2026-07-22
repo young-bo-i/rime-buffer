@@ -44,6 +44,7 @@ final class InboundBus {
         case empty
         case blocked
         case full
+        case tooLarge
     }
 
     enum SubmissionResult: Equatable {
@@ -56,6 +57,11 @@ final class InboundBus {
     /// (RemotePeer has its own pendingCap=50; the gateway needs the same guard.)
     static let maxPending = 50
     static let maxTextCount = 20_000
+    /// A reviewed plugin result may be one coarse AI logical block. Keep the
+    /// old aggregate memory envelope while allowing that one item to survive
+    /// intact until acceptance applies host segmentation.
+    static let maxReviewedPluginTextCount = 1_048_576
+    static let maxPendingTextCount = 1_048_576
 
     private(set) var pending: [InboundItem] = []
     private var streamItemID: [String: UUID] = [:]   // provider streamID -> item id
@@ -95,7 +101,17 @@ final class InboundBus {
                         text: String,
                         title: String? = nil,
                         pluginMetadata: BufferModel.PluginMetadata? = nil) -> SubmissionResult {
-        let clean = String(text.prefix(Self.maxTextCount))
+        let isPlugin: Bool
+        if case .plugin = origin { isPlugin = true } else { isPlugin = false }
+        let clean: String
+        if isPlugin {
+            guard text.count <= Self.maxReviewedPluginTextCount else {
+                return .rejected(.tooLarge)
+            }
+            clean = text
+        } else {
+            clean = String(text.prefix(Self.maxTextCount))
+        }
         guard !clean.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return .rejected(.empty)
         }
@@ -104,13 +120,23 @@ final class InboundBus {
             IMELog.write("inbound dropped origin=\(origin.tag) chars=\(clean.count) (blocked)")
             return .rejected(.blocked)
         case .trusted:
-            BufferModel.shared.stageExternal(clean,
-                                             origin: origin,
-                                             pluginMetadata: pluginMetadata)
+            if case .plugin = origin {
+                BufferModel.shared.stageExternalSemantic(
+                    clean,
+                    origin: origin,
+                    pluginMetadata: pluginMetadata
+                )
+            } else {
+                BufferModel.shared.stageExternal(clean,
+                                                 origin: origin,
+                                                 pluginMetadata: pluginMetadata)
+            }
             IMELog.write("inbound trusted->buffer origin=\(origin.tag) chars=\(clean.count)")
             return .staged
         case .ask:
-            guard pending.count < Self.maxPending else {
+            let pendingCharacters = pending.reduce(0) { $0 + $1.text.count }
+            guard pending.count < Self.maxPending,
+                  pendingCharacters + clean.count <= Self.maxPendingTextCount else {
                 IMELog.write("inbound dropped origin=\(origin.tag) (pending cap \(Self.maxPending))")
                 return .rejected(.full)
             }
@@ -171,9 +197,17 @@ final class InboundBus {
         } else {
             acceptedMetadata = item.pluginMetadata
         }
-        BufferModel.shared.stageExternal(item.text,
-                                         origin: item.origin,
-                                         pluginMetadata: acceptedMetadata)
+        if case .plugin = item.origin {
+            BufferModel.shared.stageExternalSemantic(
+                item.text,
+                origin: item.origin,
+                pluginMetadata: acceptedMetadata
+            )
+        } else {
+            BufferModel.shared.stageExternal(item.text,
+                                             origin: item.origin,
+                                             pluginMetadata: acceptedMetadata)
+        }
         IMELog.write("inbound accepted origin=\(item.origin.tag) chars=\(item.text.count)")
         if !item.streaming { pending.remove(at: idx) }
         onChange?()

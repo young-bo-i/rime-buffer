@@ -804,6 +804,10 @@ private enum AITextPluginSmoke {
             print("AI text smoke failed: workspace gates")
             return false
         }
+        guard workspaceForcesProviderSegmentation() else {
+            print("AI text smoke failed: workspace forced segmentation")
+            return false
+        }
         guard remoteMirrorAndActionReview() else {
             print("AI text smoke failed: remote action review")
             return false
@@ -827,7 +831,7 @@ private enum AITextPluginSmoke {
             "```JSON\n\(structured)\n```"
         ), uppercaseFenced == blocks else { return false }
         guard let fallback = try? AITextResultDecoder.decodeFinalText("甲\n\n乙"),
-              fallback.map(\.text) == ["甲\n\n", "乙"] else { return false }
+              fallback.map(\.text) == ["甲\n\n乙"] else { return false }
         let fineSource = "第一句，第二句。第三句\n第四句；第五句！"
         let fine = AITextFineBlockSegmenter.refine([
             AITextProviderBlock(index: 0, text: fineSource, title: "细分"),
@@ -847,6 +851,35 @@ private enum AITextPluginSmoke {
               protected.contains(where: { $0.text.contains("`let value = \"a,b:c\"`") }) else {
             return false
         }
+        let prefixedURLSource = "链接 (https://example.com/a?x=1,000&at=12:30)，后续"
+        let prefixedURL = SemanticBlockSegmenter.segments(from: prefixedURLSource)
+        guard prefixedURL.joined() == prefixedURLSource,
+              prefixedURL.contains(where: {
+                  $0.contains("(https://example.com/a?x=1,000&at=12:30)，")
+              }) else { return false }
+        let punctuationEdge = String(repeating: "中", count: 48) + "，后续"
+        let punctuationSegments = SemanticBlockSegmenter.segments(from: punctuationEdge)
+        guard punctuationSegments.joined() == punctuationEdge,
+              !punctuationSegments.contains("，") else { return false }
+        let exactWhitespace = "  甲\r\n\n乙  "
+        let exactFragments = SemanticBlockSegmenter.refine(
+            [SemanticLogicalBlock(sourceIndex: 0,
+                                  text: exactWhitespace,
+                                  title: nil)],
+            maximumSegments: SemanticBlockSegmenter.maximumWorkbenchSegments
+        )
+        guard exactFragments.map(\.text).joined() == exactWhitespace else { return false }
+        let englishSource = "This is one short phrase and this is another. Final words!"
+        let english = AITextFineBlockSegmenter.refine([
+            AITextProviderBlock(index: 0, text: englishSource, title: nil),
+        ])
+        guard english.count >= 3,
+              english.map(\.text).joined() == englishSource,
+              english.allSatisfy({ block in
+                  let words = block.text.split { !$0.isLetter && !$0.isNumber }
+                  return words.count <= SemanticBlockSegmenter.preferredLatinWordCount
+                      || block.text.contains("https://")
+              }) else { return false }
         var previousPrefixBlocks: [AITextProviderBlock] = []
         var growing = ""
         for character in protectedSource {
@@ -859,13 +892,41 @@ private enum AITextPluginSmoke {
                 == Array(previousPrefixBlocks.prefix(stableCount)) else { return false }
             previousPrefixBlocks = currentBlocks
         }
-        let manyClauses = (1 ... 21).map { "第\($0)段，" }.joined()
+        let manyClauses = (1 ... (AITextRuntimeLimits.maximumBlockCount + 1))
+            .map { "第\($0)段，" }
+            .joined()
         let capped = AITextFineBlockSegmenter.refine([
             AITextProviderBlock(index: 0, text: manyClauses, title: nil),
         ])
         guard capped.count == AITextRuntimeLimits.maximumBlockCount,
               capped.map(\.text).joined() == manyClauses,
-              capped.last?.text.contains("第21段") == true else { return false }
+              capped.last?.text.contains(
+                  "第\(AITextRuntimeLimits.maximumBlockCount + 1)段"
+              ) == true else { return false }
+        let atCapacity = SemanticBlockSegmenter.refine(
+            [SemanticLogicalBlock(
+                sourceIndex: 0,
+                text: (1...SemanticBlockSegmenter.maximumWorkbenchSegments)
+                    .map { "u\($0)，" }.joined(),
+                title: nil
+            )],
+            maximumSegments: SemanticBlockSegmenter.maximumWorkbenchSegments
+        )
+        let overCapacity = SemanticBlockSegmenter.refine(
+            [SemanticLogicalBlock(
+                sourceIndex: 0,
+                text: (1...(SemanticBlockSegmenter.maximumWorkbenchSegments + 1))
+                    .map { "u\($0)，" }.joined(),
+                title: nil
+            )],
+            maximumSegments: SemanticBlockSegmenter.maximumWorkbenchSegments
+        )
+        let oldTextByKey = Dictionary(uniqueKeysWithValues: atCapacity.map {
+            ($0.key, $0.text)
+        })
+        guard overCapacity.allSatisfy({ fragment in
+            oldTextByKey[fragment.key].map { fragment.text.hasPrefix($0) } ?? true
+        }) else { return false }
         let partial = AITextPartialJSONBlocks.decode(
             "{\"blocks\":[{\"text\":\"首块\\n正在生"
         )
@@ -2042,6 +2103,119 @@ private enum AITextPluginSmoke {
               workspace.outputBlocks.isEmpty else { return false }
         workspace.setProtected(false)
         return workspace.canGenerate && workspace.primaryAction == .requestGeneration
+    }
+
+    private static func workspaceForcesProviderSegmentation() -> Bool {
+        let source = BufferModel()
+        source.stageExternal("source", origin: .rime)
+        let provider = AITextSmokeProvider()
+        let workspace = AITextPluginWorkspace(provider: provider,
+                                              sourceModel: source,
+                                              isSelected: { true })
+        workspace.start()
+        defer { workspace.stop() }
+        let coarse = (1...25).map { "第\($0)段，" }.joined()
+        guard workspace.generate() else { return false }
+        provider.emit(
+            AITextProviderBlock(index: 0, text: coarse, title: "coarse"),
+            request: 0
+        )
+        let partialIDs = workspace.outputBlocks.map(\.id)
+        guard partialIDs.count > 1,
+              workspace.outputBlocks.map(\.text).joined() == coarse,
+              workspace.outputBlocks.allSatisfy(\.incomplete) else { return false }
+        provider.finish(.success([
+            AITextProviderBlock(index: 0, text: coarse, title: "coarse"),
+        ]), request: 0)
+        guard workspace.phase == .ready
+            && workspace.outputBlocks.count == partialIDs.count
+            && workspace.outputBlocks.count > AITextRuntimeLimits.maximumModelBlockCount
+            && workspace.outputBlocks.map(\.id) == partialIDs
+            && workspace.deliveryPendingBlocks.map(\.text).joined() == coarse else {
+            return false
+        }
+
+        // Growing an earlier provider block must not steal the stable identity
+        // of a later provider block. Provider indices remain logical here;
+        // only the workspace creates child segments.
+        let secondSource = BufferModel()
+        secondSource.stageExternal("source", origin: .rime)
+        let secondProvider = AITextSmokeProvider()
+        let secondWorkspace = AITextPluginWorkspace(
+            provider: secondProvider,
+            sourceModel: secondSource,
+            isSelected: { true }
+        )
+        secondWorkspace.start()
+        defer { secondWorkspace.stop() }
+        guard secondWorkspace.generate() else { return false }
+        secondProvider.emit(
+            AITextProviderBlock(index: 0, text: "第一段。", title: nil),
+            request: 0
+        )
+        secondProvider.emit(
+            AITextProviderBlock(index: 1, text: "后一段。", title: nil),
+            request: 0
+        )
+        guard let laterID = secondWorkspace.outputBlocks.first(where: {
+            $0.text == "后一段。"
+        })?.id else { return false }
+        secondProvider.emit(
+            AITextProviderBlock(index: 0, text: "第一段。新增一段。", title: nil),
+            request: 0
+        )
+        guard secondWorkspace.outputBlocks.first(where: {
+            $0.text == "后一段。"
+        })?.id == laterID else { return false }
+        secondProvider.finish(.success([
+            AITextProviderBlock(index: 0, text: "第一段。新增一段。", title: nil),
+            AITextProviderBlock(index: 1, text: "后一段。", title: nil),
+        ]), request: 0)
+        guard secondWorkspace.phase == .ready
+            && secondWorkspace.outputBlocks.first(where: {
+                $0.text == "后一段。"
+            })?.id == laterID else { return false }
+
+        // A coarse plain-text provider result may exceed the per-delivery-block
+        // limit while remaining within the wire budget. It must stay one
+        // logical provider block until the workspace safely refines it.
+        let largePlain = Array(repeating: "word", count: 5_000)
+            .joined(separator: " ")
+        guard largePlain.utf8.count > AITextRuntimeLimits.maximumBlockBytes,
+              let decodedLarge = try? AITextResultDecoder.decodeFinalText(largePlain),
+              decodedLarge.count == 1,
+              AITextProviderStreamingOutput.blocks(from: largePlain).count == 1 else {
+            return false
+        }
+        let escapedLarge = largePlain
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let partialStructuredLarge =
+            "{\"blocks\":[{\"index\":0,\"text\":\"\(escapedLarge)"
+        guard AITextProviderStreamingOutput.blocks(
+            from: partialStructuredLarge
+        ).first?.text == largePlain else {
+            return false
+        }
+        let thirdSource = BufferModel()
+        thirdSource.stageExternal("source", origin: .rime)
+        let thirdProvider = AITextSmokeProvider()
+        let thirdWorkspace = AITextPluginWorkspace(
+            provider: thirdProvider,
+            sourceModel: thirdSource,
+            isSelected: { true }
+        )
+        thirdWorkspace.start()
+        defer { thirdWorkspace.stop() }
+        guard thirdWorkspace.generate() else { return false }
+        thirdProvider.finish(.success(decodedLarge), request: 0)
+        return thirdWorkspace.phase == .ready
+            && thirdWorkspace.outputBlocks.count
+                == SemanticBlockSegmenter.maximumWorkbenchSegments
+            && thirdWorkspace.outputBlocks.map(\.text).joined() == largePlain
+            && thirdWorkspace.outputBlocks.allSatisfy {
+                $0.text.utf8.count <= AITextRuntimeLimits.maximumBlockBytes
+            }
     }
 
     private static func remoteMirrorAndActionReview() -> Bool {
