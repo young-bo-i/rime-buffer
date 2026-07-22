@@ -664,9 +664,9 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
     private let translationSourcePopup = FirstMousePopUpButton(frame: .zero, pullsDown: false)
     private let translationTargetPopup = FirstMousePopUpButton(frame: .zero, pullsDown: false)
     private let translationSwapButton = FirstMouseButton(title: "", target: nil, action: nil)
-    private let aiGenerateButton = FirstMouseButton(title: "生成", target: nil, action: nil)
     private let disclosureButton = FirstMouseButton(title: "", target: nil, action: nil)
     private let sendButton = FirstMouseButton(title: "", target: nil, action: nil)
+    private let sendButtonProgressIndicator = NSProgressIndicator()
     private let refreshButton = FirstMouseButton(title: "", target: nil, action: nil)
     private let closeButton = FirstMouseButton(title: "", target: nil, action: nil)
     private lazy var dragHandleSlot = BufferMainControlSlot(control: dragHandle, row: .source)
@@ -691,6 +691,7 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
     private var renderingTranslationControls = false
     private var renderingAIControls = false
     private var renderedTranslationLanguages: [TranslationLanguageOption] = []
+    private var sendButtonUsesAccent = false
 
     var isVisible: Bool {
         BufferWindowVisibilityRules.isVisibleOnActiveSpace(
@@ -942,9 +943,9 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         _ = bufferRail.refresh(shielded: contentProtected)
         assert(!contentProtected || bufferRail.isHidden,
                "secure input must leave the text-bearing rail hidden")
-        sendButton.isEnabled = availability.canSend
-            && !contentProtected
-        sendButton.toolTip = availability.canSend ? "发送全部缓冲块" : availability.label
+        refreshPrimaryAction(workspace: derivedWorkspace,
+                             availability: availability,
+                             contentProtected: contentProtected)
         refreshButton.isEnabled = BufferPluginSelectionStore.shared.activeKey != nil
             && !contentProtected
         refreshButton.toolTip = refreshButton.isEnabled
@@ -1061,7 +1062,19 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
                             controlsExpanded ? "chevron.down" : "chevron.up",
                             controlsExpanded ? "收起功能" : "向上展开功能",
                             #selector(disclosureTapped))
-        configureIconButton(sendButton, "paperplane.fill", "发送全部缓冲块", #selector(sendTapped))
+        configureIconButton(sendButton, "paperplane.fill", "发送下一块", #selector(sendTapped))
+        sendButtonProgressIndicator.style = .spinning
+        sendButtonProgressIndicator.controlSize = .small
+        sendButtonProgressIndicator.isDisplayedWhenStopped = false
+        sendButtonProgressIndicator.isHidden = true
+        sendButtonProgressIndicator.translatesAutoresizingMaskIntoConstraints = false
+        sendButton.addSubview(sendButtonProgressIndicator)
+        NSLayoutConstraint.activate([
+            sendButtonProgressIndicator.centerXAnchor.constraint(equalTo: sendButton.centerXAnchor),
+            sendButtonProgressIndicator.centerYAnchor.constraint(equalTo: sendButton.centerYAnchor),
+            sendButtonProgressIndicator.widthAnchor.constraint(equalToConstant: 12),
+            sendButtonProgressIndicator.heightAnchor.constraint(equalToConstant: 12),
+        ])
         configureIconButton(refreshButton,
                             "arrow.clockwise",
                             "刷新或重置当前插件（保留缓冲正文）",
@@ -1127,18 +1140,6 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         translationSwapButton.translatesAutoresizingMaskIntoConstraints = false
         translationSwapButton.widthAnchor.constraint(equalToConstant: 18).isActive = true
         translationSwapButton.heightAnchor.constraint(equalToConstant: 18).isActive = true
-
-        aiGenerateButton.image = RimeUI.symbol("sparkles", pointSize: 10, weight: .semibold)
-        aiGenerateButton.image?.isTemplate = true
-        aiGenerateButton.imagePosition = .imageLeading
-        aiGenerateButton.font = .systemFont(ofSize: 10, weight: .medium)
-        aiGenerateButton.isBordered = false
-        aiGenerateButton.focusRingType = .none
-        aiGenerateButton.controlSize = .small
-        aiGenerateButton.target = self
-        aiGenerateButton.action = #selector(aiGenerateTapped)
-        aiGenerateButton.setContentHuggingPriority(.required, for: .horizontal)
-        aiGenerateButton.setContentCompressionResistancePriority(.required, for: .horizontal)
 
         pluginLoadingIndicator.style = .spinning
         pluginLoadingIndicator.controlSize = .small
@@ -1274,12 +1275,11 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
             $0.contentTintColor = RimeUI.textSecondary
             $0.refreshInteractionAppearance()
         }
-        translationSwapButton.contentTintColor = RimeUI.textSecondary
-        translationSwapButton.refreshInteractionAppearance()
-        aiGenerateButton.contentTintColor = aiGenerateButton.isEnabled
+        sendButton.contentTintColor = sendButtonUsesAccent && sendButton.isEnabled
             ? RimeUI.accentBlue
             : RimeUI.textSecondary
-        aiGenerateButton.refreshInteractionAppearance()
+        translationSwapButton.contentTintColor = RimeUI.textSecondary
+        translationSwapButton.refreshInteractionAppearance()
         pluginActionButtons.values.forEach {
             $0.contentTintColor = $0.isEnabled ? RimeUI.accentBlue : RimeUI.textSecondary
             $0.refreshInteractionAppearance()
@@ -1297,7 +1297,6 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         pluginSelector.setPreviewPointerState(nil)
         translationSourcePopup.setPreviewPointerState(nil)
         translationTargetPopup.setPreviewPointerState(nil)
-        aiGenerateButton.setPreviewPointerState(nil)
         translationSwapButton.setPreviewPointerState(nil)
         pluginActionButtons.values.forEach { $0.setPreviewPointerState(nil) }
 
@@ -1317,6 +1316,78 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         case .bufferRail, .status, .none:
             break
         }
+    }
+
+    private func refreshPrimaryAction(
+        workspace: (any DerivedBufferWorkspace)?,
+        availability: BufferDeliveryCoordinator.Availability,
+        contentProtected: Bool
+    ) {
+        sendButton.imagePosition = .imageOnly
+        sendButtonUsesAccent = false
+
+        guard let controls = workspace as? any DerivedManualGenerationControls else {
+            setSendButtonGenerating(false)
+            setSendButtonSymbol("paperplane.fill")
+            sendButton.isEnabled = availability.canSend && !contentProtected
+            sendButton.toolTip = availability.canSend ? "发送下一块" : availability.label
+            sendButton.setAccessibilityLabel("发送下一块")
+            return
+        }
+
+        switch controls.primaryAction {
+        case .disabled:
+            setSendButtonGenerating(false)
+            setSendButtonSymbol("sparkles")
+            sendButton.isEnabled = false
+            sendButton.toolTip = contentProtected
+                ? "安全输入已开启，AI 已暂停"
+                : (workspace?.statusText ?? "等待内容")
+            sendButton.setAccessibilityLabel("AI 生成不可用")
+        case .requestGeneration:
+            setSendButtonGenerating(false)
+            setSendButtonSymbol("sparkles")
+            sendButton.isEnabled = !contentProtected
+                && controls.canGenerate
+                && !availability.blocksManualGenerationRequest
+            sendButton.toolTip = sendButton.isEnabled
+                ? "用 \(controls.generationProviderName) 处理当前全部缓冲内容"
+                : (availability.blocksManualGenerationRequest
+                    ? availability.label
+                    : (workspace?.statusText ?? "AI 生成不可用"))
+            sendButton.setAccessibilityLabel("请求 AI 生成")
+            sendButtonUsesAccent = true
+        case .generating:
+            sendButton.image = nil
+            sendButton.isEnabled = false
+            sendButton.toolTip = workspace?.statusText ?? "AI 正在生成"
+            sendButton.setAccessibilityLabel("AI 正在生成")
+            setSendButtonGenerating(true)
+        case .deliver:
+            setSendButtonGenerating(false)
+            setSendButtonSymbol("paperplane.fill")
+            sendButton.isEnabled = availability.canSend && !contentProtected
+            sendButton.toolTip = availability.canSend ? "发送下一块" : availability.label
+            sendButton.setAccessibilityLabel("发送下一块 AI 内容")
+            sendButtonUsesAccent = true
+        }
+    }
+
+    private func setSendButtonGenerating(_ generating: Bool) {
+        if generating {
+            guard sendButtonProgressIndicator.isHidden else { return }
+            sendButtonProgressIndicator.isHidden = false
+            sendButtonProgressIndicator.startAnimation(nil)
+        } else {
+            guard !sendButtonProgressIndicator.isHidden else { return }
+            sendButtonProgressIndicator.stopAnimation(nil)
+            sendButtonProgressIndicator.isHidden = true
+        }
+    }
+
+    private func setSendButtonSymbol(_ name: String) {
+        sendButton.image = RimeUI.symbol(name, pointSize: 11, weight: .semibold)
+        sendButton.image?.isTemplate = true
     }
 
     private func refreshPluginActions() {
@@ -1458,12 +1529,11 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
 
     private func refreshManualGenerationControls(
         workspace: any DerivedBufferWorkspace,
-        controls: any DerivedManualGenerationControls
+        controls _: any DerivedManualGenerationControls
     ) {
         pluginSelector.toolTip = "当前插件：\(workspace.workbenchDisplayName)"
-        let loading = controls.isGenerating
         // The target rail owns the animated first-content indicator. Keep the
-        // shelf compact and avoid showing the same spinner twice.
+        // shelf compact; the right-side primary button owns generation state.
         pluginLoadingIndicator.isHidden = true
         pluginLoadingIndicator.stopAnimation(nil)
 
@@ -1477,21 +1547,7 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
                 pluginButtonRow.removeArrangedSubview($0)
                 $0.removeFromSuperview()
             }
-            pluginButtonRow.addArrangedSubview(aiGenerateButton)
         }
-        aiGenerateButton.title = loading ? "生成中…" : "生成"
-        aiGenerateButton.image = RimeUI.symbol(loading ? "hourglass" : "sparkles",
-                                               pointSize: 10,
-                                               weight: .semibold)
-        aiGenerateButton.image?.isTemplate = true
-        aiGenerateButton.isEnabled = !lastSecureInputState
-            && !sessionProtectionActive
-            && controls.canGenerate
-        aiGenerateButton.toolTip = aiGenerateButton.isEnabled
-            ? "用 \(controls.generationProviderName) 处理当前全部缓冲内容"
-            : ((lastSecureInputState || sessionProtectionActive)
-                ? "安全输入已开启，生成已暂停"
-                : workspace.statusText)
     }
 
     private func refreshDerivedWorkspaceWithoutControls(
@@ -1880,7 +1936,34 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
     }
 
     @objc private func sendTapped() {
-        _ = BufferDeliveryCoordinator.shared.sendAll(resolveCompositionIfNeeded: true)
+        guard !sessionProtectionActive else { return }
+        if IsSecureEventInputEnabled() {
+            // Synchronize privacy immediately instead of waiting for the next
+            // periodic secure-input refresh.
+            refresh()
+            return
+        }
+        if let controls = DerivedBufferWorkspaceRouter.selectedWorkspace
+            as? any DerivedManualGenerationControls {
+            switch controls.primaryAction {
+            case .requestGeneration:
+                let availability = BufferDeliveryCoordinator.shared.availability()
+                guard !availability.blocksManualGenerationRequest else {
+                    NSSound.beep()
+                    refresh()
+                    return
+                }
+                if !controls.generate() { NSSound.beep() }
+                refresh()
+                RimeBufferController.refreshActiveUI()
+                return
+            case .generating, .disabled:
+                return
+            case .deliver:
+                break
+            }
+        }
+        _ = BufferDeliveryCoordinator.shared.sendNext(resolveCompositionIfNeeded: true)
         // Delivery.insert atomically replaces the idle marked guard. Restore it
         // for the still-current external lease before the next Return.
         RimeBufferController.refreshActiveUI()
@@ -1907,15 +1990,6 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
     @objc private func pluginActionTapped(_ sender: NSButton) {
         guard let key = (sender as? BufferPluginActionButton)?.pluginKey else { return }
         ActionPluginHost.shared.invoke(key)
-    }
-
-    @objc private func aiGenerateTapped() {
-        guard !IsSecureEventInputEnabled(),
-              let controls = DerivedBufferWorkspaceRouter.selectedWorkspace
-                as? any DerivedManualGenerationControls else { return }
-        if !controls.generate() { NSSound.beep() }
-        refresh()
-        RimeBufferController.refreshActiveUI()
     }
 
     @objc private func translationSourceChanged() {

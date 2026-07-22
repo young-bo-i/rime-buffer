@@ -565,6 +565,56 @@ private func runActionPluginStreamModelSmokeTest() -> Bool {
           !model.hasIncompletePluginBlocks else {
         return streamSmokeFail("model did not atomically promote the terminal snapshot")
     }
+
+    // Marine can return several logical blocks in one blocks-v1 response. A
+    // primary send action (Return or paper plane) must validate and consume
+    // exactly one block per activation, preserving the remainder in order.
+    var insertedTexts: [String] = []
+    var completedResults: [BufferDeliveryCoordinator.SendResult] = []
+    let coordinator = BufferDeliveryCoordinator(
+        model: model,
+        dependencies: .init(
+            resolveTarget: { expected in
+                guard expected == nil || expected == focus else { return nil }
+                return .init(
+                    token: focus,
+                    compositionActive: false,
+                    resolveComposition: {},
+                    deliver: { block in
+                        insertedTexts.append(block.text)
+                        return true
+                    }
+                )
+            },
+            secureInputEnabled: { false },
+            validatePlugin: { _, _, completion in completion(.allowed) },
+            refreshUI: {}
+        )
+    )
+    let firstSend = coordinator.sendNext(
+        expectedToken: focus,
+        completion: { completedResults.append($0) }
+    )
+    guard firstSend.deferred,
+          completedResults == [.init(sentCount: 1, blockedReason: nil)],
+          insertedTexts == ["最终第一段"],
+          model.blocks.map(\.id) == [secondID],
+          model.blocks.map(\.text) == ["最终第二段"] else {
+        return streamSmokeFail("primary send did not preserve the next Marine block")
+    }
+    let secondSend = coordinator.sendNext(
+        expectedToken: focus,
+        completion: { completedResults.append($0) }
+    )
+    guard secondSend.deferred,
+          completedResults == [
+            .init(sentCount: 1, blockedReason: nil),
+            .init(sentCount: 1, blockedReason: nil),
+          ],
+          insertedTexts == ["最终第一段", "最终第二段"],
+          model.blocks.isEmpty else {
+        return streamSmokeFail("repeated primary sends did not advance one Marine block at a time")
+    }
     return true
 }
 

@@ -106,14 +106,29 @@ final class CompositionSession {
         // focus probes. Keep one guard for the whole buffer-control lease
         // instead of replacing it after every physical key.
         if !bufferGuardActive {
-            client.setMarkedText(bufferGuardText as NSString,
-                                 selectionRange: NSRange(location: (bufferGuardText as NSString).length,
-                                                         length: 0),
-                                 replacementRange: NSRange(location: NSNotFound, length: 0))
-            markedTextActive = true
-            bufferGuardActive = true
+            installBufferGuard(client: client)
         }
         composing = rimeComposing
+    }
+
+    /// Reassert the invisible session for the current Return keyDown. Some web
+    /// editors can end marked text without an observable focus transition,
+    /// leaving our local guard latch stale. A targeted refresh here makes the
+    /// same keyDown an explicit IME transaction before its block is inserted.
+    func reassertBufferGuard(rimeComposing: Bool, client: IMKTextInput) {
+        installBufferGuard(client: client)
+        composing = rimeComposing
+    }
+
+    private func installBufferGuard(client: IMKTextInput) {
+        client.setMarkedText(bufferGuardText as NSString,
+                             selectionRange: NSRange(
+                                location: (bufferGuardText as NSString).length,
+                                length: 0
+                             ),
+                             replacementRange: NSRange(location: NSNotFound, length: 0))
+        markedTextActive = true
+        bufferGuardActive = true
     }
 
     /// End the session explicitly (escape / focus loss / commit without insert).

@@ -93,6 +93,14 @@ final class BufferDeliveryCoordinator {
             return false
         }
 
+        /// AI generation snapshots the committed source rail. Starting it
+        /// while the focused client still owns preedit would omit that text,
+        /// then the later composition settlement would invalidate the request.
+        var blocksManualGenerationRequest: Bool {
+            if case .blocked(.composing) = self { return true }
+            return false
+        }
+
         var label: String {
             switch self {
             case .ready: return "可发送"

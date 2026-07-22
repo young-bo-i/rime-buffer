@@ -36,10 +36,31 @@ protocol DerivedLanguagePairControls: AnyObject {
     @discardableResult func swapLanguages() -> Bool
 }
 
+enum DerivedManualGenerationPrimaryAction: Equatable {
+    case disabled
+    case requestGeneration
+    case generating
+    case deliver
+
+    var beginsDeliveryGesture: Bool { self == .deliver }
+}
+
+enum DerivedManualGenerationPrimaryActionRules {
+    static func resolve(isGenerating: Bool,
+                        hasReadyDelivery: Bool,
+                        canGenerate: Bool) -> DerivedManualGenerationPrimaryAction {
+        if isGenerating { return .generating }
+        if hasReadyDelivery { return .deliver }
+        if canGenerate { return .requestGeneration }
+        return .disabled
+    }
+}
+
 protocol DerivedManualGenerationControls: AnyObject {
     var canGenerate: Bool { get }
     var isGenerating: Bool { get }
     var generationProviderName: String { get }
+    var primaryAction: DerivedManualGenerationPrimaryAction { get }
     @discardableResult func generate() -> Bool
 }
 
@@ -61,6 +82,13 @@ extension AITextPluginWorkspace: DerivedBufferWorkspace,
     var workbenchDisplayName: String { "AI 生成 · \(kind.displayName)" }
     var isGenerating: Bool { phase == .running }
     var generationProviderName: String { kind.displayName }
+    var primaryAction: DerivedManualGenerationPrimaryAction {
+        DerivedManualGenerationPrimaryActionRules.resolve(
+            isGenerating: isGenerating,
+            hasReadyDelivery: phase == .ready && !deliveryPendingBlocks.isEmpty,
+            canGenerate: canGenerate
+        )
+    }
 
     @discardableResult
     func requestRefresh() -> Bool { resetAndRefresh() }

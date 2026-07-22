@@ -713,6 +713,83 @@ func runEngineSmokeTest() -> Bool {
         return false
     }
 
+    // The frontend's deferred Shift contract must protect a live composition:
+    // a used/held gesture emits no mode-switch pair, while a proven standalone
+    // tap still reaches librime and preserves its configured commit_code
+    // semantics. This exercises the bundled engine rather than only the pure
+    // gesture reducer below.
+    let shiftSession = engine.createSession()
+    guard shiftSession != 0,
+          engine.selectSchema("rime_ice", session: shiftSession) else {
+        print("FAILED: cannot create isolated Shift smoke session")
+        return false
+    }
+    engine.clearComposition(session: shiftSession)
+    engine.setOption("ascii_mode", false, session: shiftSession)
+    _ = engine.takeCommit(session: shiftSession)
+    for scalar in "ni".unicodeScalars {
+        _ = engine.processKey(Int32(scalar.value), session: shiftSession)
+    }
+    let protectedShiftBefore = engine.getContext(session: shiftSession)
+    var protectedShift = ShiftModifierGesture(
+        beganAt: 1,
+        rimeKeycode: RimeKey.shiftL,
+        session: shiftSession,
+        schemaID: "rime_ice"
+    )
+    protectedShift.noteModifierUse()
+    guard protectedShift.releaseDecision(
+            at: 1.1,
+            currentSession: shiftSession,
+            currentSchemaID: "rime_ice"
+          ) == .discard else {
+        print("FAILED: modified Shift should not replay into librime")
+        return false
+    }
+    let protectedShiftAfter = engine.getContext(session: shiftSession)
+    guard protectedShiftAfter.active == protectedShiftBefore.active,
+          protectedShiftAfter.input == protectedShiftBefore.input,
+          protectedShiftAfter.preedit == protectedShiftBefore.preedit,
+          protectedShiftAfter.candidates.map(\.text)
+            == protectedShiftBefore.candidates.map(\.text),
+          engine.takeCommit(session: shiftSession) == nil,
+          !engine.getStatus(session: shiftSession).asciiMode else {
+        print("FAILED: modified Shift changed live composition")
+        return false
+    }
+
+    let standaloneShift = ShiftModifierGesture(
+        beganAt: 2,
+        rimeKeycode: RimeKey.shiftL,
+        session: shiftSession,
+        schemaID: "rime_ice"
+    )
+    guard case let .replayStandaloneTap(rimeKeycode) = standaloneShift.releaseDecision(
+        at: 2.1,
+        currentSession: shiftSession,
+        currentSchemaID: "rime_ice"
+    ) else {
+        print("FAILED: standalone Shift replay decision")
+        return false
+    }
+    _ = engine.processKey(rimeKeycode,
+                          mask: RimeKey.shiftMask,
+                          session: shiftSession)
+    _ = engine.processKey(rimeKeycode,
+                          mask: RimeKey.releaseMask,
+                          session: shiftSession)
+    let standaloneShiftCommit = engine.takeCommit(session: shiftSession)
+    guard standaloneShiftCommit == protectedShiftBefore.input,
+          engine.getContext(session: shiftSession).input.isEmpty,
+          engine.getStatus(session: shiftSession).asciiMode else {
+        print("FAILED: standalone Shift did not preserve commit_code semantics",
+              standaloneShiftCommit ?? "<nil>")
+        return false
+    }
+    engine.setOption("ascii_mode", false, session: shiftSession)
+    engine.clearComposition(session: shiftSession)
+    engine.destroySession(shiftSession)
+
     guard engine.selectSchema("english", session: session),
           engine.getStatus(session: session).schemaId == "english" else {
         print("FAILED: cannot select english")
@@ -4041,8 +4118,121 @@ func runBufferWindowSmokeTest() -> Bool {
           ) == .executeBufferAction,
           BufferControlRoutingRules.disposition(
             bufferActive: true, ownClient: false, exactFocus: false
-          ) == .consumeOnly else {
+          ) == .consumeOnly,
+          BufferEnterSecureInputRules.disposition(secureInputEnabled: false)
+            == .normal,
+          BufferEnterSecureInputRules.disposition(secureInputEnabled: true)
+            == .consumeWithoutGuardOrGeneration else {
         print("FAILED: buffer Return/Backspace isolation disposition")
+        return false
+    }
+
+    guard DerivedManualGenerationPrimaryActionRules.resolve(
+            isGenerating: false,
+            hasReadyDelivery: false,
+            canGenerate: false
+          ) == .disabled,
+          DerivedManualGenerationPrimaryActionRules.resolve(
+            isGenerating: false,
+            hasReadyDelivery: false,
+            canGenerate: true
+          ) == .requestGeneration,
+          DerivedManualGenerationPrimaryActionRules.resolve(
+            isGenerating: true,
+            hasReadyDelivery: true,
+            canGenerate: true
+          ) == .generating,
+          DerivedManualGenerationPrimaryActionRules.resolve(
+            isGenerating: false,
+            hasReadyDelivery: true,
+            canGenerate: true
+          ) == .deliver,
+          !DerivedManualGenerationPrimaryAction.disabled.beginsDeliveryGesture,
+          !DerivedManualGenerationPrimaryAction.requestGeneration.beginsDeliveryGesture,
+          !DerivedManualGenerationPrimaryAction.generating.beginsDeliveryGesture,
+          DerivedManualGenerationPrimaryAction.deliver.beginsDeliveryGesture,
+          BufferDeliveryCoordinator.Availability.blocked(.composing)
+            .blocksManualGenerationRequest,
+          !BufferDeliveryCoordinator.Availability.blocked(.nothingPending)
+            .blocksManualGenerationRequest,
+          !BufferDeliveryCoordinator.Availability.ready
+            .blocksManualGenerationRequest else {
+        print("FAILED: AI primary action state/Return routing contract")
+        return false
+    }
+
+    let shortShiftTap = ShiftModifierGesture(
+        beganAt: 10,
+        rimeKeycode: RimeKey.shiftL,
+        session: 7,
+        schemaID: "rime_ice"
+    )
+    let shortRightShiftTap = ShiftModifierGesture(
+        beganAt: 10,
+        rimeKeycode: RimeKey.shiftR,
+        session: 7,
+        schemaID: "rime_ice"
+    )
+    var usedShift = shortShiftTap
+    usedShift.noteModifierUse()
+    let premodifiedShift = ShiftModifierGesture(
+        beganAt: 10,
+        rimeKeycode: RimeKey.shiftL,
+        session: 7,
+        schemaID: "rime_ice",
+        beganWithOtherModifier: true
+    )
+    var overlappingShift = shortShiftTap
+    overlappingShift.noteModifierUse()
+    var cancelledShift = shortShiftTap
+    cancelledShift.cancelForFocusChange()
+    guard ShiftModifierGesture.standaloneTapLimit == 0.5,
+          shortShiftTap.releaseDecision(
+            at: 10.499,
+            currentSession: 7,
+            currentSchemaID: "rime_ice"
+          ) == .replayStandaloneTap(rimeKeycode: RimeKey.shiftL),
+          shortRightShiftTap.releaseDecision(
+            at: 10.1,
+            currentSession: 7,
+            currentSchemaID: "rime_ice"
+          ) == .replayStandaloneTap(rimeKeycode: RimeKey.shiftR),
+          shortShiftTap.releaseDecision(
+            at: 10.5,
+            currentSession: 7,
+            currentSchemaID: "rime_ice"
+          ) == .discard,
+          usedShift.releaseDecision(
+            at: 10.1,
+            currentSession: 7,
+            currentSchemaID: "rime_ice"
+          ) == .discard,
+          premodifiedShift.releaseDecision(
+            at: 10.1,
+            currentSession: 7,
+            currentSchemaID: "rime_ice"
+          ) == .discard,
+          overlappingShift.releaseDecision(
+            at: 10.1,
+            currentSession: 7,
+            currentSchemaID: "rime_ice"
+          ) == .discard,
+          cancelledShift.releaseDecision(
+            at: 10.1,
+            currentSession: 7,
+            currentSchemaID: "rime_ice"
+          ) == .discard,
+          usedShift.releaseDecision(
+            at: 10.1,
+            currentSession: 8,
+            currentSchemaID: "rime_ice"
+          ) == .discard,
+          usedShift.releaseDecision(
+            at: 10.1,
+            currentSession: 7,
+            currentSchemaID: "my_combo"
+          ) == .discard else {
+        print("FAILED: deferred standalone/modified/held Shift routing")
         return false
     }
 
@@ -5024,6 +5214,12 @@ func runBufferWindowSmokeTest() -> Bool {
           targetPosition != nil,
           sourcePosition! < targetPosition!,
           !translationFragments.contains("→"),
+          !translationFragments.contains("原"),
+          !translationFragments.contains("译"),
+          TranslationRailRoleSymbolRules.resolve("原", target: false)
+            == .init(name: "text.bubble", accessibilityLabel: "原始内容"),
+          TranslationRailRoleSymbolRules.resolve("答", target: true)
+            == .init(name: "sparkles", accessibilityLabel: "AI 回答"),
           reusedTargetViews,
           translationShielded else {
         print("FAILED: translation rail must render two stacked, independently shielded buffers")

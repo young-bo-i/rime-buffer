@@ -22,6 +22,18 @@ enum BufferControlRoutingRules {
     }
 }
 
+enum BufferEnterSecureInputDisposition: Equatable {
+    case normal
+    case consumeWithoutGuardOrGeneration
+}
+
+enum BufferEnterSecureInputRules {
+    static func disposition(secureInputEnabled: Bool)
+        -> BufferEnterSecureInputDisposition {
+        secureInputEnabled ? .consumeWithoutGuardOrGeneration : .normal
+    }
+}
+
 enum BufferEnterPollDecision: Equatable {
     case wait(progress: Double)
     case sendNext
@@ -92,6 +104,58 @@ struct BufferEnterCallbackOwnership: Equatable {
     }
 }
 
+enum ShiftGestureReleaseDecision: Equatable {
+    case replayStandaloneTap(rimeKeycode: Int32)
+    case discard
+}
+
+/// librime treats a sub-500ms Shift press/release with no intervening Rime key
+/// as its standalone ASCII switch. Defer that pair until physical release so
+/// a modified/held gesture can be discarded before `commit_code` mutates the
+/// current composition. Only a proven standalone tap is replayed to librime.
+struct ShiftModifierGesture: Equatable {
+    static let standaloneTapLimit: TimeInterval = 0.5
+
+    let beganAt: TimeInterval
+    let rimeKeycode: Int32
+    let session: UInt64
+    let schemaID: String
+    private(set) var usedAsModifier = false
+
+    init(beganAt: TimeInterval,
+         rimeKeycode: Int32,
+         session: UInt64,
+         schemaID: String,
+         beganWithOtherModifier: Bool = false) {
+        self.beganAt = beganAt
+        self.rimeKeycode = rimeKeycode
+        self.session = session
+        self.schemaID = schemaID
+        usedAsModifier = beganWithOtherModifier
+    }
+
+    mutating func noteModifierUse() {
+        usedAsModifier = true
+    }
+
+    mutating func cancelForFocusChange() {
+        usedAsModifier = true
+    }
+
+    func releaseDecision(at releasedAt: TimeInterval,
+                         currentSession: UInt64,
+                         currentSchemaID: String) -> ShiftGestureReleaseDecision {
+        guard session != 0,
+              session == currentSession,
+              schemaID == currentSchemaID else { return .discard }
+        let elapsed = max(0, releasedAt - beganAt)
+        guard !usedAsModifier, elapsed < Self.standaloneTapLimit else {
+            return .discard
+        }
+        return .replayStandaloneTap(rimeKeycode: rimeKeycode)
+    }
+}
+
 @objc(RimeBufferController)
 final class RimeBufferController: IMKInputController {
 
@@ -112,6 +176,7 @@ final class RimeBufferController: IMKInputController {
     private var currentSchemaId = ""
     private var currentASCIIMode = false
     private var lastModifiers: NSEvent.ModifierFlags = []
+    private var shiftGesture: ShiftModifierGesture?
     private var focusToken: FocusToken?
     private var lastBufferBackspaceKeyHandledAt: CFAbsoluteTime = 0
     private var lastBufferBackspaceCommandHandledAt: CFAbsoluteTime = 0
@@ -522,6 +587,13 @@ final class RimeBufferController: IMKInputController {
         // flagsChanged delta stream whenever a modifier (esp. Caps Lock) is
         // held or locked across a focus change.
         lastModifiers = NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if !lastModifiers.contains(.shift) {
+            shiftGesture = nil
+        } else {
+            // A Shift that began outside this trusted focus can modify keys,
+            // but its eventual release must never become a standalone toggle.
+            shiftGesture?.cancelForFocusChange()
+        }
         let activeClient: IMKTextInput? = (sender as? IMKTextInput) ?? self.client()
         if let activeClient {
             guard adoptActivationFocus(client: activeClient) else {
@@ -580,6 +652,7 @@ final class RimeBufferController: IMKInputController {
             session = 0
             currentSchemaId = ""
             currentASCIIMode = false
+            shiftGesture = nil
             composition.markCleared()
         }
         var fresh = false
@@ -639,6 +712,7 @@ final class RimeBufferController: IMKInputController {
         }
         currentSchemaId = ""
         currentASCIIMode = false
+        shiftGesture = nil
         candidateWindow.hideAll()
         IMELog.write("rime session retired for user dictionary maintenance")
     }
@@ -1228,6 +1302,13 @@ final class RimeBufferController: IMKInputController {
     }
 
     private func handleKeyDown(_ event: NSEvent, client: IMKTextInput) -> Bool {
+        // Mark before every early return (Cmd shortcuts, stream capture,
+        // buffer controls and direct shifted text). Those paths deliberately
+        // do not feed this keyDown to librime, but it still means Shift was a
+        // modifier rather than a standalone mode-toggle tap.
+        if event.modifierFlags.contains(.shift) {
+            shiftGesture?.noteModifierUse()
+        }
         publishTelemetryKey(event, client: client)
 
         // Cmd belongs to the app, always (macOS Rime configs never bind Super).
@@ -1413,6 +1494,19 @@ final class RimeBufferController: IMKInputController {
             return true
         }
         lastBufferEnterKeyHandledAt = now
+        if BufferEnterSecureInputRules.disposition(
+            secureInputEnabled: IsSecureEventInputEnabled()
+        ) == .consumeWithoutGuardOrGeneration {
+            // Fail closed at the outer Return boundary, before composition
+            // settlement, stream capture, AI generation or delivery timing.
+            suppressBufferEnterForImmediateAction(client: client,
+                                                  hardwareKeyCode: hardwareKeyCode)
+            DerivedBufferWorkspaceRouter.setProtectedOnAll(true)
+            IMELog.write("buffer enter consumed at secure-input boundary")
+            updateUI(client: client)
+            BufferWindowController.shared.refresh()
+            return true
+        }
         if streamInputModeSelected {
             guard let lease = streamInputLease(client: client) else {
                 StreamInputWorkspace.shared.authorityRejected()
@@ -1447,8 +1541,69 @@ final class RimeBufferController: IMKInputController {
                                                 hardwareKeyCode: hardwareKeyCode)
             return true
         }
+        if handleManualGenerationBufferEnterIfNeeded(
+            client: client,
+            hardwareKeyCode: hardwareKeyCode
+        ) {
+            return true
+        }
         beginBufferEnterGesture(client: client,
                                 hardwareKeyCode: hardwareKeyCode)
+        return true
+    }
+
+    /// AI workspaces use the same physical Return as their right-side primary
+    /// control. Only a ready target enters tap/hold delivery; every other state
+    /// owns the whole press immediately so a synchronous provider result can
+    /// never be delivered again by that press's keyUp.
+    private func handleManualGenerationBufferEnterIfNeeded(
+        client: IMKTextInput,
+        hardwareKeyCode: UInt16
+    ) -> Bool {
+        guard let controls = DerivedBufferWorkspaceRouter.selectedWorkspace
+            as? any DerivedManualGenerationControls else { return false }
+
+        if BufferEnterSecureInputRules.disposition(
+            secureInputEnabled: IsSecureEventInputEnabled()
+        ) == .consumeWithoutGuardOrGeneration {
+            suppressBufferEnterForImmediateAction(client: client,
+                                                  hardwareKeyCode: hardwareKeyCode)
+            DerivedBufferWorkspaceRouter.setProtectedOnAll(true)
+            IMELog.write("buffer enter consumed; secure input blocked AI generation")
+            updateUI(client: client)
+            BufferWindowController.shared.refresh()
+            return true
+        }
+
+        let action = controls.primaryAction
+        guard !action.beginsDeliveryGesture else { return false }
+        suppressBufferEnterForImmediateAction(client: client,
+                                              hardwareKeyCode: hardwareKeyCode)
+        // setMarkedText can synchronously re-enter a host. Recheck immediately
+        // before calling a provider so a secure-input transition during guard
+        // installation still fails closed.
+        if BufferEnterSecureInputRules.disposition(
+            secureInputEnabled: IsSecureEventInputEnabled()
+        ) == .consumeWithoutGuardOrGeneration {
+            DerivedBufferWorkspaceRouter.setProtectedOnAll(true)
+            IMELog.write("buffer enter consumed; secure input changed before AI request")
+            updateUI(client: client)
+            BufferWindowController.shared.refresh()
+            return true
+        }
+        switch action {
+        case .requestGeneration:
+            let requested = controls.generate()
+            IMELog.write("buffer enter requested AI generation accepted=\(requested)")
+        case .generating:
+            IMELog.write("buffer enter consumed while AI generation is running")
+        case .disabled:
+            IMELog.write("buffer enter consumed while AI generation is unavailable")
+        case .deliver:
+            break
+        }
+        updateUI(client: client)
+        BufferWindowController.shared.refresh()
         return true
     }
 
@@ -1712,6 +1867,10 @@ final class RimeBufferController: IMKInputController {
     }
 
     private func cancelFocusBoundGestures() {
+        // Shift press is deferred, so cancellation creates no librime release
+        // debt. Keep the physical gesture only to discard a later same-focus
+        // release if the key remains held across activation.
+        shiftGesture?.cancelForFocusChange()
         let mustConsumeRelease = bufferEnterPending
             || bufferEnterSuppressUntilPhysicalUp
             || bufferEnterCallbackOwnership.suppressesKeyUp
@@ -1751,6 +1910,11 @@ final class RimeBufferController: IMKInputController {
         bufferEnterUsesStreamInput = streamInputModeSelected
         bufferEnterHardwareKeyCode = CGKeyCode(hardwareKeyCode)
         bufferEnterStartedAt = CFAbsoluteTimeGetCurrent()
+        // Reassert only for the exact Return keyDown. This gives Chromium a
+        // current IME marked-text transaction even if the web editor silently
+        // ended the lease's earlier idle guard, while preserving tap/hold
+        // timing for the actual delivery decision.
+        reassertBufferEnterGuardIfAllowed(client: client)
         BufferWindowController.shared.setEnterHoldProgress(0)
         scheduleBufferEnterPoll()
         IMELog.write("buffer enter gesture began keyCode=\(hardwareKeyCode)")
@@ -1771,6 +1935,35 @@ final class RimeBufferController: IMKInputController {
         bufferEnterStartedAt = CFAbsoluteTimeGetCurrent()
         BufferWindowController.shared.setEnterHoldProgress(nil)
         scheduleBufferEnterPoll()
+    }
+
+    /// Claim a non-delivery Return on keyDown, reasserting the invisible IME
+    /// guard before an AI request or no-op state can reach a web editor.
+    private func suppressBufferEnterForImmediateAction(client: IMKTextInput,
+                                                       hardwareKeyCode: UInt16) {
+        let lease = currentLease(matching: client)
+        bufferEnterPending = false
+        bufferEnterSuppressUntilPhysicalUp = true
+        bufferEnterCallbackOwnership.claimPress()
+        bufferEnterClient = client
+        bufferEnterOwner = lease?.token
+        bufferEnterUsesStreamInput = false
+        bufferEnterHardwareKeyCode = CGKeyCode(hardwareKeyCode)
+        bufferEnterStartedAt = CFAbsoluteTimeGetCurrent()
+        reassertBufferEnterGuardIfAllowed(client: client)
+        BufferWindowController.shared.setEnterHoldProgress(nil)
+        scheduleBufferEnterPoll()
+    }
+
+    /// The invisible Chromium guard is never legal in a secure field. This is
+    /// checked at the action boundary instead of relying on the workbench's
+    /// periodic privacy refresh, which can lag an OS secure-input transition.
+    private func reassertBufferEnterGuardIfAllowed(client: IMKTextInput) {
+        guard BufferEnterSecureInputRules.disposition(
+            secureInputEnabled: IsSecureEventInputEnabled()
+        ) == .normal else { return }
+        composition.reassertBufferGuard(rimeComposing: false,
+                                        client: client)
     }
 
     /// Own an untrusted Return press without retaining a client or focus token.
@@ -2304,9 +2497,18 @@ final class RimeBufferController: IMKInputController {
 
     private func handleFlags(_ event: NSEvent, client: IMKTextInput) -> Bool {
         let modifiers = event.modifierFlags
-        let changes = lastModifiers.symmetricDifference(modifiers)
+        var changes = lastModifiers.symmetricDifference(modifiers)
         if !changes.isEmpty {
             publishTelemetryModifierPress(event, client: client)
+        }
+
+        let nonShiftChanges = changes.subtracting(.shift)
+        let isSecondShiftTransition = changes.isEmpty
+            && modifiers.contains(.shift)
+            && (event.keyCode == 56 || event.keyCode == 60)
+        if modifiers.contains(.shift),
+           !nonShiftChanges.isEmpty || isSecondShiftTransition {
+            shiftGesture?.noteModifierUse()
         }
 
         guard rimeEngine.start(), ensureSessionReady() else {
@@ -2316,6 +2518,67 @@ final class RimeBufferController: IMKInputController {
         guard !changes.isEmpty else {
             lastModifiers = modifiers
             return false
+        }
+
+        let rimeMask = RimeKey.modifierMask(from: modifiers)
+        var handled = false
+
+        // Do not put librime's ascii_composer into its pending-Shift state on
+        // physical keyDown. Its release path can run `commit_code` before a
+        // frontend has a chance to restore ascii_mode, which would destroy an
+        // existing composition for Shift+Option and other controller-owned
+        // paths. Replay a matched press/release only after we have proved this
+        // was a short standalone tap; modified, long and focus-cancelled
+        // gestures never reach ascii_composer at all.
+        if changes.contains(.shift) {
+            let pressed = modifiers.contains(.shift)
+            let eventKey = RimeKey.fromVirtualKeyCode(event.keyCode)
+            let shiftKey = eventKey == RimeKey.shiftL || eventKey == RimeKey.shiftR
+                ? eventKey!
+                : RimeKey.shiftL
+            if pressed {
+                // Preserve processRimeKey's non-chord boundary even though the
+                // mode-switch event itself is deferred until release.
+                chord.flush()
+                mutualPairingState.reset()
+                let otherModifiers = modifiers.intersection([
+                    .control, .option, .command, .function,
+                ])
+                shiftGesture = ShiftModifierGesture(
+                    beganAt: event.timestamp,
+                    rimeKeycode: shiftKey,
+                    session: session,
+                    schemaID: currentSchemaId,
+                    beganWithOtherModifier: !otherModifiers.isEmpty
+                )
+            } else {
+                let releaseGesture = shiftGesture
+                shiftGesture = nil
+                if let releaseGesture,
+                   case let .replayStandaloneTap(rimeKeycode) = releaseGesture.releaseDecision(
+                    at: event.timestamp,
+                    currentSession: session,
+                    currentSchemaID: currentSchemaId
+                ) {
+                    let lock = rimeMask & RimeKey.lockMask
+                    handled = processRimeKey(
+                        rimeKeycode,
+                        mask: RimeKey.shiftMask | lock,
+                        client: client
+                    ) || handled
+                    handled = processRimeKey(
+                        rimeKeycode,
+                        mask: rimeMask | RimeKey.releaseMask,
+                        client: client
+                    ) || handled
+                    IMELog.write("standalone Shift tap replayed to Rime key=\(rimeKeycode)")
+                }
+            }
+            changes.remove(.shift)
+            if changes.isEmpty {
+                lastModifiers = modifiers
+                return handled
+            }
         }
 
         if changes.contains(.option) {
@@ -2342,18 +2605,15 @@ final class RimeBufferController: IMKInputController {
         }
         guard let keycode = RimeKey.fromVirtualKeyCode(keyCode) else {
             lastModifiers = modifiers
-            return false
+            return handled
         }
 
-        // Byte-identical to the proven prototype: press/release stream with
-        // Caps sent as mask^lockMask (ascii_composer switch keys — Shift_L:
-        // commit_code, good_old_caps_lock — depend on this exact ordering).
-        let rimeMask = RimeKey.modifierMask(from: modifiers)
-        var handled = false
+        // Preserve the proven press/release stream, with Caps sent as
+        // mask^lockMask (good_old_caps_lock depends on this exact ordering).
         if changes.contains(.capsLock) {
             handled = processRimeKey(keycode, mask: rimeMask ^ RimeKey.lockMask, client: client) || handled
         } else {
-            let watched: [NSEvent.ModifierFlags] = [.shift, .control, .option, .command]
+            let watched: [NSEvent.ModifierFlags] = [.control, .option, .command]
             for flag in watched where changes.contains(flag) {
                 let pressed = modifiers.contains(flag)
                 let mask = pressed ? rimeMask : (rimeMask | RimeKey.releaseMask)

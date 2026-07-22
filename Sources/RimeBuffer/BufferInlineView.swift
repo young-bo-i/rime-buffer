@@ -27,6 +27,27 @@ enum BufferInlineMetrics {
     }
 }
 
+struct TranslationRailRoleSymbol: Equatable {
+    let name: String
+    let accessibilityLabel: String
+}
+
+enum TranslationRailRoleSymbolRules {
+    static func resolve(_ role: String, target: Bool) -> TranslationRailRoleSymbol {
+        switch role {
+        case "原": return .init(name: "text.bubble", accessibilityLabel: "原始内容")
+        case "译": return .init(name: "globe", accessibilityLabel: "翻译结果")
+        case "答": return .init(name: "sparkles", accessibilityLabel: "AI 回答")
+        case "拼": return .init(name: "keyboard", accessibilityLabel: "拼音输入")
+        case "文": return .init(name: "text.bubble.fill", accessibilityLabel: "转换结果")
+        default:
+            return target
+                ? .init(name: "sparkles", accessibilityLabel: "处理结果")
+                : .init(name: "text.bubble", accessibilityLabel: "原始内容")
+        }
+    }
+}
+
 /// Mutable translation chip used by keyed rail reconciliation. Keeping the
 /// view and label alive across snapshots avoids stack-view teardown flicker and
 /// lets consciousness-stream input distinguish a confirmed prefix from an
@@ -212,8 +233,8 @@ final class BufferInlineView: NSView {
     private let loadingIndicator = NSProgressIndicator()
     private let enterHoldProgressLayer = CALayer()
     private var renderedBlockIDs: [UUID] = []
-    private var translationSourceRoleView: NSTextField?
-    private var translationTargetRoleView: NSTextField?
+    private var translationSourceRoleView: NSImageView?
+    private var translationTargetRoleView: NSImageView?
     private var translationSourceChipView: TranslationRailChipView?
     private var translationTargetChipViews: [UUID: TranslationRailChipView] = [:]
     private var translationMessageView: TranslationRailMessageView?
@@ -572,10 +593,11 @@ final class BufferInlineView: NSView {
                                    active: Bool) {
         renderedBlockIDs.removeAll(keepingCapacity: true)
         let sourceRole = translationSourceRoleView
-            ?? translationRoleLabel(snapshot.sourceRole, target: false)
+            ?? translationRoleIcon(snapshot.sourceRole, target: false)
         translationSourceRoleView = sourceRole
-        sourceRole.stringValue = snapshot.sourceRole
-        sourceRole.textColor = RimeUI.textSecondary
+        updateTranslationRoleIcon(sourceRole,
+                                  role: snapshot.sourceRole,
+                                  target: false)
         var sourceViews: [NSView] = [sourceRole]
         if snapshot.sourceText.isEmpty {
             translationSourceEmptyLabel.stringValue = snapshot.sourceEmptyText
@@ -596,10 +618,11 @@ final class BufferInlineView: NSView {
         reconcileArrangedSubviews(sourceViews, in: translationSourceRow)
 
         let targetRole = translationTargetRoleView
-            ?? translationRoleLabel(snapshot.targetRole, target: true)
+            ?? translationRoleIcon(snapshot.targetRole, target: true)
         translationTargetRoleView = targetRole
-        targetRole.stringValue = snapshot.targetRole
-        targetRole.textColor = RimeUI.accentBlue
+        updateTranslationRoleIcon(targetRole,
+                                  role: snapshot.targetRole,
+                                  target: true)
         var targetViews: [NSView] = [targetRole]
         var loading = false
         var message: String?
@@ -693,16 +716,31 @@ final class BufferInlineView: NSView {
         }
     }
 
-    private func translationRoleLabel(_ role: String, target: Bool) -> NSTextField {
-        let label = NSTextField(labelWithString: role)
-        label.font = .systemFont(ofSize: 9, weight: .semibold)
-        label.textColor = target ? RimeUI.accentBlue : RimeUI.textSecondary
-        label.alignment = .center
-        label.translatesAutoresizingMaskIntoConstraints = false
-        label.widthAnchor.constraint(greaterThanOrEqualToConstant: 14).isActive = true
-        label.setContentHuggingPriority(.required, for: .horizontal)
-        label.setContentCompressionResistancePriority(.required, for: .horizontal)
-        return label
+    private func translationRoleIcon(_ role: String, target: Bool) -> NSImageView {
+        let icon = NSImageView()
+        icon.imageScaling = .scaleProportionallyDown
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            icon.widthAnchor.constraint(equalToConstant: 14),
+            icon.heightAnchor.constraint(equalToConstant: 14),
+        ])
+        icon.setContentHuggingPriority(.required, for: .horizontal)
+        icon.setContentCompressionResistancePriority(.required, for: .horizontal)
+        updateTranslationRoleIcon(icon, role: role, target: target)
+        return icon
+    }
+
+    private func updateTranslationRoleIcon(_ icon: NSImageView,
+                                           role: String,
+                                           target: Bool) {
+        let descriptor = TranslationRailRoleSymbolRules.resolve(role, target: target)
+        icon.image = RimeUI.symbol(descriptor.name, pointSize: 10, weight: .semibold)
+        icon.image?.isTemplate = true
+        icon.contentTintColor = target ? RimeUI.accentBlue : RimeUI.textSecondary
+        icon.toolTip = descriptor.accessibilityLabel
+        icon.setAccessibilityElement(true)
+        icon.setAccessibilityRole(.image)
+        icon.setAccessibilityLabel(descriptor.accessibilityLabel)
     }
 
     /// Colored provenance dot for a non-local block. Rime commits (local typing)

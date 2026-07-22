@@ -858,6 +858,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         default:
             return contentColumn([
                 title("输入编码"),
+                caption("单独轻点 Shift 切换中英；Shift 与字母/标点组合或持续按住 500 ms 后，会保持按下前的输入模式。"),
                 spacer(8),
                 inputEncodingSelectionView(),
             ])
@@ -1031,7 +1032,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
 
     private func bufferPage(subpageID: String) -> NSView {
         let note = NSTextField(wrappingLabelWithString:
-            "缓冲区开启后，Rime 提交内容会进入单行缓冲条；轻按 Enter 发送下一块，长按 1.2 秒或点击主条右侧纸飞机发送全部。成功发送的块会立即消失；发送失败或尚未发送的块不会丢失，也不会保存发送历史。")
+            "缓冲区开启后，Rime 提交内容会进入单行缓冲条；轻按 Enter 或点击右侧纸飞机发送下一块，按住 Enter 约 1.2 秒发送全部。AI 生成插件会复用右侧主按钮和 Enter 请求 AI，结果就绪后再变回逐块发送。成功发送的块会立即消失；失败或未发送的块不会丢失，也不会保存发送历史。")
         note.font = .systemFont(ofSize: 11)
         note.textColor = .tertiaryLabelColor
 

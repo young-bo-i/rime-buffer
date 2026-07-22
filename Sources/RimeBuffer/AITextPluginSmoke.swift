@@ -1958,7 +1958,6 @@ private enum AITextPluginSmoke {
 
     private static func workspaceGatesAndDelivery() -> Bool {
         let source = BufferModel()
-        source.stageExternal("source", origin: .rime)
         let provider = AITextSmokeProvider()
         let selection = AITextSmokeSelection()
         let workspace = AITextPluginWorkspace(provider: provider,
@@ -1966,7 +1965,15 @@ private enum AITextPluginSmoke {
                                               isSelected: { selection.selected })
         workspace.start()
         defer { workspace.stop() }
-        guard workspace.canGenerate, workspace.generate(), provider.requests.count == 1 else {
+        guard workspace.primaryAction == .disabled,
+              !workspace.generate(),
+              provider.requests.isEmpty else { return false }
+        source.stageExternal("source", origin: .rime)
+        guard workspace.canGenerate,
+              workspace.primaryAction == .requestGeneration,
+              workspace.generate(),
+              workspace.primaryAction == .generating,
+              provider.requests.count == 1 else {
             return false
         }
         provider.emitActivity("正在认真组织回复", request: 0)
@@ -1977,6 +1984,7 @@ private enum AITextPluginSmoke {
         guard let partialID = workspace.outputBlocks.first?.id,
               workspace.outputBlocks.first?.incomplete == true,
               workspace.deliveryPendingBlocks.isEmpty,
+              workspace.primaryAction == .generating,
               workspace.hasIncompleteDeliveryBlocks else { return false }
         provider.emit(AITextProviderBlock(index: 0, text: "draft updated", title: nil), request: 0)
         guard workspace.outputBlocks.first?.id == partialID else { return false }
@@ -1987,21 +1995,29 @@ private enum AITextPluginSmoke {
         guard workspace.phase == .ready,
               workspace.outputBlocks.count == 2,
               workspace.outputBlocks[0].id == partialID,
-              workspace.railSnapshot.outputBlocks.count == 2 else { return false }
+              workspace.railSnapshot.outputBlocks.count == 2,
+              workspace.primaryAction == .deliver,
+              source.stagedText == "source" else { return false }
 
         let firstGeneration = workspace.deliveryGeneration
         let firstID = workspace.outputBlocks[0].id
         workspace.consumeDelivered(blockIDs: [firstID], generation: firstGeneration)
-        guard source.stagedText == "source", workspace.outputBlocks.count == 1 else {
+        guard source.stagedText == "source",
+              workspace.outputBlocks.count == 1,
+              workspace.primaryAction == .deliver else {
             return false
         }
         let secondGeneration = workspace.deliveryGeneration
         let secondID = workspace.outputBlocks[0].id
         workspace.consumeDelivered(blockIDs: [secondID], generation: secondGeneration)
-        guard source.stagedText.isEmpty, workspace.outputBlocks.isEmpty else { return false }
+        guard source.stagedText.isEmpty,
+              workspace.outputBlocks.isEmpty,
+              workspace.primaryAction == .disabled else { return false }
 
         source.stageExternal("stale", origin: .rime)
-        guard workspace.generate(), provider.requests.count == 2 else { return false }
+        guard workspace.primaryAction == .requestGeneration,
+              workspace.generate(),
+              provider.requests.count == 2 else { return false }
         workspace.reset()
         provider.emit(AITextProviderBlock(index: 0, text: "must-ignore", title: nil), request: 1)
         provider.finish(.success([
@@ -2010,16 +2026,22 @@ private enum AITextPluginSmoke {
         guard workspace.outputBlocks.isEmpty else { return false }
 
         guard workspace.generate(), provider.requests.count == 3 else { return false }
+        provider.finish(.failure(.unavailable("retry")), request: 2)
+        guard workspace.phase == .failed("retry"),
+              workspace.primaryAction == .requestGeneration,
+              workspace.generate(),
+              provider.requests.count == 4 else { return false }
         source.append(" changed")
-        guard provider.cancellations[2].wasCancelled,
-              workspace.outputBlocks.isEmpty else { return false }
-        guard workspace.generate(), provider.requests.count == 4 else { return false }
-        workspace.setProtected(true)
         guard provider.cancellations[3].wasCancelled,
+              workspace.outputBlocks.isEmpty else { return false }
+        guard workspace.generate(), provider.requests.count == 5 else { return false }
+        workspace.setProtected(true)
+        guard provider.cancellations[4].wasCancelled,
               !workspace.canGenerate,
+              workspace.primaryAction == .disabled,
               workspace.outputBlocks.isEmpty else { return false }
         workspace.setProtected(false)
-        return workspace.canGenerate
+        return workspace.canGenerate && workspace.primaryAction == .requestGeneration
     }
 
     private static func remoteMirrorAndActionReview() -> Bool {
