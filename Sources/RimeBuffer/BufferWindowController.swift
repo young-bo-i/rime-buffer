@@ -984,7 +984,7 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
 
         assert(!contentProtected || bufferRail.isHidden,
                "secure input must leave the text-bearing rail hidden")
-        refreshPrimaryAction(workspace: derivedWorkspace,
+        refreshPrimaryAction(controls: WorkbenchManualGenerationRouter.selectedControls,
                              availability: availability,
                              contentProtected: contentProtected)
         refreshButton.isEnabled = BufferPluginSelectionStore.shared.activeKey != nil
@@ -1360,14 +1360,14 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
     }
 
     private func refreshPrimaryAction(
-        workspace: (any DerivedBufferWorkspace)?,
+        controls: (any WorkbenchManualGenerationControls)?,
         availability: BufferDeliveryCoordinator.Availability,
         contentProtected: Bool
     ) {
         sendButton.imagePosition = .imageOnly
         sendButtonUsesAccent = false
 
-        guard let controls = workspace as? any DerivedManualGenerationControls else {
+        guard let controls else {
             setSendButtonGenerating(false)
             setSendButtonSymbol("paperplane.fill")
             sendButton.isEnabled = availability.canSend && !contentProtected
@@ -1383,7 +1383,7 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
             sendButton.isEnabled = false
             sendButton.toolTip = contentProtected
                 ? "安全输入已开启，AI 已暂停"
-                : (workspace?.statusText ?? "等待内容")
+                : controls.generationStatusText
             sendButton.setAccessibilityLabel("AI 生成不可用")
         case .requestGeneration:
             setSendButtonGenerating(false)
@@ -1392,16 +1392,16 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
                 && controls.canGenerate
                 && !availability.blocksManualGenerationRequest
             sendButton.toolTip = sendButton.isEnabled
-                ? "用 \(controls.generationProviderName) 处理当前全部缓冲内容"
+                ? controls.generationRequestDescription
                 : (availability.blocksManualGenerationRequest
                     ? availability.label
-                    : (workspace?.statusText ?? "AI 生成不可用"))
+                    : controls.generationStatusText)
             sendButton.setAccessibilityLabel("请求 AI 生成")
             sendButtonUsesAccent = true
         case .generating:
             sendButton.image = nil
             sendButton.isEnabled = false
-            sendButton.toolTip = workspace?.statusText ?? "AI 正在生成"
+            sendButton.toolTip = controls.generationStatusText
             sendButton.setAccessibilityLabel("AI 正在生成")
             setSendButtonGenerating(true)
         case .deliver:
@@ -1442,7 +1442,7 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         if let workspace = DerivedBufferWorkspaceRouter.selectedWorkspace {
             if let controls = workspace as? any DerivedLanguagePairControls {
                 refreshLanguageControls(workspace: workspace, controls: controls)
-            } else if let controls = workspace as? any DerivedManualGenerationControls {
+            } else if let controls = workspace as? any WorkbenchManualGenerationControls {
                 refreshManualGenerationControls(workspace: workspace, controls: controls)
             } else {
                 refreshDerivedWorkspaceWithoutControls(workspace)
@@ -1452,7 +1452,13 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         if renderingTranslationControls || renderingAIControls {
             resetDerivedControlRendering()
         }
-        let presentations = ActionPluginHost.shared.presentations
+        let allPresentations = ActionPluginHost.shared.presentations
+        // A single prepared action shares the same primary generation surface
+        // as the built-in AI workspace. Keep legacy and ambiguous actions in
+        // the shelf, but do not render a second “generate” button for Marine.
+        let presentations = ActionPluginPrimaryPresentationRules.secondary(
+            in: allPresentations
+        )
         let waitingForFirstContent = presentations.contains(where: \.waitingForFirstContent)
         pluginLoadingIndicator.isHidden = !waitingForFirstContent
         if waitingForFirstContent {
@@ -1460,7 +1466,7 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         } else {
             pluginLoadingIndicator.stopAnimation(nil)
         }
-        let pluginNames = presentations.reduce(into: [String]()) { names, presentation in
+        let pluginNames = allPresentations.reduce(into: [String]()) { names, presentation in
             guard !names.contains(presentation.pluginName) else { return }
             names.append(presentation.pluginName)
         }
@@ -1570,7 +1576,7 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
 
     private func refreshManualGenerationControls(
         workspace: any DerivedBufferWorkspace,
-        controls _: any DerivedManualGenerationControls
+        controls _: any WorkbenchManualGenerationControls
     ) {
         pluginSelector.toolTip = "当前插件：\(workspace.workbenchDisplayName)"
         // The target rail owns the animated first-content indicator. Keep the
@@ -1981,11 +1987,12 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         if IsSecureEventInputEnabled() {
             // Synchronize privacy immediately instead of waiting for the next
             // periodic secure-input refresh.
+            ActionPluginHost.shared.cancelActiveInvocationForWorkbench()
+            DerivedBufferWorkspaceRouter.setProtectedOnAll(true)
             refresh()
             return
         }
-        if let controls = DerivedBufferWorkspaceRouter.selectedWorkspace
-            as? any DerivedManualGenerationControls {
+        if let controls = WorkbenchManualGenerationRouter.selectedControls {
             switch controls.primaryAction {
             case .requestGeneration:
                 let availability = BufferDeliveryCoordinator.shared.availability()

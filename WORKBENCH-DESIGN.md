@@ -13,7 +13,7 @@
 
 > **2026-07-19 本地翻译覆盖决策（当前）**：苹果翻译已作为只出现在缓冲插件列表的内置 `.bufferAction` 落地，与 Marine 共用唯一 owner。源文复用 `BufferModel`，在上方连续轨合并显示且不分 block；译文位于下方独立 `AppleTranslationWorkspace` 分块轨，两轨分别横向滚动。翻译态折叠/展开为 78/112pt，普通工作台仍严格为 44/78pt，模式切换保持底边。拖拽与展开按钮对齐上方原文行，发送按钮对齐下方目标语言行。仅完成且 generation 匹配的译文可由统一投递协调器手动发送。框架保持 macOS 13 最低版本，macOS 15+ 通过工作台内的 SwiftUI `translationTask` 弱链接桥接本地语言模型。本文后续将 Translation 标记为“计划”或描述无头 initializer 的内容均已被此决策覆盖。
 >
-> **2026-07-22 AI 插件/连接器覆盖决策（当前）**：内置 `.bufferAction` 已收敛为唯一「AI 生成」插件；Codex CLI、Claude Code CLI 与 OpenAI 兼容 API 是“连接器 › AI 模型”中的三个独立可切换模型源。展开层不再放独立“生成”按钮；主条右侧控件以 AI 图标/转圈/纸飞机表达无源禁用、可请求、生成中和可投递。Return 与它共用同一状态：有源无结果时请求 AI，ready 后的新一次轻按逐块发送、长按全部发送。生成冻结当前缓冲全文，在下方 target rail 以稳定 block 原位更新；只有目标块全部成功发送后才消费上方对应 source blocks。两轨角色使用图标，不再显示“原/答”文字。
+> **2026-07-23 AI 插件/连接器覆盖决策（当前）**：内置 `.bufferAction` 已收敛为唯一「AI 生成」插件；Codex CLI、Claude Code CLI 与 OpenAI 兼容 API 是“连接器 › AI 模型”中的三个独立可切换模型源。当外部 owner 的整个动作面只有一个 prepared presentation 时，它与内置 AI 共用主生成控件，展开层不再放独立“生成”按钮；主条右侧控件以 AI 图标/转圈/纸飞机表达不可请求、可请求、生成中和可投递。Return 与它共用同一状态：无结果时请求 AI，ready 后的新一次轻按逐块发送、长按全部发送。Marine 仍以 `presentationId` 合并直评/回复并按 `status.actionId` 选择真实动作；若还存在任意第二个 presentation，则全部保留为显式按钮而不让 Return 猜测。内置生成冻结当前缓冲全文，在下方 target rail 以稳定 block 原位更新；只有目标块全部成功发送后才消费上方对应 source blocks。两轨角色使用图标，不再显示“原/答”文字。
 
 > **2026-07-22 全量捕获与强制分块决策（当前）**：缓冲持久开启后，ASCII/英文模式下 librime 未处理的可打印字母、数字、空格和普通标点也必须进入缓冲，只有快捷键、自有输入框、失效焦点与 secure input 例外；逐键英文在同一焦点内合并为短词组块并保留逐字退格。AI、苹果翻译、意识流所选候选、Action/Marine 的流式快照与最终结果统一由宿主细分，英文按完整单词/短词组，中文按句、分句和有界长度；不得把单个粗糙上游块当成一次性大段投递。上游 block 仍是硬边界，Action 子块完整继承原插件权限；轻按 Return/纸飞机逐块，长按 Return 才发送全部。
 

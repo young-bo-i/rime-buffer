@@ -51,6 +51,14 @@ enum BufferDeliveryContentRouter {
         if let workspace = DerivedBufferWorkspaceRouter.selectedWorkspace {
             return workspace
         }
+        // A sole prepared Action Plugin owns the same primary generation /
+        // delivery surface as the built-in AI workspace. Its filtered source
+        // prevents unrelated BufferModel text from being sent merely because
+        // a matching generated block exists later in the shared model.
+        if sourceModel === BufferModel.shared,
+           ActionPluginHost.shared.primaryGenerationPresentation != nil {
+            return ActionPluginHost.shared
+        }
         return sourceModel
     }
 }
@@ -630,18 +638,30 @@ final class BufferDeliveryCoordinator {
                              completion: ((SendResult) -> Void)?) {
         guard activeOperationID == operationID else { return }
         activeOperationID = nil
+        // Capture diagnostic metadata under the frozen generation before any
+        // model mutation advances it. When sendAll accepts an earlier block
+        // and rejects a later plugin block, consumption and stale marking are
+        // two mutations of the same logical completion transaction.
+        let staleMetadata = staleBlockID.flatMap { blockID in
+            source.deliveryBlock(id: blockID,
+                                 generation: sourceGeneration)?.pluginMetadata
+                ?? source.deliveryBlock(id: blockID,
+                                        generation: source.deliveryGeneration)?.pluginMetadata
+        }
         if !deliveredIDs.isEmpty {
             source.consumeDelivered(blockIDs: deliveredIDs,
                                     generation: sourceGeneration)
         }
         if let staleBlockID {
+            // consumeDelivered may legitimately advance the source generation;
+            // no user/event-loop work can interleave on this synchronous main-
+            // thread path, so mark the still-present rejected block against the
+            // source's immediately current generation.
             _ = source.markDeliveryBlockStale(id: staleBlockID,
-                                              generation: sourceGeneration)
+                                              generation: source.deliveryGeneration)
         }
         if let reason,
-           let staleBlockID,
-           let metadata = source.deliveryBlock(id: staleBlockID,
-                                               generation: sourceGeneration)?.pluginMetadata {
+           let metadata = staleMetadata {
             model.failTransientLoading(requestId: metadata.requestId,
                                        message: reason.message)
         }

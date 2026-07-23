@@ -2203,6 +2203,7 @@ private func runContextualActionPresentationSmokeTest() -> Bool {
         title: "生成直评",
         symbol: "bubble.left.and.text.bubble.right",
         statusPath: "/status",
+        preparePath: "/prepare",
         invokePath: "/invoke",
         modes: ["direct"],
         presentationId: presentationId,
@@ -2213,6 +2214,7 @@ private func runContextualActionPresentationSmokeTest() -> Bool {
         title: "生成回复",
         symbol: "arrowshape.turn.up.left",
         statusPath: "/status",
+        preparePath: "/prepare",
         invokePath: "/invoke",
         modes: ["reply"],
         presentationId: presentationId,
@@ -2235,6 +2237,7 @@ private func runContextualActionPresentationSmokeTest() -> Bool {
         title: "错误重叠动作",
         symbol: "exclamationmark.triangle",
         statusPath: "/status",
+        preparePath: "/prepare",
         invokePath: "/invoke",
         modes: ["direct"],
         presentationId: presentationId,
@@ -2289,9 +2292,25 @@ private func runContextualActionPresentationSmokeTest() -> Bool {
         blocks: [ActionPluginResultBlock(text: "生成内容", title: nil)],
         targetSummary: "目标评论"
     )
+    let preparation = ActionPluginPrepareResponse(
+        protocolVersion: ActionPluginPrepareContract.protocolVersion,
+        resultFormat: ActionPluginPrepareContract.resultFormat,
+        pluginId: "contextual",
+        runtimeInstanceId: "contextual-instance",
+        requestId: "template",
+        actionId: directAction.id,
+        contextId: "ctx-direct",
+        prompt: "CONTEXTUAL PREPARED PROMPT\nReturn blocks-v1.",
+        targetSummary: "目标评论"
+    )
     let transport = ActionPluginTransportStub(status: unavailable,
                                               response: response,
                                               binding: binding)
+    transport.prepareResult = .success(preparation)
+    let connector = PreparedActionConnectorStub()
+    connector.blocks = [
+        AITextProviderBlock(index: 0, text: "生成内容", title: nil),
+    ]
     let focusBox = ActionPluginFocusBox()
     var epochs = FocusEpochState()
     focusBox.token = epochs.activate()
@@ -2303,6 +2322,7 @@ private func runContextualActionPresentationSmokeTest() -> Bool {
         bufferModel: model,
         inboundBus: InboundBus(),
         pluginLoader: { _ in [plugin] },
+        connectorProvider: { connector },
         runtimeBindingIsCurrent: { _, candidate in candidate == binding }
     )
     var changeCount = 0
@@ -2313,7 +2333,14 @@ private func runContextualActionPresentationSmokeTest() -> Bool {
           host.presentations[0].title == "生成评论",
           host.presentations[0].presentationKey == presentationKey,
           host.presentations[0].key.actionId == directAction.id,
-          host.presentations[0].canInvoke == false else {
+          host.presentations[0].canInvoke == false,
+          host.presentations[0].isPreparedGeneration,
+          host.presentations[0].preparedGenerationActionIDs
+            == Set([directAction.id, replyAction.id]),
+          host.primaryGenerationPresentation?.presentationKey == presentationKey,
+          host.secondaryPresentations.isEmpty,
+          host.generationStatusText == "等待评论框",
+          host.primaryAction == .disabled else {
         print("FAILED: contextual action must remain one disabled control without a target")
         return false
     }
@@ -2329,6 +2356,8 @@ private func runContextualActionPresentationSmokeTest() -> Bool {
             && host.presentations[0].canInvoke
             && host.presentations[0].presentationKey == presentationKey
             && host.presentations[0].key.actionId == directAction.id
+            && host.primaryGenerationPresentation?.key.actionId == directAction.id
+            && host.primaryAction == .requestGeneration
     }) else {
         print("FAILED: contextual presentation did not select direct action")
         return false
@@ -2346,14 +2375,24 @@ private func runContextualActionPresentationSmokeTest() -> Bool {
             && host.presentations[0].canInvoke
             && host.presentations[0].presentationKey == presentationKey
             && host.presentations[0].key.actionId == replyAction.id
+            && host.primaryGenerationPresentation?.key.actionId == replyAction.id
+            && host.generationStatusText == "生成回复"
+            && host.primaryAction == .requestGeneration
     }) else {
         print("FAILED: contextual presentation did not switch its action id")
         return false
     }
 
-    host.invoke(host.presentations[0].key)
+    guard host.generate(), host.primaryAction == .generating else {
+        print("FAILED: contextual prepared primary action did not start generation")
+        return false
+    }
     guard runMainLoopUntil({ model.blocks.count == 1 }),
-          model.blocks[0].pluginMetadata?.actionId == replyAction.id else {
+          model.blocks[0].pluginMetadata?.actionId == replyAction.id,
+          transport.prepareRequestCount == 1,
+          transport.invokeRequestCount == 0,
+          connector.requests.count == 1,
+          host.primaryAction == .deliver else {
         print("FAILED: unified contextual control invoked the wrong action")
         return false
     }
@@ -2483,6 +2522,11 @@ private func runPreparedActionConnectorSmokeTest() -> Bool {
                                               binding: binding)
     transport.prepareResult = .success(template)
     let connector = PreparedActionConnectorStub()
+    connector.blocks = [
+        AITextProviderBlock(index: 0, text: "连接器生成结果一", title: "候选一"),
+        AITextProviderBlock(index: 1, text: "连接器生成结果二", title: "候选二"),
+        AITextProviderBlock(index: 2, text: "连接器生成结果三", title: "候选三"),
+    ]
     connector.holdsCompletion = true
     let focusBox = ActionPluginFocusBox()
     var epochs = FocusEpochState()
@@ -2504,16 +2548,106 @@ private func runPreparedActionConnectorSmokeTest() -> Bool {
     )
     host.refreshStatuses(force: true)
     guard runMainLoopUntil({ host.presentations.first?.canInvoke == true }),
+          let presentation = host.presentations.first,
           let key = host.presentations.first?.key else {
         print("FAILED: prepared action did not become invokable")
         return false
     }
-    host.invoke(key)
+    guard presentation.isPreparedGeneration,
+          presentation.preparedGenerationActionIDs == Set([action.id]),
+          host.primaryGenerationPresentation == presentation,
+          host.secondaryPresentations.isEmpty,
+          host.canGenerate,
+          host.generationProviderName == "Prepared",
+          host.generationStatusText == "生成话术",
+          host.primaryAction == .requestGeneration,
+          ActionPluginPrimaryPresentationRules.primary(in: [presentation]) == presentation,
+          ActionPluginPrimaryPresentationRules.primary(
+            in: [presentation, presentation]
+          ) == nil,
+          ActionPluginPrimaryPresentationRules.secondary(
+            in: [presentation, presentation]
+          ).count == 2 else {
+        print("FAILED: prepared primary presentation promotion was ambiguous")
+        return false
+    }
+
+    let legacyPresentation = ActionPluginPresentation(
+        key: ActionPluginKey(pluginId: "prepared", actionId: "prepared.legacy"),
+        presentationKey: ActionPluginPresentationKey(
+            pluginId: "prepared",
+            presentationId: "prepared.legacy"
+        ),
+        pluginName: "Prepared",
+        title: "旧动作",
+        symbol: "bolt",
+        label: "运行旧动作",
+        targetSummary: nil,
+        available: true,
+        canInvoke: true,
+        requiresFocus: true,
+        preparedGenerationActionIDs: [],
+        running: false,
+        waitingForFirstContent: false
+    )
+    guard ActionPluginPrimaryPresentationRules.primary(
+            in: [presentation, legacyPresentation]
+          ) == nil,
+          ActionPluginPrimaryPresentationRules.secondary(
+            in: [presentation, legacyPresentation]
+          ) == [presentation, legacyPresentation] else {
+        print("FAILED: mixed prepared/legacy actions did not retain the explicit shelf")
+        return false
+    }
+
+    model.stageExternal("ordinary source", origin: .rime)
+    guard host.primaryAction == .requestGeneration else {
+        print("FAILED: ordinary source promoted the prepared action to delivery")
+        return false
+    }
+
+    let unrelatedMetadata = BufferModel.PluginMetadata(
+        pluginId: "prepared",
+        actionId: "prepared.other",
+        requestId: "unrelated-request",
+        contextId: "prepared-context",
+        focusToken: focusBox.token,
+        runtimeIdentity: binding.identity
+    )
+    model.stageExternal("other action result",
+                        origin: .plugin(id: "prepared"),
+                        pluginMetadata: unrelatedMetadata)
+    guard host.primaryAction == .requestGeneration else {
+        print("FAILED: unrelated plugin action promoted the prepared action to delivery")
+        return false
+    }
+
+    let stalePrimaryMetadata = BufferModel.PluginMetadata(
+        pluginId: "prepared",
+        actionId: action.id,
+        requestId: "stale-primary-request",
+        contextId: "prepared-context",
+        focusToken: focusBox.token,
+        runtimeIdentity: binding.identity,
+        stale: true
+    )
+    model.stageExternal("stale primary result",
+                        origin: .plugin(id: "prepared"),
+                        pluginMetadata: stalePrimaryMetadata)
+    guard host.primaryAction == .requestGeneration else {
+        print("FAILED: stale prepared result was exposed as ready delivery")
+        return false
+    }
+
+    guard host.generate(), host.primaryAction == .generating else {
+        print("FAILED: prepared primary action did not enter generating state")
+        return false
+    }
     guard runMainLoopUntil({
         connector.requests.count == 1
             && model.loadingMessage?.contains("正在分析页面话术") == true
     }),
-          model.blocks.isEmpty,
+          model.blocks.count == 3,
           model.transientLoadingActive,
           host.presentations.first?.waitingForFirstContent == true else {
         print("FAILED: prepared connector activity was not visible before first content")
@@ -2521,17 +2655,27 @@ private func runPreparedActionConnectorSmokeTest() -> Bool {
     }
     connector.complete()
     guard runMainLoopUntil({
-        model.blocks.count == 1
-            && model.blocks[0].pluginMetadata?.incomplete == false
+        model.blocks.count == 6
+            && model.blocks.contains {
+                $0.text == "连接器生成结果一"
+                    && $0.pluginMetadata?.incomplete == false
+            }
     }),
           transport.prepareRequestCount == 1,
           transport.invokeRequestCount == 0,
           connector.requests.count == 1,
           connector.requests[0].preparedPrompt == template.prompt,
           connector.requests[0].sourceText.isEmpty,
-          model.blocks[0].text == "连接器生成结果",
-          model.blocks[0].pluginMetadata?.pluginId == "prepared",
-          model.blocks[0].pluginMetadata?.contextId == "prepared-context" else {
+          host.deliveryPendingBlocks.map(\.text) == [
+            "连接器生成结果一",
+            "连接器生成结果二",
+            "连接器生成结果三",
+          ],
+          host.deliveryPendingBlocks[0].pluginMetadata?.pluginId == "prepared",
+          host.deliveryPendingBlocks[0].pluginMetadata?.contextId == "prepared-context",
+          !host.hasIncompleteDeliveryBlocks,
+          host.primaryAction == .deliver,
+          !host.generate() else {
         print("FAILED: prepared action did not stay on the connector/plugin authority path")
         return false
     }
@@ -2560,11 +2704,111 @@ private func runPreparedActionConnectorSmokeTest() -> Bool {
         }
         connector.emitHeld(invalidBlock)
         guard runMainLoopUntil({ !model.transientLoadingActive }),
-              model.blocks.count == 1,
+              model.blocks.count == 6,
               host.presentations.first?.waitingForFirstContent == false else {
             print("FAILED: invalid provisional connector block reached the workbench")
             return false
         }
+    }
+
+    guard let deliveryFocus = focusBox.token else {
+        print("FAILED: prepared delivery focus disappeared")
+        return false
+    }
+    var deliveredTexts: [String] = []
+    var completedDeliveries: [BufferDeliveryCoordinator.SendResult] = []
+    var pendingValidations: [(ActionPluginDeliveryDecision) -> Void] = []
+    let preparedCoordinator = BufferDeliveryCoordinator(
+        model: model,
+        dependencies: .init(
+            resolveTarget: { expected in
+                guard expected == nil || expected == deliveryFocus else { return nil }
+                return .init(
+                    token: deliveryFocus,
+                    compositionActive: false,
+                    resolveComposition: {},
+                    deliver: { block in
+                        deliveredTexts.append(block.text)
+                        return true
+                    }
+                )
+            },
+            secureInputEnabled: { false },
+            validatePlugin: { _, _, completion in
+                pendingValidations.append(completion)
+            },
+            refreshUI: {}
+        ),
+        contentSourceResolver: { host }
+    )
+    let delivery = preparedCoordinator.sendNext(
+        expectedToken: deliveryFocus,
+        completion: { completedDeliveries.append($0) }
+    )
+    guard delivery.deferred,
+          pendingValidations.count == 1,
+          completedDeliveries.isEmpty,
+          deliveredTexts.isEmpty else {
+        print("FAILED: prepared sendNext did not wait for target validation")
+        return false
+    }
+    let firstValidation = pendingValidations.removeFirst()
+    firstValidation(.allowed)
+    guard
+          completedDeliveries == [.init(sentCount: 1, blockedReason: nil)],
+          deliveredTexts == ["连接器生成结果一"],
+          host.deliveryPendingBlocks.map(\.text) == [
+            "连接器生成结果二",
+            "连接器生成结果三",
+          ],
+          host.primaryAction == .deliver else {
+        print("FAILED: prepared sendNext did not select only the first generated block")
+        return false
+    }
+    let partialDelivery = preparedCoordinator.sendAll(
+        expectedToken: deliveryFocus,
+        completion: { completedDeliveries.append($0) }
+    )
+    guard partialDelivery.deferred,
+          pendingValidations.count == 1 else {
+        print("FAILED: prepared sendAll did not validate its first remaining block")
+        return false
+    }
+    let secondValidation = pendingValidations.removeFirst()
+    secondValidation(.allowed)
+    guard pendingValidations.count == 1,
+          completedDeliveries.count == 1 else {
+        print("FAILED: prepared sendAll did not advance validation one block at a time")
+        return false
+    }
+    // Simulate ordinary typing while the last target check is held. The
+    // already-inserted generated block must still be consumed by stable UUID;
+    // advancing BufferModel.changeCount cannot make it deliverable twice.
+    model.stageExternal("concurrent ordinary input", origin: .rime)
+    let thirdValidation = pendingValidations.removeFirst()
+    thirdValidation(.rejected(.targetChanged))
+    guard
+          completedDeliveries == [
+            .init(sentCount: 1, blockedReason: nil),
+            .init(sentCount: 1, blockedReason: .pluginTargetChanged),
+          ],
+          deliveredTexts == [
+            "连接器生成结果一",
+            "连接器生成结果二",
+          ],
+          model.blocks.map(\.text) == [
+            "ordinary source",
+            "other action result",
+            "stale primary result",
+            "连接器生成结果三",
+            "concurrent ordinary input",
+          ],
+          model.blocks.first(where: { $0.text == "连接器生成结果三" })?
+            .pluginMetadata?.stale == true,
+          host.deliveryPendingBlocks.isEmpty,
+          host.primaryAction == .requestGeneration else {
+        print("FAILED: prepared sendAll did not atomically consume accepted and stale rejected blocks")
+        return false
     }
     return true
 }
@@ -3195,6 +3439,11 @@ func runActionPluginSmokeTest() -> Bool {
         workbenchFirst.refreshStatuses(force: true)
         guard runMainLoopUntil(timeout: 1, { hostChangeCount > 0 }),
               workbenchFirst.presentations.first?.canInvoke == false,
+              workbenchFirst.presentations.first?.isPreparedGeneration == false,
+              workbenchFirst.presentations.first?.preparedGenerationActionIDs.isEmpty == true,
+              workbenchFirst.primaryGenerationPresentation == nil,
+              workbenchFirst.secondaryPresentations == workbenchFirst.presentations,
+              workbenchFirst.primaryAction == .disabled,
               transport.invokeRequestCount == 0 else {
             print("FAILED: workbench-first must wait for a focused target")
             return false
@@ -4476,30 +4725,30 @@ func runBufferWindowSmokeTest() -> Bool {
         return false
     }
 
-    guard DerivedManualGenerationPrimaryActionRules.resolve(
+    guard WorkbenchManualGenerationPrimaryActionRules.resolve(
             isGenerating: false,
             hasReadyDelivery: false,
             canGenerate: false
           ) == .disabled,
-          DerivedManualGenerationPrimaryActionRules.resolve(
+          WorkbenchManualGenerationPrimaryActionRules.resolve(
             isGenerating: false,
             hasReadyDelivery: false,
             canGenerate: true
           ) == .requestGeneration,
-          DerivedManualGenerationPrimaryActionRules.resolve(
+          WorkbenchManualGenerationPrimaryActionRules.resolve(
             isGenerating: true,
             hasReadyDelivery: true,
             canGenerate: true
           ) == .generating,
-          DerivedManualGenerationPrimaryActionRules.resolve(
+          WorkbenchManualGenerationPrimaryActionRules.resolve(
             isGenerating: false,
             hasReadyDelivery: true,
             canGenerate: true
           ) == .deliver,
-          !DerivedManualGenerationPrimaryAction.disabled.beginsDeliveryGesture,
-          !DerivedManualGenerationPrimaryAction.requestGeneration.beginsDeliveryGesture,
-          !DerivedManualGenerationPrimaryAction.generating.beginsDeliveryGesture,
-          DerivedManualGenerationPrimaryAction.deliver.beginsDeliveryGesture,
+          !WorkbenchManualGenerationPrimaryAction.disabled.beginsDeliveryGesture,
+          !WorkbenchManualGenerationPrimaryAction.requestGeneration.beginsDeliveryGesture,
+          !WorkbenchManualGenerationPrimaryAction.generating.beginsDeliveryGesture,
+          WorkbenchManualGenerationPrimaryAction.deliver.beginsDeliveryGesture,
           BufferDeliveryCoordinator.Availability.blocked(.composing)
             .blocksManualGenerationRequest,
           !BufferDeliveryCoordinator.Availability.blocked(.nothingPending)

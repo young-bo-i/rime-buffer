@@ -318,6 +318,13 @@ final class RimeBufferController: IMKInputController {
     private var bufferEnterClient: IMKTextInput?
     private var bufferEnterOwner: FocusToken?
     private var bufferEnterUsesStreamInput = false
+    /// Freeze both the selected owner and the concrete delivery source at
+    /// keyDown. Focus alone is insufficient: a plugin switch during the same
+    /// physical Return must not let keyUp deliver a different workspace.
+    private var bufferEnterPluginOwner: PluginKey?
+    private var bufferEnterDeliveryWorkspaceID: String?
+    private var bufferEnterDeliverySourceIdentity: ObjectIdentifier?
+    private var bufferEnterDeliveryGeneration: UInt64?
     private var bufferEnterHardwareKeyCode: CGKeyCode = 36
     private var bufferEnterStartedAt: CFAbsoluteTime = 0
     private var bufferEnterPollTimer: Timer?
@@ -1840,6 +1847,7 @@ final class RimeBufferController: IMKInputController {
             suppressBufferEnterForImmediateAction(client: client,
                                                   hardwareKeyCode: hardwareKeyCode)
             DerivedBufferWorkspaceRouter.setProtectedOnAll(true)
+            ActionPluginHost.shared.cancelActiveInvocationForWorkbench()
             IMELog.write("buffer enter consumed at secure-input boundary")
             updateUI(client: client)
             BufferWindowController.shared.refresh()
@@ -1879,7 +1887,7 @@ final class RimeBufferController: IMKInputController {
                                                 hardwareKeyCode: hardwareKeyCode)
             return true
         }
-        if handleManualGenerationBufferEnterIfNeeded(
+        if handleWorkbenchManualGenerationBufferEnterIfNeeded(
             client: client,
             hardwareKeyCode: hardwareKeyCode
         ) {
@@ -1890,16 +1898,17 @@ final class RimeBufferController: IMKInputController {
         return true
     }
 
-    /// AI workspaces use the same physical Return as their right-side primary
-    /// control. Only a ready target enters tap/hold delivery; every other state
-    /// owns the whole press immediately so a synchronous provider result can
-    /// never be delivered again by that press's keyUp.
-    private func handleManualGenerationBufferEnterIfNeeded(
+    /// Manual-generation owners use the same physical Return as their
+    /// right-side primary control. Only a ready target enters tap/hold
+    /// delivery; every other state owns the whole press immediately so a
+    /// synchronous result can never be delivered again by that press's keyUp.
+    private func handleWorkbenchManualGenerationBufferEnterIfNeeded(
         client: IMKTextInput,
         hardwareKeyCode: UInt16
     ) -> Bool {
-        guard let controls = DerivedBufferWorkspaceRouter.selectedWorkspace
-            as? any DerivedManualGenerationControls else { return false }
+        guard let controls = WorkbenchManualGenerationRouter.selectedControls else {
+            return false
+        }
 
         if BufferEnterSecureInputRules.disposition(
             secureInputEnabled: IsSecureEventInputEnabled()
@@ -1907,7 +1916,8 @@ final class RimeBufferController: IMKInputController {
             suppressBufferEnterForImmediateAction(client: client,
                                                   hardwareKeyCode: hardwareKeyCode)
             DerivedBufferWorkspaceRouter.setProtectedOnAll(true)
-            IMELog.write("buffer enter consumed; secure input blocked AI generation")
+            ActionPluginHost.shared.cancelActiveInvocationForWorkbench()
+            IMELog.write("buffer enter consumed; secure input blocked generation")
             updateUI(client: client)
             BufferWindowController.shared.refresh()
             return true
@@ -1924,7 +1934,8 @@ final class RimeBufferController: IMKInputController {
             secureInputEnabled: IsSecureEventInputEnabled()
         ) == .consumeWithoutGuardOrGeneration {
             DerivedBufferWorkspaceRouter.setProtectedOnAll(true)
-            IMELog.write("buffer enter consumed; secure input changed before AI request")
+            ActionPluginHost.shared.cancelActiveInvocationForWorkbench()
+            IMELog.write("buffer enter consumed; secure input changed before generation request")
             updateUI(client: client)
             BufferWindowController.shared.refresh()
             return true
@@ -1932,11 +1943,11 @@ final class RimeBufferController: IMKInputController {
         switch action {
         case .requestGeneration:
             let requested = controls.generate()
-            IMELog.write("buffer enter requested AI generation accepted=\(requested)")
+            IMELog.write("buffer enter requested generation accepted=\(requested)")
         case .generating:
-            IMELog.write("buffer enter consumed while AI generation is running")
+            IMELog.write("buffer enter consumed while generation is running")
         case .disabled:
-            IMELog.write("buffer enter consumed while AI generation is unavailable")
+            IMELog.write("buffer enter consumed while generation is unavailable")
         case .deliver:
             break
         }
@@ -2346,6 +2357,10 @@ final class RimeBufferController: IMKInputController {
         bufferEnterClient = nil
         bufferEnterOwner = nil
         bufferEnterUsesStreamInput = false
+        bufferEnterPluginOwner = nil
+        bufferEnterDeliveryWorkspaceID = nil
+        bufferEnterDeliverySourceIdentity = nil
+        bufferEnterDeliveryGeneration = nil
         bufferEnterPollTimer?.invalidate()
         bufferEnterPollTimer = nil
         BufferWindowController.shared.setEnterHoldProgress(nil)
@@ -2376,6 +2391,11 @@ final class RimeBufferController: IMKInputController {
         bufferEnterClient = client
         bufferEnterOwner = lease.token
         bufferEnterUsesStreamInput = streamInputModeSelected
+        let deliverySource = BufferDeliveryContentRouter.current()
+        bufferEnterPluginOwner = BufferPluginSelectionStore.shared.activeKey
+        bufferEnterDeliveryWorkspaceID = deliverySource.deliveryWorkspaceID
+        bufferEnterDeliverySourceIdentity = ObjectIdentifier(deliverySource)
+        bufferEnterDeliveryGeneration = deliverySource.deliveryGeneration
         bufferEnterHardwareKeyCode = CGKeyCode(hardwareKeyCode)
         bufferEnterStartedAt = CFAbsoluteTimeGetCurrent()
         // Reassert only for the exact Return keyDown. This gives Chromium a
@@ -2399,6 +2419,10 @@ final class RimeBufferController: IMKInputController {
         bufferEnterClient = client
         bufferEnterOwner = lease?.token
         bufferEnterUsesStreamInput = streamInputModeSelected
+        bufferEnterPluginOwner = nil
+        bufferEnterDeliveryWorkspaceID = nil
+        bufferEnterDeliverySourceIdentity = nil
+        bufferEnterDeliveryGeneration = nil
         bufferEnterHardwareKeyCode = CGKeyCode(hardwareKeyCode)
         bufferEnterStartedAt = CFAbsoluteTimeGetCurrent()
         BufferWindowController.shared.setEnterHoldProgress(nil)
@@ -2416,6 +2440,10 @@ final class RimeBufferController: IMKInputController {
         bufferEnterClient = client
         bufferEnterOwner = lease?.token
         bufferEnterUsesStreamInput = false
+        bufferEnterPluginOwner = nil
+        bufferEnterDeliveryWorkspaceID = nil
+        bufferEnterDeliverySourceIdentity = nil
+        bufferEnterDeliveryGeneration = nil
         bufferEnterHardwareKeyCode = CGKeyCode(hardwareKeyCode)
         bufferEnterStartedAt = CFAbsoluteTimeGetCurrent()
         reassertBufferControlGuardIfAllowed(client: client)
@@ -2707,6 +2735,17 @@ final class RimeBufferController: IMKInputController {
                                         client: IMKTextInput?,
                                         expectedOwner: FocusToken?,
                                         source: String) -> Bool {
+        let currentDeliverySource = BufferDeliveryContentRouter.current()
+        guard BufferPluginSelectionStore.shared.activeKey == bufferEnterPluginOwner,
+              let expectedWorkspaceID = bufferEnterDeliveryWorkspaceID,
+              let expectedSourceIdentity = bufferEnterDeliverySourceIdentity,
+              let expectedGeneration = bufferEnterDeliveryGeneration,
+              currentDeliverySource.deliveryWorkspaceID == expectedWorkspaceID,
+              ObjectIdentifier(currentDeliverySource) == expectedSourceIdentity,
+              currentDeliverySource.deliveryGeneration == expectedGeneration else {
+            IMELog.write("buffer enter \(source) consumed without delivery; delivery source changed")
+            return true
+        }
         if bufferEnterUsesStreamInput {
             guard streamInputModeSelected,
                   let resolvedClient = client,

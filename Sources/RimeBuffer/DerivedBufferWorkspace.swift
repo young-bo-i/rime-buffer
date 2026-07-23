@@ -36,7 +36,11 @@ protocol DerivedLanguagePairControls: AnyObject {
     @discardableResult func swapLanguages() -> Bool
 }
 
-enum DerivedManualGenerationPrimaryAction: Equatable {
+/// The right-side workbench control has one shared state machine whether the
+/// generator is a trusted two-rail workspace or an external prepared Action
+/// Plugin. Keeping this contract outside `DerivedBufferWorkspace` prevents
+/// Return routing from treating "built in" as the generation capability.
+enum WorkbenchManualGenerationPrimaryAction: Equatable {
     case disabled
     case requestGeneration
     case generating
@@ -45,10 +49,10 @@ enum DerivedManualGenerationPrimaryAction: Equatable {
     var beginsDeliveryGesture: Bool { self == .deliver }
 }
 
-enum DerivedManualGenerationPrimaryActionRules {
+enum WorkbenchManualGenerationPrimaryActionRules {
     static func resolve(isGenerating: Bool,
                         hasReadyDelivery: Bool,
-                        canGenerate: Bool) -> DerivedManualGenerationPrimaryAction {
+                        canGenerate: Bool) -> WorkbenchManualGenerationPrimaryAction {
         if isGenerating { return .generating }
         if hasReadyDelivery { return .deliver }
         if canGenerate { return .requestGeneration }
@@ -56,12 +60,21 @@ enum DerivedManualGenerationPrimaryActionRules {
     }
 }
 
-protocol DerivedManualGenerationControls: AnyObject {
+protocol WorkbenchManualGenerationControls: AnyObject {
     var canGenerate: Bool { get }
     var isGenerating: Bool { get }
     var generationProviderName: String { get }
-    var primaryAction: DerivedManualGenerationPrimaryAction { get }
+    var generationStatusText: String { get }
+    var generationRequestDescription: String { get }
+    var primaryAction: WorkbenchManualGenerationPrimaryAction { get }
     @discardableResult func generate() -> Bool
+}
+
+extension WorkbenchManualGenerationControls {
+    var generationStatusText: String { "等待内容" }
+    var generationRequestDescription: String {
+        "用 \(generationProviderName) 处理当前全部缓冲内容"
+    }
 }
 
 extension AppleTranslationWorkspace: DerivedBufferWorkspace,
@@ -77,13 +90,14 @@ extension AppleTranslationWorkspace: DerivedBufferWorkspace,
 }
 
 extension AITextPluginWorkspace: DerivedBufferWorkspace,
-                                 DerivedManualGenerationControls {
+                                 WorkbenchManualGenerationControls {
     var workspacePluginKey: PluginKey { pluginKey }
     var workbenchDisplayName: String { "AI 生成 · \(kind.displayName)" }
     var isGenerating: Bool { phase == .running }
     var generationProviderName: String { kind.displayName }
-    var primaryAction: DerivedManualGenerationPrimaryAction {
-        DerivedManualGenerationPrimaryActionRules.resolve(
+    var generationStatusText: String { statusText }
+    var primaryAction: WorkbenchManualGenerationPrimaryAction {
+        WorkbenchManualGenerationPrimaryActionRules.resolve(
             isGenerating: isGenerating,
             hasReadyDelivery: phase == .ready && !deliveryPendingBlocks.isEmpty,
             canGenerate: canGenerate
@@ -94,6 +108,22 @@ extension AITextPluginWorkspace: DerivedBufferWorkspace,
     func requestRefresh() -> Bool { resetAndRefresh() }
 
     func workbenchWillPause() { reset() }
+}
+
+enum WorkbenchManualGenerationRouter {
+    /// Resolve built-in controls first. Translation and consciousness-stream
+    /// workspaces deliberately do not conform, so their existing Return paths
+    /// remain unchanged.
+    static var selectedControls: (any WorkbenchManualGenerationControls)? {
+        if let controls = DerivedBufferWorkspaceRouter.selectedWorkspace
+            as? any WorkbenchManualGenerationControls {
+            return controls
+        }
+        guard ActionPluginHost.shared.primaryGenerationPresentation != nil else {
+            return nil
+        }
+        return ActionPluginHost.shared
+    }
 }
 
 /// The array stores the stable singleton objects themselves. Returning a new

@@ -1423,8 +1423,35 @@ struct ActionPluginPresentation: Equatable {
     let available: Bool
     let canInvoke: Bool
     let requiresFocus: Bool
+    /// `preparePath` delegates model execution to RimeBuffer's selected AI
+    /// connector. This semantic flag lets the workbench promote a prepared
+    /// action without coupling its UI to a specific plugin id such as Marine.
+    let preparedGenerationActionIDs: Set<String>
     let running: Bool
     let waitingForFirstContent: Bool
+
+    var isPreparedGeneration: Bool { !preparedGenerationActionIDs.isEmpty }
+}
+
+enum ActionPluginPrimaryPresentationRules {
+    /// Promotion must be deterministic. Only an owner whose entire resolved
+    /// action surface is one prepared presentation can share the AI primary
+    /// control; any additional presentation keeps the explicit shelf so Return
+    /// never chooses between capabilities.
+    static func primary(in presentations: [ActionPluginPresentation])
+        -> ActionPluginPresentation? {
+        // The primary control replaces the whole action shelf for this owner.
+        // If any second presentation exists (prepared or legacy), keeping the
+        // ordinary shelf + delivery behavior is the only unambiguous choice.
+        guard presentations.count == 1,
+              presentations[0].isPreparedGeneration else { return nil }
+        return presentations[0]
+    }
+
+    static func secondary(in presentations: [ActionPluginPresentation])
+        -> [ActionPluginPresentation] {
+        primary(in: presentations) == nil ? presentations : []
+    }
 }
 
 enum ActionPluginRoutingRules {
@@ -1728,6 +1755,9 @@ final class ActionPluginHost {
                         && (!action.requiresFocus || currentFocusToken != nil)
                         && activeInvocation == nil,
                     requiresFocus: action.requiresFocus,
+                    preparedGenerationActionIDs: action.preparePath == nil
+                        ? []
+                        : [action.id],
                     running: running,
                     waitingForFirstContent: waitingForFirstContent
                 )
@@ -1767,12 +1797,23 @@ final class ActionPluginHost {
                     available: selected.presentation.available,
                     canInvoke: selected.presentation.canInvoke,
                     requiresFocus: selected.presentation.requiresFocus,
+                    preparedGenerationActionIDs: Set(group.compactMap {
+                        $0.action.preparePath == nil ? nil : $0.action.id
+                    }),
                     running: selected.presentation.running,
                     waitingForFirstContent: selected.presentation.waitingForFirstContent
                 ))
             }
             return resolved
         }
+    }
+
+    var primaryGenerationPresentation: ActionPluginPresentation? {
+        ActionPluginPrimaryPresentationRules.primary(in: presentations)
+    }
+
+    var secondaryPresentations: [ActionPluginPresentation] {
+        ActionPluginPrimaryPresentationRules.secondary(in: presentations)
     }
 
     func refreshStatuses(force: Bool = false) {
@@ -1814,7 +1855,8 @@ final class ActionPluginHost {
         }
     }
 
-    func invoke(_ key: ActionPluginKey) {
+    @discardableResult
+    func invoke(_ key: ActionPluginKey) -> Bool {
         dispatchPrecondition(condition: .onQueue(.main))
         guard activeInvocation == nil,
               !focus.secureInputEnabled(),
@@ -1830,20 +1872,20 @@ final class ActionPluginHost {
               ActionPluginRoutingRules.statusMatches(status,
                                                      action: action,
                                                      contextId: contextId) else {
-            return
+            return false
         }
 
         let focusToken = focus.currentToken()
         if let focusToken {
-            guard focus.isValid(focusToken) else { return }
+            guard focus.isValid(focusToken) else { return false }
         } else {
-            guard !action.requiresFocus else { return }
+            guard !action.requiresFocus else { return false }
         }
         if action.requiresFocus {
             guard ActionPluginRoutingRules.focusBindingMatches(
                 bound: observed.focusToken,
                 current: focusToken
-            ) else { return }
+            ) else { return false }
         }
 
         let binding = observed.snapshot.binding
@@ -1854,12 +1896,12 @@ final class ActionPluginHost {
         guard runtimeBindingIsCurrent(plugin, binding) else {
             failures[key] = "插件运行实例已失效，请稍后重试"
             onChange?()
-            return
+            return false
         }
         if streaming, binding.config.instanceId?.isEmpty != false {
             failures[key] = "插件流运行实例不可用"
             onChange?()
-            return
+            return false
         }
 
         let requestId = UUID().uuidString.lowercased()
@@ -1955,6 +1997,7 @@ final class ActionPluginHost {
                                   failureMessage: "插件生成超时",
                                   preserveLegacyResultRouting: false)
         }
+        return true
     }
 
     func focusInvalidated(_ token: FocusToken) {
@@ -3397,5 +3440,121 @@ final class ActionPluginHost {
             deliveryPlugins[removedRequestID] = nil
             deliveryKeys[removedRequestID] = nil
         }
+    }
+}
+
+extension ActionPluginHost: WorkbenchManualGenerationControls,
+                            BufferDeliveryContentSource {
+    var canGenerate: Bool {
+        primaryGenerationPresentation?.canInvoke == true
+    }
+
+    var isGenerating: Bool {
+        primaryGenerationPresentation?.running == true
+    }
+
+    var generationProviderName: String {
+        primaryGenerationPresentation?.pluginName ?? "Action Plugin"
+    }
+
+    var generationStatusText: String {
+        if let failure = workbenchFailureMessage?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !failure.isEmpty {
+            return failure
+        }
+        if let label = primaryGenerationPresentation?.label
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !label.isEmpty {
+            return label
+        }
+        return "等待插件上下文"
+    }
+
+    var generationRequestDescription: String {
+        "让 \(generationProviderName) 处理当前插件上下文"
+    }
+
+    var primaryAction: WorkbenchManualGenerationPrimaryAction {
+        guard let presentation = primaryGenerationPresentation else { return .disabled }
+        return WorkbenchManualGenerationPrimaryActionRules.resolve(
+            isGenerating: presentation.running,
+            hasReadyDelivery: !deliveryPendingBlocks.isEmpty,
+            canGenerate: presentation.canInvoke
+        )
+    }
+
+    @discardableResult
+    func generate() -> Bool {
+        guard primaryAction == .requestGeneration,
+              let presentation = primaryGenerationPresentation else { return false }
+        return invoke(presentation.key)
+    }
+
+    // MARK: Prepared-generation delivery source
+
+    var deliveryWorkspaceID: String {
+        guard let key = primaryGenerationPresentation?.presentationKey else {
+            return "action-prepared:none"
+        }
+        return "action-prepared:\(key.pluginId):\(key.presentationId)"
+    }
+
+    var deliveryGeneration: UInt64 { bufferModel.deliveryGeneration }
+
+    var hasIncompleteDeliveryBlocks: Bool {
+        guard let presentation = primaryGenerationPresentation else { return false }
+        return bufferModel.blocks.contains {
+            preparedDeliveryBlock($0, matches: presentation, requireFinal: false)
+                && $0.pluginMetadata?.incomplete == true
+        }
+    }
+
+    var deliveryPendingBlocks: [BufferModel.Block] {
+        guard let presentation = primaryGenerationPresentation else { return [] }
+        return bufferModel.blocks.filter {
+            preparedDeliveryBlock($0, matches: presentation, requireFinal: true)
+        }
+    }
+
+    func deliveryBlock(id: UUID, generation: UInt64) -> BufferModel.Block? {
+        guard deliveryGeneration == generation,
+              let presentation = primaryGenerationPresentation,
+              let block = bufferModel.block(id: id),
+              preparedDeliveryBlock(block,
+                                    matches: presentation,
+                                    requireFinal: true) else { return nil }
+        return block
+    }
+
+    func consumeDelivered(blockIDs: [UUID], generation _: UInt64) {
+        // Delivery.insert already accepted these exact stable UUIDs. Consume
+        // them even if unrelated BufferModel input advanced the global model
+        // generation while a later block's async target validation was held;
+        // otherwise an accepted block could be offered a second time.
+        bufferModel.consumeDelivered(blockIDs: blockIDs)
+    }
+
+    @discardableResult
+    func markDeliveryBlockStale(id: UUID, generation _: UInt64) -> Bool {
+        // The coordinator selected this stable UUID from the filtered source.
+        // Marking it remains safe after unrelated generation changes or an
+        // owner switch; BufferModel itself verifies that it is still a bound,
+        // non-reviewed plugin block and never acts on a replacement UUID.
+        return bufferModel.markPluginBlockStale(id: id)
+    }
+
+    private func preparedDeliveryBlock(
+        _ block: BufferModel.Block,
+        matches presentation: ActionPluginPresentation,
+        requireFinal: Bool
+    ) -> Bool {
+        guard case let .plugin(originPluginID) = block.origin,
+              let metadata = block.pluginMetadata,
+              originPluginID == presentation.key.pluginId,
+              metadata.pluginId == presentation.key.pluginId,
+              presentation.preparedGenerationActionIDs.contains(metadata.actionId),
+              !metadata.stale else { return false }
+        return !requireFinal || !metadata.incomplete
     }
 }
