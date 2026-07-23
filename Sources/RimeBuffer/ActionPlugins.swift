@@ -1816,21 +1816,33 @@ final class ActionPluginHost {
         ActionPluginPrimaryPresentationRules.secondary(in: presentations)
     }
 
-    func refreshStatuses(force: Bool = false) {
+    func refreshStatuses(force: Bool = false,
+                         onlyPluginID: String? = nil) {
         dispatchPrecondition(condition: .onQueue(.main))
         let now = ProcessInfo.processInfo.systemUptime
         reloadManifests(force: force || now - lastManifestReload >= 5)
         guard force || now - lastStatusRefresh >= 0.75 else { return }
-        lastStatusRefresh = now
-        if force, !statuses.isEmpty {
+        if onlyPluginID == nil {
+            lastStatusRefresh = now
+        }
+        if force {
             // A panel may have been hidden while the browser target changed.
             // Disable cached actions until the fresh status request returns;
             // final invoke verification remains the last safety gate.
-            statuses.removeAll()
-            onChange?()
+            let previousCount = statuses.count
+            if let onlyPluginID {
+                statuses = statuses.filter { $0.key.pluginId != onlyPluginID }
+            } else {
+                statuses.removeAll()
+            }
+            if statuses.count != previousCount {
+                onChange?()
+            }
         }
 
-        for plugin in plugins.values where pluginIsSelected(plugin.manifest.id) {
+        for plugin in plugins.values
+            where pluginIsSelected(plugin.manifest.id)
+                && (onlyPluginID == nil || plugin.manifest.id == onlyPluginID) {
             for action in plugin.manifest.actions {
                 let key = ActionPluginKey(pluginId: plugin.manifest.id,
                                           actionId: action.id)
@@ -2030,10 +2042,35 @@ final class ActionPluginHost {
 
     func pluginConfigurationDidChange(changedPluginID: String? = nil) {
         dispatchPrecondition(condition: .onQueue(.main))
-        // Management notifications are generation boundaries even when a
-        // disable/re-enable or uninstall/reinstall cycle ends with an
-        // identical manifest. Clear every authority minted by the prior
-        // generation before observing the new enabled set.
+        if let changedPluginID {
+            // A named manager mutation is a boundary for that plugin only.
+            // Settings may enable/disable inactive plugin B while selected
+            // plugin A is generating; B must lose every task and grant without
+            // interrupting A's invocation, partial blocks, status, or message.
+            let touchesForeground = pluginIsSelected(changedPluginID)
+                || activeInvocation?.key.pluginId == changedPluginID
+            if touchesForeground {
+                clearWorkbenchMessages()
+            }
+            statuses = statuses.filter { $0.key.pluginId != changedPluginID }
+            failures = failures.filter { $0.key.pluginId != changedPluginID }
+            statusRequests = statusRequests.filter { $0.key.pluginId != changedPluginID }
+            if let invocation = activeInvocation,
+               invocation.key.pluginId == changedPluginID {
+                cancelInvocation(invocation,
+                                 failureMessage: nil,
+                                 preserveLegacyResultRouting: false)
+            }
+            cancelBackgroundInvocations(pluginID: changedPluginID)
+            revokeDeliveryBindings(pluginID: changedPluginID)
+            reloadManifests(force: true)
+            refreshStatuses(force: true, onlyPluginID: changedPluginID)
+            onChange?()
+            return
+        }
+
+        // Older/third-party notifications cannot identify their mutation.
+        // Retain the original fail-closed global generation boundary.
         hostGeneration &+= 1
         clearWorkbenchMessages()
         statuses.removeAll()
@@ -2045,25 +2082,10 @@ final class ActionPluginHost {
                              preserveLegacyResultRouting: false)
         }
         cancelBackgroundInvocations()
-        if let changedPluginID {
-            // Enabling/switching plugin B is not authority revocation for a
-            // completed block minted by unchanged plugin A. The manager names
-            // the actual mutation so only that plugin's grants are dropped.
-            for requestID in deliveryBindingOrder
-                where deliveryKeys[requestID]?.pluginId == changedPluginID {
-                deliveryBindings[requestID] = nil
-                deliveryPlugins[requestID] = nil
-                deliveryKeys[requestID] = nil
-            }
-            deliveryBindingOrder.removeAll { deliveryBindings[$0] == nil }
-        } else {
-            // Older/third-party notifications cannot identify their mutation;
-            // retain the original fail-closed generation boundary.
-            deliveryBindings.removeAll()
-            deliveryPlugins.removeAll()
-            deliveryKeys.removeAll()
-            deliveryBindingOrder.removeAll()
-        }
+        deliveryBindings.removeAll()
+        deliveryPlugins.removeAll()
+        deliveryKeys.removeAll()
+        deliveryBindingOrder.removeAll()
         reloadManifests(force: true)
         refreshStatuses(force: true)
         onChange?()
@@ -2345,6 +2367,29 @@ final class ActionPluginHost {
                              failureMessage: nil,
                              preserveLegacyResultRouting: false)
         }
+    }
+
+    private func cancelBackgroundInvocations(pluginID: String) {
+        let invocations = backgroundInvocationOrder.compactMap {
+            backgroundInvocations[$0]
+        }.filter {
+            $0.key.pluginId == pluginID
+        }
+        for invocation in invocations {
+            cancelInvocation(invocation,
+                             failureMessage: nil,
+                             preserveLegacyResultRouting: false)
+        }
+    }
+
+    private func revokeDeliveryBindings(pluginID: String) {
+        for requestID in deliveryBindingOrder
+            where deliveryKeys[requestID]?.pluginId == pluginID {
+            deliveryBindings[requestID] = nil
+            deliveryPlugins[requestID] = nil
+            deliveryKeys[requestID] = nil
+        }
+        deliveryBindingOrder.removeAll { deliveryBindings[$0] == nil }
     }
 
     func cancelActiveInvocationForWorkbench() {
@@ -2803,8 +2848,10 @@ final class ActionPluginHost {
         }
 
         guard loaded != plugins else { return }
-        hostGeneration &+= 1
         let previousPlugins = plugins
+        let changedPluginIDs = Set(previousPlugins.keys).union(loaded.keys).filter {
+            previousPlugins[$0] != loaded[$0]
+        }
         plugins = loaded
 
         // A key surviving an upgrade is not the same authority. Preserve
@@ -2835,12 +2882,15 @@ final class ActionPluginHost {
             return true
         }
 
-        if let invocation = activeInvocation {
+        if let invocation = activeInvocation,
+           changedPluginIDs.contains(invocation.key.pluginId) {
             cancelInvocation(invocation,
                              failureMessage: nil,
                              preserveLegacyResultRouting: false)
         }
-        cancelBackgroundInvocations()
+        for pluginID in changedPluginIDs {
+            cancelBackgroundInvocations(pluginID: pluginID)
+        }
 
         for requestID in deliveryBindingOrder {
             guard let plugin = deliveryPlugins[requestID],

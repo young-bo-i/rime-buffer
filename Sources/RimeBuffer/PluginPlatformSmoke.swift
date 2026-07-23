@@ -13,6 +13,7 @@ private final class PluginRegistrySmokeBuiltIn: InternalPlugin {
             key: PluginKey(domain: .builtIn, rawID: rawID),
             wireID: nil,
             name: "Smoke Built-in",
+            symbolName: "puzzlepiece",
             version: "1",
             summary: "fixture",
             source: .builtIn,
@@ -51,6 +52,32 @@ func runPluginPlatformSmokeTest() -> Bool {
         BuiltInPluginID.aiText,
     ]) else {
         return fail("shipped buffer plugin registry")
+    }
+    let shippedDescriptors = BuiltInPlugins.makeAll().map(\.descriptor)
+    guard shippedDescriptors.allSatisfy({
+        PluginVisualIdentity.resolvedSymbolName($0.symbolName) == $0.symbolName
+    }) else {
+        return fail("shipped plugin visual identity")
+    }
+    let fallbackSymbol = PluginVisualIdentity.resolvedSymbolName(nil)
+    guard fallbackSymbol == PluginVisualIdentity.fallbackSymbolName,
+          PluginVisualIdentity.resolvedSymbolName("   ") == fallbackSymbol,
+          PluginVisualIdentity.resolvedSymbolName(
+            "rimes.symbol.that.does.not.exist"
+          ) == fallbackSymbol,
+          let fallbackImage = PluginVisualIdentity.image(
+            symbolName: "rimes.symbol.that.does.not.exist",
+            accessibilityDescription: "Fallback",
+            pointSize: 12
+          ),
+          fallbackImage.isTemplate,
+          let defaultImage = PluginVisualIdentity.image(
+            symbolName: PluginVisualIdentity.defaultWorkbenchSymbolName,
+            accessibilityDescription: "Default",
+            pointSize: 10
+          ),
+          defaultImage.isTemplate else {
+        return fail("plugin symbol fallback")
     }
     let shippedAIPlugins = BuiltInPlugins.makeAll().filter {
         $0.descriptor.key.rawID == BuiltInPluginID.aiText
@@ -123,6 +150,10 @@ func runPluginPlatformSmokeTest() -> Bool {
                                       externalManager: manager,
                                       bufferPluginSelection: selection)
 
+        let externalKey = PluginKey(domain: .externalActionV1, rawID: externalRawID)
+        let bufferBuiltInKey = PluginKey(domain: .builtIn,
+                                         rawID: "translation-smoke")
+        let nonBufferBuiltInKey = PluginKey(domain: .builtIn, rawID: externalRawID)
         let snapshot = registry.allPlugins()
         guard snapshot.count == 3,
               Set(snapshot.map(\.id)) == Set([
@@ -132,15 +163,34 @@ func runPluginPlatformSmokeTest() -> Bool {
               ]),
               snapshot.first(where: { $0.id.domain == .externalActionV1 })?
                 .descriptor.wireID == externalRawID,
+              snapshot.first(where: { $0.id == externalKey })?
+                .descriptor.symbolName == "play",
               builtIn.startCount == 1 else {
             return fail("namespaced discovery")
         }
 
+        let menuEntries = BufferPluginMenuCatalog.entries(from: snapshot)
+        guard menuEntries.first == BufferPluginMenuEntry(
+                key: nil,
+                title: "Default",
+                symbolName: PluginVisualIdentity.defaultWorkbenchSymbolName
+              ),
+              Set(menuEntries.compactMap(\.key))
+                == Set([bufferBuiltInKey, externalKey]),
+              menuEntries.count == 3 else {
+            return fail("enabled workbench menu catalog")
+        }
+        let disabledExternalSnapshot = snapshot.map { plugin in
+            plugin.id == externalKey
+                ? RegisteredPlugin(descriptor: plugin.descriptor, isEnabled: false)
+                : plugin
+        }
+        guard BufferPluginMenuCatalog.entries(from: disabledExternalSnapshot)
+                .compactMap(\.key) == [bufferBuiltInKey] else {
+            return fail("disabled workbench plugin filtering")
+        }
+
         selection.migrateDefaultIfNeeded(from: snapshot)
-        let externalKey = PluginKey(domain: .externalActionV1, rawID: externalRawID)
-        let bufferBuiltInKey = PluginKey(domain: .builtIn,
-                                         rawID: "translation-smoke")
-        let nonBufferBuiltInKey = PluginKey(domain: .builtIn, rawID: externalRawID)
         guard selection.activeKey == externalKey,
               !selection.select(nonBufferBuiltInKey, among: snapshot) else {
             return fail("exclusive buffer plugin selection")
@@ -157,8 +207,8 @@ func runPluginPlatformSmokeTest() -> Bool {
         }
         defer { lateDefaults.removePersistentDomain(forName: lateDefaultsName) }
         lateDefaults.removePersistentDomain(forName: lateDefaultsName)
-        // The first selection implementation wrote this false sentinel when
-        // Rime launched before Marine had installed its manifest.
+        // The first selection implementation could leave this false sentinel
+        // when Rime launched before Marine had installed its manifest.
         lateDefaults.set(false, forKey: "plugins.buffer.active.hasValue.v1")
         let lateSelection = BufferPluginSelectionStore(defaults: lateDefaults)
         let lateRoot = root.appendingPathComponent("late-plugins", isDirectory: true)
@@ -173,8 +223,9 @@ func runPluginPlatformSmokeTest() -> Bool {
             bufferPluginSelection: lateSelection
         )
         lateSelection.migrateDefaultIfNeeded(from: lateRegistry.allPlugins())
-        guard lateSelection.activeKey == nil else {
-            return fail("legacy empty selection changed before plugin discovery")
+        guard lateSelection.activeKey == nil,
+              lateDefaults.bool(forKey: "plugins.buffer.active.semantics.v2") else {
+            return fail("startup did not establish Default ownership")
         }
         let lateDirectory = lateRoot.appendingPathComponent("external-smoke", isDirectory: true)
         try FileManager.default.createDirectory(at: lateDirectory,
@@ -188,8 +239,11 @@ func runPluginPlatformSmokeTest() -> Bool {
             object: nil,
             userInfo: [ActionPluginManager.rootPathUserInfoKey: lateRoot.path]
         )
-        guard lateSelection.activeKey == externalKey else {
-            return fail("externally discovered plugin did not receive initial ownership")
+        guard lateSelection.activeKey == nil,
+              lateRegistry.isEnabled(externalKey),
+              lateSelection.select(externalKey, among: lateRegistry.allPlugins()),
+              lateSelection.activeKey == externalKey else {
+            return fail("late plugin install changed owner or could not be selected")
         }
         lateSelection.clear()
         lateSelection.migrateDefaultIfNeeded(from: snapshot)
@@ -219,6 +273,21 @@ func runPluginPlatformSmokeTest() -> Bool {
                 return fail("switch to built-in owner")
             }
 
+            try registry.setEnabled(false, for: externalKey)
+            guard selection.activeKey == bufferBuiltInKey,
+                  !registry.isEnabled(externalKey),
+                  BufferPluginMenuCatalog.entries(from: registry.allPlugins())
+                    .compactMap(\.key) == [bufferBuiltInKey] else {
+                return fail("disabling inactive plugin changed owner")
+            }
+            try registry.setEnabled(true, for: externalKey)
+            guard selection.activeKey == bufferBuiltInKey,
+                  registry.isEnabled(externalKey),
+                  Set(BufferPluginMenuCatalog.entries(from: registry.allPlugins())
+                    .compactMap(\.key)) == Set([bufferBuiltInKey, externalKey]) else {
+                return fail("re-enabling inactive plugin changed owner")
+            }
+
             try registry.setBufferPluginActive(true, for: externalKey)
             guard selection.activeKey == externalKey,
                   registry.isEnabled(bufferBuiltInKey),
@@ -234,12 +303,25 @@ func runPluginPlatformSmokeTest() -> Bool {
 
             try registry.setEnabled(false, for: bufferBuiltInKey)
             guard !registry.isEnabled(bufferBuiltInKey) else {
-                return fail("legacy disabled setup")
+                return fail("disabled built-in setup")
+            }
+            do {
+                try registry.setBufferPluginActive(true, for: bufferBuiltInKey)
+                return fail("disabled workbench plugin was selected")
+            } catch BufferPluginActivationError.unavailable {
+                guard selection.activeKey == nil,
+                      !registry.isEnabled(bufferBuiltInKey) else {
+                    return fail("stale selection changed enablement or owner")
+                }
+            }
+            try registry.setEnabled(true, for: bufferBuiltInKey)
+            guard registry.isEnabled(bufferBuiltInKey),
+                  selection.activeKey == nil else {
+                return fail("settings enablement changed active owner")
             }
             try registry.setBufferPluginActive(true, for: bufferBuiltInKey)
-            guard selection.activeKey == bufferBuiltInKey,
-                  registry.isEnabled(bufferBuiltInKey) else {
-                return fail("legacy disabled activation")
+            guard selection.activeKey == bufferBuiltInKey else {
+                return fail("enabled built-in owner selection")
             }
 
             try registry.setBufferPluginActive(false, for: externalKey)
@@ -255,6 +337,19 @@ func runPluginPlatformSmokeTest() -> Bool {
                 guard selection.activeKey == bufferBuiltInKey else {
                     return fail("failed activation changed owner")
                 }
+            }
+
+            try registry.setEnabled(false, for: bufferBuiltInKey)
+            guard selection.activeKey == nil,
+                  !registry.isEnabled(bufferBuiltInKey),
+                  !BufferPluginMenuCatalog.entries(from: registry.allPlugins())
+                    .compactMap(\.key).contains(bufferBuiltInKey) else {
+                return fail("disabling active built-in did not select Default")
+            }
+            try registry.setEnabled(true, for: bufferBuiltInKey)
+            guard selection.activeKey == nil,
+                  registry.isEnabled(bufferBuiltInKey) else {
+                return fail("re-enabling built-in changed Default owner")
             }
 
             try registry.setBufferPluginActive(true, for: externalKey)

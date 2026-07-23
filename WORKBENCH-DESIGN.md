@@ -65,7 +65,7 @@
 └────────────────────────────────────────────────┘
 ```
 
-实现载体：`BufferWindowController` 拥有独立 `nonactivatingPanel`。普通折叠态是 44pt 单行主条：拖拽图标 → 展开箭头 → `BufferInlineView` → 发送；向上工具层只有状态 → 缓冲插件选择器与当前动作 → 刷新/重置 → 关闭，展开后总高 78pt。苹果翻译、AI 生成与单候选意识流使用 78/112pt 的 source + target 布局；意识流出现 2/3 个候选时增加 1/2 条 target row，高度为 109/143pt 与 140/174pt。选择器直接切换唯一 owner；刷新/重置不清除缓冲正文，只重置当前插件的请求、失败与 generation。切换 owner/展开态/target row 数时保持窗口底边不动，因此条下方 Rime 候选锚点稳定；只有 22pt 拖拽图标可移动面板。`Command+Shift+B` 通过全局 Carbon hot key 调用 `toggleVisibility()`：关闭时显示并恢复捕获，打开时复用普通关闭语义，收束当前组字、保留内容并暂停捕获。窗口仍可调整宽度、关闭、固定到所有桌面/全屏空间，frame 与展开态持久化并在多屏变化后校正。`CandidateWindow` 继续独占 Rime 组字候选状态；意识流互斥解释在 target rows 内呈现。拖拽/展开对齐 source 行，发送对齐最下方 target 行。
+实现载体：`BufferWindowController` 拥有独立 `nonactivatingPanel`。普通折叠态是 44pt 单行主条：拖拽图标 → 展开箭头 → `BufferInlineView` → 发送；向上工具层只有状态 → 带小图标的缓冲插件选择器与当前动作 → 刷新/重置 → 关闭，展开后总高 78pt。苹果翻译、AI 生成与单候选意识流使用 78/112pt 的 source + target 布局；意识流出现 2/3 个候选时增加 1/2 条 target row，高度为 109/143pt 与 140/174pt。设置页可独立开启多个缓冲插件；选择器只枚举已开启集合，以 `Default` 表示无插件，并直接切换唯一 owner。刷新/重置不清除缓冲正文，只重置当前插件的请求、失败与 generation。切换 owner/展开态/target row 数时保持窗口底边不动，因此条下方 Rime 候选锚点稳定；只有 22pt 拖拽图标可移动面板。`Command+Shift+B` 通过全局 Carbon hot key 调用 `toggleVisibility()`：关闭时显示并恢复捕获，打开时复用普通关闭语义，收束当前组字、保留内容并暂停捕获。窗口仍可调整宽度、关闭、固定到所有桌面/全屏空间，frame 与展开态持久化并在多屏变化后校正。`CandidateWindow` 继续独占 Rime 组字候选状态；意识流互斥解释在 target rows 内呈现。拖拽/展开对齐 source 行，发送对齐最下方 target 行。
 
 各层职责：
 

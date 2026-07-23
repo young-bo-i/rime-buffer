@@ -1131,6 +1131,8 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
 
         pluginSelector.controlSize = .mini
         pluginSelector.font = .systemFont(ofSize: 10, weight: .semibold)
+        pluginSelector.imagePosition = .imageLeading
+        pluginSelector.imageHugsTitle = true
         pluginSelector.target = self
         pluginSelector.action = #selector(bufferPluginSelectionChanged)
         pluginSelector.toolTip = "切换缓冲插件"
@@ -1927,13 +1929,18 @@ final class BufferWindowController: NSObject, NSWindowDelegate {
         let plugins = PluginRegistry.shared.plugins(capability: .bufferAction)
         let activeKey = BufferPluginSelectionStore.shared.activeKey
         pluginSelector.removeAllItems()
-        pluginSelector.addItem(withTitle: "无插件")
-        pluginSelector.lastItem?.representedObject = BufferPluginMenuIdentity(nil)
-        for plugin in plugins {
-            pluginSelector.addItem(withTitle: plugin.descriptor.name)
-            pluginSelector.lastItem?.representedObject = BufferPluginMenuIdentity(
-                plugin.descriptor.key
+        for entry in BufferPluginMenuCatalog.entries(from: plugins) {
+            pluginSelector.addItem(withTitle: entry.title)
+            pluginSelector.lastItem?.representedObject = BufferPluginMenuIdentity(entry.key)
+            pluginSelector.lastItem?.image = PluginVisualIdentity.image(
+                symbolName: entry.symbolName,
+                accessibilityDescription: entry.title,
+                pointSize: 10,
+                weight: .semibold
             )
+            pluginSelector.lastItem?.toolTip = entry.key == nil
+                ? "使用默认缓冲，不加载插件"
+                : "切换到 \(entry.title)"
         }
         let selectedIndex = (0..<pluginSelector.numberOfItems).first { index in
             guard let identity = pluginSelector.item(at: index)?.representedObject

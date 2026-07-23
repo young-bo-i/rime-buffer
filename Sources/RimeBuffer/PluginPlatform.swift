@@ -80,6 +80,10 @@ struct PluginDescriptor: Identifiable, Hashable {
     /// Buffer metadata from the registry's namespaced `key`.
     let wireID: String?
     let name: String
+    /// Compact SF Symbol identity shared by Settings and the workbench
+    /// selector. External v1 plugins inherit their first action symbol so old
+    /// manifests gain an icon without a schema change.
+    let symbolName: String
     let version: String
     let summary: String
     let source: PluginSource
@@ -107,6 +111,75 @@ struct RegisteredPlugin: Identifiable, Equatable {
     var id: PluginKey { descriptor.key }
 }
 
+enum PluginVisualIdentity {
+    static let fallbackSymbolName = "puzzlepiece.extension"
+    private static let legacyFallbackSymbolName = "puzzlepiece"
+    static let defaultWorkbenchSymbolName = "square.grid.2x2"
+
+    static func resolvedSymbolName(_ preferred: String?) -> String {
+        if let preferred = preferred?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !preferred.isEmpty,
+           NSImage(systemSymbolName: preferred,
+                   accessibilityDescription: nil) != nil {
+            return preferred
+        }
+        if NSImage(systemSymbolName: fallbackSymbolName,
+                   accessibilityDescription: nil) != nil {
+            return fallbackSymbolName
+        }
+        return legacyFallbackSymbolName
+    }
+
+    static func image(symbolName: String,
+                      accessibilityDescription: String,
+                      pointSize: CGFloat,
+                      weight: NSFont.Weight = .regular) -> NSImage? {
+        let resolved = resolvedSymbolName(symbolName)
+        let configuration = NSImage.SymbolConfiguration(pointSize: pointSize,
+                                                        weight: weight)
+        let image = NSImage(
+            systemSymbolName: resolved,
+            accessibilityDescription: accessibilityDescription
+        )?.withSymbolConfiguration(configuration)
+        image?.isTemplate = true
+        return image
+    }
+}
+
+struct BufferPluginMenuEntry: Equatable {
+    let key: PluginKey?
+    let title: String
+    let symbolName: String
+}
+
+enum BufferPluginMenuCatalog {
+    static let defaultTitle = "Default"
+
+    /// Settings owns the enabled set. The workbench only chooses an active
+    /// owner from that set, plus the explicit Default (no-plugin) state.
+    static func entries(from plugins: [RegisteredPlugin]) -> [BufferPluginMenuEntry] {
+        let enabled = plugins.compactMap { plugin -> BufferPluginMenuEntry? in
+            guard plugin.isEnabled,
+                  plugin.descriptor.capabilities.contains(.bufferAction) else {
+                return nil
+            }
+            return BufferPluginMenuEntry(
+                key: plugin.descriptor.key,
+                title: plugin.descriptor.name,
+                symbolName: plugin.descriptor.symbolName
+            )
+        }
+        return [
+            BufferPluginMenuEntry(
+                key: nil,
+                title: defaultTitle,
+                symbolName: PluginVisualIdentity.defaultWorkbenchSymbolName
+            ),
+        ] + enabled
+    }
+}
+
 enum BufferPluginActivationError: LocalizedError, Equatable {
     case unavailable(PluginKey)
     case stateChanged(PluginKey)
@@ -131,9 +204,8 @@ final class BufferPluginSelectionStore {
         static let hasSelection = "plugins.buffer.active.hasValue.v1"
         static let domain = "plugins.buffer.active.domain.v1"
         static let rawID = "plugins.buffer.active.rawID.v1"
-        // The first selection build wrote hasSelection=false merely because
-        // Rime started before Marine installed its manifest. Once this marker
-        // exists, a false value is known to be an intentional v2 choice.
+        // Once this marker exists, a false value is an intentional Default
+        // owner and later plugin install/enable events must not replace it.
         static let selectionSemanticsV2 = "plugins.buffer.active.semantics.v2"
     }
 
@@ -197,17 +269,15 @@ final class BufferPluginSelectionStore {
                 && $0.descriptor.source == .external
                 && $0.descriptor.capabilities.contains(.bufferAction)
         }
-        // Keep the sentinel absent when Rime starts before an external
-        // provider such as Marine. A later managed install may then perform
-        // the same one-time migration. Repair one legacy false sentinel left
-        // by the first selection build; clear() writes the v2 marker, so a new
-        // explicit choice of “无插件” is never overridden.
         let hasStoredSelection = defaults.object(forKey: Key.hasSelection) != nil
         if hasStoredSelection && defaults.bool(forKey: Key.selectionSemanticsV2) {
             return
         }
-        guard let external else { return }
-        persist(external.descriptor.key)
+        // This method is called once at process startup. Preserve a legacy
+        // enabled external owner when it already exists; otherwise establish
+        // Default now so a later Settings enable/install action changes only
+        // the enabled set, never the active owner.
+        persist(external?.descriptor.key)
     }
 
     func reconcile(with plugins: [RegisteredPlugin]) {
@@ -342,6 +412,9 @@ final class PluginRegistry {
                     key: PluginKey(domain: .externalActionV1, rawID: managed.id),
                     wireID: managed.id,
                     name: managed.manifest.name,
+                    symbolName: PluginVisualIdentity.resolvedSymbolName(
+                        managed.actions.first?.symbol
+                    ),
                     version: managed.manifest.version ?? "1",
                     summary: "为缓冲工作台提供 \(managed.actions.count) 个动作",
                     source: .external,
@@ -421,11 +494,9 @@ final class PluginRegistry {
         if !enabled { bufferPluginSelection.clearIfSelected(key) }
     }
 
-    /// Applies the single user-facing switch for a buffer plugin. The switch
-    /// represents the exclusive workbench owner, not the lower-level plugin
-    /// enablement permission: selecting another owner leaves the previous
-    /// plugin enabled but inactive. A plugin disabled by an older build is
-    /// enabled first so the same switch can bring it back into service.
+    /// Applies the workbench's exclusive active owner selection. Settings
+    /// separately manages the multi-select enablement set; a stale menu item
+    /// can never resurrect a plugin that Settings has just disabled.
     func setBufferPluginActive(_ active: Bool, for key: PluginKey) throws {
         guard active else {
             // A stale off event from a row that is no longer selected must not
@@ -434,31 +505,15 @@ final class PluginRegistry {
             return
         }
 
-        guard let target = allPlugins().first(where: {
+        guard allPlugins().contains(where: {
             $0.descriptor.key == key
+                && $0.isEnabled
                 && $0.descriptor.capabilities.contains(.bufferAction)
         }) else {
             throw BufferPluginActivationError.unavailable(key)
         }
 
-        let wasEnabled = target.isEnabled
-        if !wasEnabled {
-            // setEnabled is allowed to fail (for example if an external plugin
-            // was uninstalled concurrently). select() has not run yet, so the
-            // previous owner remains untouched on that path.
-            try setEnabled(true, for: key)
-        }
-
         guard bufferPluginSelection.select(key, among: allPlugins()) else {
-            if !wasEnabled {
-                do {
-                    try setEnabled(false, for: key)
-                } catch {
-                    IMELog.write(
-                        "buffer plugin activation rollback failed key=\(key)"
-                    )
-                }
-            }
             throw BufferPluginActivationError.stateChanged(key)
         }
     }
@@ -481,7 +536,9 @@ final class PluginRegistry {
     }
 
     private func notifyChange() {
-        bufferPluginSelection.migrateDefaultIfNeeded(from: allPlugins())
+        // Registry mutations update availability only. Startup owns the sole
+        // compatibility migration that may choose a legacy external owner.
+        bufferPluginSelection.reconcile(with: allPlugins())
         NotificationCenter.default.post(name: .pluginRegistryDidChange, object: self)
     }
 }

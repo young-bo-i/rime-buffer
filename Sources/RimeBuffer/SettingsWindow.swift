@@ -4,7 +4,7 @@ import UniformTypeIdentifiers
 
 private enum SettingsPluginSwitchMode {
     case enablement
-    case activeBufferPlugin
+    case bufferEnablement
 }
 
 private final class SettingsPluginSwitch: NSSwitch {
@@ -1364,7 +1364,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
 
         pluginRowsStack.removeFromSuperview()
         let note = NSTextField(wrappingLabelWithString:
-            "缓冲插件一次只运行一个。打开新的插件会自动切换，插件结果仍需在缓冲区确认后发送。")
+            "可以同时开启多个缓冲插件；只有已开启的插件会出现在缓冲工作台，当前使用项仍在工作台中切换。")
         note.font = .systemFont(ofSize: 11)
         note.textColor = .tertiaryLabelColor
 
@@ -1372,7 +1372,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         let showBuiltIns = subpageID == "all" || subpageID == "built-in-extensions"
         var views: [NSView] = [
             heading,
-            caption("在这里选择当前缓冲插件，或管理随应用提供的内部扩展。"),
+            caption("在这里管理工作台可用的缓冲插件，或管理随应用提供的内部扩展。"),
             spacer(8),
         ]
         if showBuiltIns {
@@ -1401,6 +1401,27 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
 
     private func pluginRow(_ plugin: RegisteredPlugin,
                            mode: SettingsPluginSwitchMode) -> NSView {
+        let icon = NSImageView()
+        icon.image = PluginVisualIdentity.image(
+            symbolName: plugin.descriptor.symbolName,
+            accessibilityDescription: plugin.descriptor.name,
+            pointSize: 15,
+            weight: .semibold
+        )
+        icon.imageScaling = .scaleProportionallyDown
+        icon.contentTintColor = .secondaryLabelColor
+        icon.toolTip = plugin.descriptor.name
+        // The adjacent name is the semantic label; keep this decorative image
+        // out of the VoiceOver traversal so the row is not announced twice.
+        icon.setAccessibilityElement(false)
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            icon.widthAnchor.constraint(equalToConstant: 22),
+            icon.heightAnchor.constraint(equalToConstant: 22),
+        ])
+        icon.setContentHuggingPriority(.required, for: .horizontal)
+        icon.setContentCompressionResistancePriority(.required, for: .horizontal)
+
         let name = NSTextField(labelWithString: plugin.descriptor.name)
         name.font = .systemFont(ofSize: 13, weight: .semibold)
         name.lineBreakMode = .byTruncatingTail
@@ -1433,18 +1454,18 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         let toggle = SettingsPluginSwitch(frame: .zero)
         toggle.pluginKey = plugin.descriptor.key
         toggle.mode = mode
-        toggle.state = mode == .activeBufferPlugin
-            ? (BufferPluginSelectionStore.shared.isSelected(plugin.descriptor.key) ? .on : .off)
-            : (plugin.isEnabled ? .on : .off)
+        toggle.state = plugin.isEnabled ? .on : .off
         toggle.controlSize = .small
         toggle.target = self
         toggle.action = #selector(pluginSwitchToggled(_:))
-        toggle.toolTip = mode == .activeBufferPlugin
-            ? (toggle.state == .on ? "关闭当前缓冲插件" : "切换到这个缓冲插件")
+        toggle.toolTip = mode == .bufferEnablement
+            ? (toggle.state == .on
+                ? "停用插件并从工作台移除"
+                : "启用插件并加入工作台")
             : (toggle.state == .on ? "停用扩展" : "启用扩展")
         toggle.setContentHuggingPriority(.required, for: .horizontal)
 
-        let row = NSStackView(views: [labels, flexSpacer(), toggle])
+        let row = NSStackView(views: [icon, labels, flexSpacer(), toggle])
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 10
@@ -1844,7 +1865,7 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         } else {
             plugins.forEach {
                 pluginRowsStack.addArrangedSubview(
-                    pluginRow($0, mode: .activeBufferPlugin)
+                    pluginRow($0, mode: .bufferEnablement)
                 )
             }
         }
@@ -1852,10 +1873,12 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
         if let statusMessage {
             setPluginStatus(statusMessage)
         } else if !pluginDownloadInProgress {
+            let enabledCount = plugins.filter(\.isEnabled).count
             let activeName = BufferPluginSelectionStore.shared.activeKey.flatMap { key in
                 plugins.first(where: { $0.descriptor.key == key })?.descriptor.name
             }
-            setPluginStatus(activeName.map { "当前使用：\($0)" } ?? "当前未打开缓冲插件")
+            let current = activeName ?? BufferPluginMenuCatalog.defaultTitle
+            setPluginStatus("已开启 \(enabledCount) 个；工作台当前：\(current)")
         }
     }
 
@@ -2215,10 +2238,11 @@ final class SettingsWindowController: NSObject, NSTextFieldDelegate, NSWindowDel
             .descriptor.name ?? sender.pluginKey.rawID
         do {
             switch sender.mode {
-            case .activeBufferPlugin:
-                try PluginRegistry.shared.setBufferPluginActive(on,
-                                                                for: sender.pluginKey)
-                setPluginStatus(on ? "已切换到：\(pluginName)" : "已关闭：\(pluginName)")
+            case .bufferEnablement:
+                try PluginRegistry.shared.setEnabled(on, for: sender.pluginKey)
+                setPluginStatus(on
+                    ? "已启用并加入工作台：\(pluginName)"
+                    : "已停用并从工作台移除：\(pluginName)")
             case .enablement:
                 try PluginRegistry.shared.setEnabled(on, for: sender.pluginKey)
                 setPluginStatus(on ? "已启用扩展：\(pluginName)" : "已停用扩展：\(pluginName)")

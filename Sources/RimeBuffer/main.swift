@@ -3472,8 +3472,9 @@ func runActionPluginSmokeTest() -> Bool {
                                            focus: focusBox.access,
                                            bufferModel: targetFirstModel,
                                            inboundBus: targetFirstBus,
-                                           pluginIsSelected: { _ in
+                                           pluginIsSelected: { pluginID in
                                                targetFirstPluginSelected
+                                                   && pluginID == loaded[0].manifest.id
                                            },
                                            runtimeBindingIsCurrent: { _, candidate in
                                                targetRuntimeIsCurrent
@@ -3568,6 +3569,48 @@ func runActionPluginSmokeTest() -> Bool {
         }
         targetFirstPluginSelected = true
         targetFirst.bufferPluginSelectionDidChange()
+
+        // A Settings mutation for inactive plugin B changes only B's
+        // enablement/authority. It must not cancel selected plugin A's held
+        // generation or remove A's partial/final workbench state.
+        guard runMainLoopUntil(timeout: 1, {
+            targetFirst.presentations.first?.canInvoke == true
+        }) else {
+            print("FAILED: selected plugin did not recover before unrelated mutation")
+            return false
+        }
+        targetFirst.pluginConfigurationDidChange(
+            changedPluginID: "inactive-plugin"
+        )
+        guard targetFirst.presentations.first?.canInvoke == true else {
+            print("FAILED: inactive plugin mutation cleared selected idle status")
+            return false
+        }
+        let blocksBeforeUnrelatedMutation = targetFirstModel.blocks.count
+        targetFirstTransport.holdInvoke = true
+        targetFirst.invoke(targetFirstKey)
+        guard targetFirstModel.loadingMessage != nil,
+              targetFirst.presentations.first?.running == true else {
+            print("FAILED: unrelated-mutation fixture did not hold generation")
+            return false
+        }
+        targetFirst.pluginConfigurationDidChange(
+            changedPluginID: "inactive-plugin"
+        )
+        guard targetFirstModel.loadingMessage != nil,
+              targetFirst.presentations.first?.running == true else {
+            print("FAILED: inactive plugin mutation cancelled selected generation")
+            return false
+        }
+        targetFirstTransport.holdInvoke = false
+        targetFirstTransport.completeHeldInvoke()
+        guard runMainLoopUntil(timeout: 1, {
+            targetFirstModel.blocks.count == blocksBeforeUnrelatedMutation + 1
+                && targetFirstModel.loadingMessage == nil
+        }) else {
+            print("FAILED: selected generation did not survive inactive plugin mutation")
+            return false
+        }
 
         // Runtime rotation revokes legacy JSON results too. The old local
         // service may still answer, but its binding can no longer authorize a
@@ -3712,6 +3755,8 @@ func runActionPluginSmokeTest() -> Bool {
             userInfo: [
                 ActionPluginManager.rootPathUserInfoKey:
                     upgradeRoot.standardizedFileURL.path,
+                ActionPluginManager.changedPluginIDUserInfoKey:
+                    loaded[0].manifest.id,
             ]
         )
         upgradeTransport.completeHeldInvoke()
